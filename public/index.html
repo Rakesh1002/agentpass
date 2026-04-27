@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentPass — Credential broker for AI agents</title>
+  <meta name="description" content="Your AI agents will never see your API keys again. Local-first credential broker for Claude Code, Cursor, OpenClaw.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>">
+  <style>
+    :root {
+      --bg: #0a0a0b;
+      --fg: #fafafa;
+      --muted: #71717a;
+      --accent: #22c55e;
+      --accent-dim: #166534;
+      --border: #27272a;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      flex: 1;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 3rem;
+    }
+
+    .logo {
+      font-size: 3rem;
+      margin-bottom: 1rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+      letter-spacing: -0.025em;
+    }
+
+    .tagline {
+      color: var(--muted);
+      font-size: 1.125rem;
+    }
+
+    .hero {
+      background: var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+      text-align: center;
+    }
+
+    .hero code {
+      background: var(--bg);
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.875rem;
+      color: var(--accent);
+    }
+
+    .features {
+      display: grid;
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .feature {
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-start;
+    }
+
+    .feature-icon {
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .feature h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+
+    .feature p {
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+
+    .waitlist {
+      background: var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .waitlist h2 {
+      font-size: 1.125rem;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+
+    .form {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    input[type="email"] {
+      flex: 1;
+      padding: 0.625rem 0.875rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--fg);
+      font-size: 0.875rem;
+    }
+
+    input[type="email"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    button {
+      padding: 0.625rem 1rem;
+      border-radius: 6px;
+      border: none;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+      font-size: 0.875rem;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+
+    button:hover { opacity: 0.9; }
+
+    .success {
+      color: var(--accent);
+      text-align: center;
+      padding: 1rem;
+    }
+
+    .agents {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+
+    .agents h2 {
+      font-size: 1rem;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .agent-logos {
+      display: flex;
+      justify-content: center;
+      gap: 1.5rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+
+    footer {
+      text-align: center;
+      padding: 2rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">🔐</div>
+      <h1>AgentPass</h1>
+      <p class="tagline">Your AI agents will never see your API keys again.</p>
+    </header>
+
+    <div class="hero">
+      <p><code>agentpass run claude</code></p>
+      <p style="margin-top: 0.5rem; font-size: 0.875rem; color: var(--muted);">Your Claude Code agent now uses keys from the vault — never exposes them.</p>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <span class="feature-icon">🔒</span>
+        <div>
+          <h3>Encrypted local vault</h3>
+          <p>AES-256-GCM encryption. Your keys never leave your machine.</p>
+        </div>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">🔄</span>
+        <div>
+          <h3>Auto-rotation handling</h3>
+          <p>Detects rotated API keys. Your agents keep working seamlessly.</p>
+        </div>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">🌐</span>
+        <div>
+          <h3>HTTP proxy injection</h3>
+          <p>Intercepts requests, substitutes secrets, agents never see raw keys.</p>
+        </div>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">💻</span>
+        <div>
+          <h3>CLI-first for Claude Code users</h3>
+          <p>Drop-in for developers who live in the terminal.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="agents">
+      <h2>Works with</h2>
+      <div class="agent-logos">
+        <span>Claude Code</span>
+        <span>Cursor</span>
+        <span>OpenClaw</span>
+      </div>
+    </div>
+
+    <div class="waitlist">
+      <h2>Join the waitlist</h2>
+      <form id="waitlist-form" class="form">
+        <input type="email" id="email" placeholder="you@example.com" required>
+        <button type="submit">Join</button>
+      </form>
+      <div id="success" class="success" style="display: none;">
+        Thanks! We'll notify you when we're live.
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <p>Local-first. Open source. Built for AI agents.</p>
+  </footer>
+
+  <script>
+    const form = document.getElementById('waitlist-form');
+    const success = document.getElementById('success');
+    const email = document.getElementById('email');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const emailValue = email.value;
+
+      // Store locally for now (Tally integration placeholder)
+      const waitlist = JSON.parse(localStorage.getItem('agentpass_waitlist') || '[]');
+      if (!waitlist.includes(emailValue)) {
+        waitlist.push(emailValue);
+        localStorage.setItem('agentpass_waitlist', JSON.stringify(waitlist));
+      }
+
+      form.style.display = 'none';
+      success.style.display = 'block';
+    });
+  </script>
+</body>
+</html>

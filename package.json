@@ -1,0 +1,19 @@
+{
+  "name": "agentpass",
+  "version": "0.1.0",
+  "description": "Credential broker for AI agents — API keys, passwords, secrets",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "agentpass": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "dependencies": {}
+}
