@@ -87,35 +87,31 @@ export class Vault {
     );
   }
 
-  private encrypt(plaintext: string): string {
+  private async encrypt(plaintext: string): Promise<string> {
     if (!this.encryptionKey) throw new Error("Vault not unlocked");
-    const encoder = new TextEncoder();
     const iv = crypto.getRandomValues(new Uint8Array(12));
-
-    return crypto.subtle.encrypt(
+    const ciphertext = await crypto.subtle.encrypt(
       { name: "AES-GCM", iv },
       this.encryptionKey,
-      encoder.encode(plaintext)
-    ).then((ciphertext) => {
-      const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-      combined.set(iv);
-      combined.set(new Uint8Array(ciphertext), iv.length);
-      return Buffer.from(combined).toString("base64");
-    });
+      new TextEncoder().encode(plaintext)
+    );
+    const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(ciphertext), iv.length);
+    return Buffer.from(combined).toString("base64");
   }
 
-  private decrypt(ciphertext: string): string {
+  private async decrypt(ciphertext: string): Promise<string> {
     if (!this.encryptionKey) throw new Error("Vault not unlocked");
-    const encoder = new TextEncoder();
     const combined = Buffer.from(ciphertext, "base64");
-    const iv = combined.slice(0, 12);
-    const data = combined.slice(12);
-
-    return crypto.subtle.decrypt(
+    const iv = combined.subarray(0, 12);
+    const data = combined.subarray(12);
+    const plaintext = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv },
       this.encryptionKey,
       data
-    ).then((plaintext) => encoder.decode(plaintext));
+    );
+    return new TextDecoder().decode(plaintext);
   }
 
   async add(name: string, value: string, type: string = "api_key"): Promise<void> {
@@ -170,6 +166,20 @@ export class Vault {
 
     const row = this.db.query(`SELECT 1 FROM secrets WHERE name = ?`).get(name);
     return !!row;
+  }
+
+  async getPool(provider: string): Promise<{ name: string; value: string }[]> {
+    if (!this.db) throw new Error("Vault not initialized");
+
+    const rows = this.db.query(
+      `SELECT name, value FROM secrets WHERE name = ? OR name LIKE ? ORDER BY name`
+    ).all(provider, `${provider}-%`) as { name: string; value: string }[];
+
+    const out: { name: string; value: string }[] = [];
+    for (const row of rows) {
+      out.push({ name: row.name, value: await this.decrypt(row.value) });
+    }
+    return out;
   }
 
   check(): boolean {
