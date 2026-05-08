@@ -1,0 +1,23 @@
+name = "agentpass-web"
+main = ".open-next/worker.js"
+compatibility_date = "2025-04-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agentpass-waitlist"
+database_id = "86906215-1086-413b-8cbf-570342f1c464"
+
+[[kv_namespaces]]
+binding = "AGENTPASS_KV"
+id = "11665f8bf9134298b988d8a562526252"
+
+# AI_GATEWAY_API_KEY is provisioned via `wrangler secret put AI_GATEWAY_API_KEY`
+# Never commit secrets to wrangler.toml.
+
+[assets]
+directory = ".open-next/assets"
+
+[[routes]]
+pattern = "pass.agentdrive.sh"
+custom_domain = true

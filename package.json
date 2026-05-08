@@ -4,6 +4,9 @@
   "description": "Credential broker for AI agents — API keys, passwords, secrets",
   "type": "module",
   "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
   "bin": {
     "agentpass": "./src/cli.ts"
   },
