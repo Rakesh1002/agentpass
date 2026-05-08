@@ -64,11 +64,11 @@ export default function Waitlist() {
             <Mail className="h-5 w-5" />
           </div>
           <h2 className="text-2xl font-bold tracking-tight text-fg">
-            Join the waitlist
+            Get the alpha
           </h2>
           <p className="mt-2 text-muted">
-            Be the first to get AgentPass. No spam — just a heads up when the
-            CLI drops.
+            10 founder spots, no spam. We&apos;ll ping you when the CLI ships
+            and send a security tip while you wait.
           </p>
         </div>
 

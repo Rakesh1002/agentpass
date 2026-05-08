@@ -1,22 +1,15 @@
 import type { Metadata } from "next";
 import "./globals.css";
 
+const TITLE = "AgentPass — Keep your AI agents alive when keys rotate or rate-limit";
+const DESCRIPTION =
+  "Local-first credential broker for Claude Code, Cursor, OpenClaw, and Codex. Multi-key fallback on 429, transparent retry on 401, encrypted vault, agents never see the raw key.";
+
 export const metadata: Metadata = {
-  title: "AgentPass — Credential broker for AI agents",
-  description:
-    "Your AI agents will never see your API keys again. Local-first credential broker for Claude Code, Cursor, OpenClaw.",
-  openGraph: {
-    title: "AgentPass — Credential broker for AI agents",
-    description:
-      "Your AI agents will never see your API keys again. Local-first credential broker for Claude Code, Cursor, OpenClaw.",
-    type: "website",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "AgentPass — Credential broker for AI agents",
-    description:
-      "Your AI agents will never see your API keys again. Local-first credential broker for Claude Code, Cursor, OpenClaw.",
-  },
+  title: TITLE,
+  description: DESCRIPTION,
+  openGraph: { title: TITLE, description: DESCRIPTION, type: "website" },
+  twitter: { card: "summary_large_image", title: TITLE, description: DESCRIPTION },
 };
 
 export default function RootLayout({

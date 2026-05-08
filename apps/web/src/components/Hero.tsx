@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Terminal, Lock, Shield } from "lucide-react";
+import { Shield } from "lucide-react";
 
 export default function Hero() {
   return (
@@ -16,7 +16,7 @@ export default function Hero() {
           className="inline-flex items-center gap-2 rounded-full border border-accent/20 bg-accent/5 px-3 py-1 text-xs font-medium text-accent mb-8"
         >
           <Shield className="h-3 w-3" />
-          Open source. Local-first. CLI-native.
+          Open source · Local-first · For Claude Code, Cursor, OpenClaw, Codex
         </motion.div>
 
         <motion.h1
@@ -25,8 +25,9 @@ export default function Hero() {
           transition={{ duration: 0.6, delay: 0.1 }}
           className="text-4xl font-bold tracking-tight text-fg sm:text-6xl"
         >
-          Your AI agents will{" "}
-          <span className="text-accent">never see</span> your API keys again
+          Stop your AI agents from breaking when{" "}
+          <span className="text-accent">a key rotates</span> or{" "}
+          <span className="text-accent">rate-limits</span>
         </motion.h1>
 
         <motion.p
@@ -35,9 +36,11 @@ export default function Hero() {
           transition={{ duration: 0.6, delay: 0.2 }}
           className="mx-auto mt-6 max-w-2xl text-lg text-muted"
         >
-          AgentPass is a local-first credential broker that encrypts your secrets
-          and injects them via HTTP proxy — so Claude Code, Cursor, and any
-          agent runtime stay blind to your keys.
+          AgentPass pools your API keys, falls over to a backup on{" "}
+          <span className="font-mono text-fg">429</span>, retries transparently
+          on <span className="font-mono text-fg">401</span> — and the raw key
+          never leaves your machine. Drop-in for Claude Code, Cursor, OpenClaw,
+          and Codex.
         </motion.p>
 
         <motion.div
@@ -50,7 +53,6 @@ export default function Hero() {
             href="#waitlist"
             className="inline-flex items-center gap-2 rounded-lg bg-accent px-6 py-3 text-sm font-semibold text-bg transition-opacity hover:opacity-90"
           >
-            <Lock className="h-4 w-4" />
             Join the waitlist
           </a>
           <a
@@ -79,26 +81,32 @@ export default function Hero() {
               <div className="h-3 w-3 rounded-full bg-green-500/80" />
               <span className="ml-2 text-xs text-muted font-mono">agentpass</span>
             </div>
-            <div className="p-4 font-mono text-sm text-muted">
+            <div className="p-4 font-mono text-xs sm:text-sm text-muted text-left">
               <div className="flex gap-2">
                 <span className="text-accent">$</span>
-                <span className="text-fg">agentpass init --password mymasterpass</span>
+                <span className="text-fg">agentpass init</span>
               </div>
-              <div className="mt-1 text-accent">✅ Vault initialized successfully</div>
+              <div className="mt-1 text-accent">Vault initialized at ~/.agentpass/vault.db</div>
 
               <div className="mt-3 flex gap-2">
                 <span className="text-accent">$</span>
-                <span className="text-fg">agentpass add openai sk-xxx</span>
+                <span className="text-fg">agentpass add openai sk-...A</span>
               </div>
-              <div className="mt-1 text-accent">✅ Added secret: openai</div>
+              <div className="mt-1 flex gap-2">
+                <span className="text-accent">$</span>
+                <span className="text-fg">agentpass add openai-2 sk-...B</span>
+              </div>
+              <div className="mt-1 text-accent">2 keys pooled for openai</div>
 
               <div className="mt-3 flex gap-2">
                 <span className="text-accent">$</span>
                 <span className="text-fg">agentpass run claude</span>
               </div>
-              <div className="mt-1 flex items-center gap-1 text-muted">
-                <Terminal className="h-3 w-3" />
-                <span>Proxy running on :8888 — Claude Code is now secure</span>
+              <div className="mt-1 text-muted">
+                key …A hit 429, cooldown 60s, falling over → key …B
+              </div>
+              <div className="mt-1 text-fg">
+                ↳ agent didn&apos;t notice. it just kept working.
               </div>
             </div>
           </div>

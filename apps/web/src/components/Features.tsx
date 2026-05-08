@@ -1,32 +1,32 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Lock, RefreshCw, Globe, Terminal, ArrowRight } from "lucide-react";
+import { Layers, RefreshCw, Lock, Terminal, ArrowRight, Globe } from "lucide-react";
 
 const features = [
   {
-    icon: Lock,
-    title: "Encrypted local vault",
+    icon: Layers,
+    title: "Multi-key fallback",
     description:
-      "AES-256-GCM encryption with PBKDF2 key derivation. Your secrets never leave your machine unless you explicitly sync them.",
+      "Pool N keys per provider. On 429, AgentPass cools down the spent key, retries with the next one, and your agent keeps shipping.",
   },
   {
     icon: RefreshCw,
-    title: "Auto-rotation handling",
+    title: "Transparent rotation",
     description:
-      "Detects when an API key is rotated and replays the request with the new key — your agents never break.",
+      "On 401, AgentPass retries with the next key in the pool. Drop the new key into the vault and the next request finds it — no agent restart.",
   },
   {
-    icon: Globe,
-    title: "HTTP proxy injection",
+    icon: Lock,
+    title: "Agent never sees the key",
     description:
-      "Intercepts outgoing requests and substitutes {{secret:name}} placeholders with real credentials at the network layer.",
+      "The proxy injects auth at the network layer. The raw key sits in your encrypted local vault — not in agent context, not in error logs.",
   },
   {
     icon: Terminal,
-    title: "CLI-first for Claude Code",
+    title: "Drop-in for your runtime",
     description:
-      "One-line install via Bun. Drop-in shim for Claude Code, Cursor, OpenClaw, and any MCP-native agent runtime.",
+      "agentpass run claude wires OPENAI_BASE_URL and ANTHROPIC_BASE_URL automatically. Works with Claude Code, Cursor, OpenClaw, Codex.",
   },
 ];
 
@@ -64,6 +64,9 @@ export default function Features() {
         <h2 className="text-center text-2xl font-bold tracking-tight text-fg">
           How it works
         </h2>
+        <p className="mx-auto mt-3 max-w-xl text-center text-sm text-muted">
+          Your agent points <code className="font-mono text-fg">OPENAI_BASE_URL</code> at the local proxy. AgentPass picks a live key, attaches the auth header, and forwards the request — falling over silently if the chosen key is throttled or rotated.
+        </p>
 
         <div className="mx-auto mt-10 flex max-w-3xl flex-col items-center justify-between gap-6 sm:flex-row">
           <div className="flex flex-col items-center gap-2 text-center">
@@ -77,32 +80,29 @@ export default function Features() {
           <div className="flex flex-col items-center gap-1">
             <ArrowRight className="hidden h-5 w-5 text-muted sm:block" />
             <span className="text-xs text-muted sm:hidden">↓</span>
-            <span className="text-xs text-accent">HTTP Proxy</span>
+            <span className="text-xs text-accent">localhost:8888</span>
           </div>
 
           <div className="flex flex-col items-center gap-2 text-center">
             <div className="relative flex h-16 w-16 items-center justify-center rounded-xl border border-accent/30 bg-accent/5">
               <Lock className="h-6 w-6 text-accent" />
-              <div className="absolute -top-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-bg">
-                🔐
-              </div>
             </div>
             <span className="text-sm font-medium text-fg">AgentPass</span>
-            <span className="text-xs text-muted">Vault + Proxy</span>
+            <span className="text-xs text-muted">Vault + Pool + Failover</span>
           </div>
 
           <div className="flex flex-col items-center gap-1">
             <ArrowRight className="hidden h-5 w-5 text-muted sm:block" />
             <span className="text-xs text-muted sm:hidden">↓</span>
-            <span className="text-xs text-accent">Real key injected</span>
+            <span className="text-xs text-accent">live key only</span>
           </div>
 
           <div className="flex flex-col items-center gap-2 text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-xl border border-border bg-card">
               <Globe className="h-6 w-6 text-muted" />
             </div>
-            <span className="text-sm font-medium text-fg">External API</span>
-            <span className="text-xs text-muted">OpenAI, Stripe, etc</span>
+            <span className="text-sm font-medium text-fg">Provider API</span>
+            <span className="text-xs text-muted">OpenAI / Anthropic</span>
           </div>
         </div>
       </motion.div>
