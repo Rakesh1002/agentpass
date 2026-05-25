@@ -3,12 +3,14 @@ import { parseArgs } from "util";
 import { vault } from "./vault";
 import { proxy } from "./proxy";
 import { claudeShim } from "./claude";
+import { listAudit } from "./audit";
+import { certificateAuthority } from "./ca";
 import { spawn } from "child_process";
+import type { ChildProcess } from "child_process";
 import { existsSync } from "fs";
-import { resolve } from "path";
+import { vaultFile } from "./paths";
 
-const VAULT_FILE = resolve(process.env.HOME || "~", ".agentpass", "vault.db");
-const PROVIDERS = ["openai", "anthropic", "groq", "openrouter"];
+const VAULT_FILE = vaultFile();
 
 let globalPassword: string | undefined;
 
@@ -35,7 +37,7 @@ async function main() {
     process.exit(0);
   }
 
-  globalPassword = values.password as string | undefined;
+  globalPassword = typeof values.password === "string" ? values.password : undefined;
 
   const command = args[0];
 
@@ -66,6 +68,12 @@ async function main() {
       case "status":
         await handleStatus();
         break;
+      case "audit":
+        await handleAudit(args.slice(1));
+        break;
+      case "ca":
+        await handleCa(args.slice(1));
+        break;
       case "import-claude":
         await handleImportClaude();
         break;
@@ -91,26 +99,19 @@ AgentPass — credential broker for AI agents
 
 Usage: agentpass <command> [options]
 
-Vault:
-  init                       Initialize encrypted vault
-  add <name> <value>         Add a secret
-  list                       List secret names (values never shown)
-  get <name>                 Show a secret (masked)
-  delete <name>              Remove a secret
-
-Multi-key pool (auto-fallback on 429):
-  add openai sk-...          Primary key
-  add openai-2 sk-...        Pool member #2
-  add openai-3 sk-...        Pool member #3
-
-Runtime:
-  proxy start                Start provider-routed proxy on :8888
-  proxy stop                 Stop proxy
-  run <cmd> [args...]        Run cmd with OPENAI/ANTHROPIC base URLs pointed at proxy
-  status                     Show vault + proxy status
-  import-claude              Import existing Anthropic key from Claude Code config
-
-Supported providers: ${PROVIDERS.join(", ")}
+Commands:
+  init                  Initialize vault with master password
+  add <name> <value>    Add a secret
+  list                  List all secrets
+  get <name>            Get a secret value
+  delete <name>         Delete a secret
+  proxy start           Start HTTP/HTTPS proxy (port 8888)
+  proxy stop            Stop proxy
+  run <cmd>             Run command with proxy enabled
+  audit                 Show recent proxy audit events
+  ca path               Print local CA certificate path
+  status                Show vault and proxy status
+  import-claude         Import existing Anthropic key from Claude Code config
 
 Examples:
   agentpass init
@@ -159,7 +160,7 @@ async function handleInit(args: string[]) {
     return;
   }
 
-  let password = (values.password as string | undefined) || globalPassword;
+  let password: string | undefined = typeof values.password === "string" ? values.password : undefined;
   if (!password) {
     const readline = await import("readline");
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -194,7 +195,7 @@ async function handleAdd(args: string[]) {
 
   const name = positionals[0];
   const value = positionals[1];
-  const type = (values.type as string) || "api_key";
+  const type = typeof values.type === "string" ? values.type : "api_key";
 
   if (!name || !value) {
     throw new Error("Usage: agentpass add <name> <value>");
@@ -237,7 +238,7 @@ async function handleGet(args: string[]) {
   const masked =
     value.length <= 12
       ? "*".repeat(value.length)
-      : value.slice(0, 7) + "…" + value.slice(-4);
+      : value.slice(0, 7) + "..." + value.slice(-4);
   console.log(`${name}: ${masked}`);
   vault.close();
 }
@@ -281,26 +282,17 @@ async function handleRun(args: string[]) {
   await unlock();
   await proxy.start();
 
-  const port = proxy.port();
-  const baseEnv = {
-    OPENAI_BASE_URL: `http://127.0.0.1:${port}/openai/v1`,
-    OPENAI_API_KEY: "agentpass-managed",
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/anthropic`,
-    ANTHROPIC_API_KEY: "agentpass-managed",
-    GROQ_BASE_URL: `http://127.0.0.1:${port}/groq/openai/v1`,
-    GROQ_API_KEY: "agentpass-managed",
-    OPENROUTER_BASE_URL: `http://127.0.0.1:${port}/openrouter/api/v1`,
-    OPENROUTER_API_KEY: "agentpass-managed",
-  };
-
   const cmd = args[0];
   if (!cmd) throw new Error("Usage: agentpass run <command> [args...]");
   const cmdArgs = args.slice(1);
 
-  console.log(`Running "${cmd}" with AgentPass providers wired up.`);
-
-  const child: ReturnType<typeof spawn> = spawn(cmd, cmdArgs, {
-    env: { ...process.env, ...baseEnv },
+  const child: ChildProcess = spawn(cmd, cmdArgs, {
+    env: {
+      ...process.env,
+      HTTP_PROXY: `http://127.0.0.1:${proxy.port()}`,
+      HTTPS_PROXY: `http://127.0.0.1:${proxy.port()}`,
+      NODE_EXTRA_CA_CERTS: certificateAuthority.certPath(),
+    },
     stdio: "inherit",
   });
 
@@ -322,18 +314,47 @@ async function handleStatus() {
   const vaultExists = existsSync(VAULT_FILE);
   console.log(`Vault: ${vaultExists ? "initialized" : "not initialized"}`);
   console.log(`Proxy: ${proxy.isRunning() ? `running on :${proxy.port()}` : "stopped"}`);
-
-  if (vaultExists) {
-    await unlock();
-    for (const p of PROVIDERS) {
-      const pool = await vault.getPool(p);
-      console.log(`  ${p}: ${pool.length} key${pool.length === 1 ? "" : "s"}`);
-    }
-    vault.close();
-  }
+  console.log(`CA certificate: ${certificateAuthority.certPath()}`);
 
   const configPath = claudeShim.findConfig();
   if (configPath) console.log(`Claude Code config: ${configPath}`);
+}
+
+async function handleAudit(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      limit: { type: "string", short: "n", default: "20" },
+    },
+    allowPositionals: true,
+    strict: false,
+  });
+
+  const limit = Number(values.limit || "20");
+  const rows = listAudit(Number.isFinite(limit) ? limit : 20);
+  if (rows.length === 0) {
+    console.log("No audit events.");
+    return;
+  }
+
+  for (const row of rows) {
+    const timestamp = new Date(row.timestamp).toISOString();
+    const status = row.statusCode || "-";
+    const secrets = row.secretNames.length > 0 ? row.secretNames.join(",") : "-";
+    const error = row.error ? ` error="${row.error}"` : "";
+    console.log(
+      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}`
+    );
+  }
+}
+
+async function handleCa(args: string[]) {
+  const action = args[0];
+  if (action === "path" || !action) {
+    console.log(certificateAuthority.certPath());
+    return;
+  }
+  throw new Error("Usage: agentpass ca path");
 }
 
 async function handleImportClaude() {

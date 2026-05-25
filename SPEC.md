@@ -4,7 +4,7 @@
 
 **Name:** AgentPass
 **Type:** CLI tool (local-first credential broker for AI agents)
-**Core functionality:** Encrypted vault + HTTP proxy that injects credentials into agent HTTP traffic so agents never see raw API keys
+**Core functionality:** Encrypted vault + local proxy validation sprint. Direct proxy requests can substitute credential placeholders; HTTPS `CONNECT` is currently tunneled but not decrypted or rewritten.
 **Target users:** Developers running Claude Code, Cursor, OpenClaw agents who manage multiple API keys
 
 ---
@@ -44,8 +44,9 @@
 2. **HTTP Proxy with Credential Injection**
    - Start proxy: `agentpass proxy start`
    - Default port: 8888
-   - Intercept outgoing HTTP/HTTPS requests
-   - Replace `{{secret:SECRET_NAME}}` patterns in Authorization headers with real keys
+   - Intercept direct HTTP proxy requests
+   - Replace `{{secret:SECRET_NAME}}` patterns in configured credential headers with real keys
+   - Support HTTPS `CONNECT` tunneling without claiming encrypted header rewriting
    - Support API key (`Bearer xxx`), Basic auth, custom headers
 
 3. **Agent Runner**
@@ -114,7 +115,7 @@ agentpass status            Show vault status, proxy state
 3. ✅ `agentpass list` shows secret names only (never values)
 4. ✅ `agentpass proxy start` starts HTTP proxy on port 8888
 5. ✅ Proxy intercepts requests to `api.openai.com`, replaces placeholder with real key
-6. ✅ `agentpass run curl https://api.openai.com/v1/models` works end-to-end
+6. ⏳ `agentpass run curl https://api.openai.com/v1/models` works as a CONNECT tunnel; generic HTTPS header substitution requires a future trusted local-CA/TLS interception flow
 7. ✅ Vault file is encrypted — cannot read secrets with `cat` or text editor
 8. ✅ MVP ships as single binary or runnable via `bun run`
 

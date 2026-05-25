@@ -43,7 +43,7 @@ export class ClaudeShim {
     try {
       const content = readFileSync(CLAUDE_ENV_FILE, "utf-8");
       const match = content.match(/ANTHROPIC_API_KEY=(.+)/);
-      return match && match[1] ? match[1].trim() : null;
+      return match?.[1] ? match[1].trim() : null;
     } catch {
       return null;
     }
