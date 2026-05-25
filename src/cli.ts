@@ -2,11 +2,14 @@ import { parseArgs } from "util";
 import { vault } from "./vault";
 import { proxy } from "./proxy";
 import { claudeShim } from "./claude";
+import { listAudit } from "./audit";
+import { certificateAuthority } from "./ca";
 import { spawn } from "child_process";
+import type { ChildProcess } from "child_process";
 import { existsSync } from "fs";
-import { resolve } from "path";
+import { vaultFile } from "./paths";
 
-const VAULT_FILE = resolve(process.env.HOME || "~", ".agentpass", "vault.db");
+const VAULT_FILE = vaultFile();
 
 let globalPassword: string | undefined;
 
@@ -33,7 +36,7 @@ async function main() {
     process.exit(0);
   }
 
-  globalPassword = values.password;
+  globalPassword = typeof values.password === "string" ? values.password : undefined;
 
   const command = args[0];
 
@@ -62,6 +65,12 @@ async function main() {
         break;
       case "status":
         await handleStatus();
+        break;
+      case "audit":
+        await handleAudit(args.slice(1));
+        break;
+      case "ca":
+        await handleCa(args.slice(1));
         break;
       case "import-claude":
         await handleImportClaude();
@@ -95,6 +104,8 @@ Commands:
   proxy start           Start HTTP proxy (port 8888)
   proxy stop            Stop HTTP proxy
   run <cmd>             Run command with proxy enabled
+  audit                 Show recent proxy audit events
+  ca path               Print local CA certificate path
   status                Show vault and proxy status
 
 Examples:
@@ -138,7 +149,7 @@ async function handleInit(args: string[]) {
     return;
   }
 
-  let password = values.password;
+  let password: string | undefined = typeof values.password === "string" ? values.password : undefined;
   if (!password) {
     const readline = await import("readline");
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -179,7 +190,7 @@ async function handleAdd(args: string[]) {
 
   const name = positionals[0];
   const value = positionals[1];
-  const type = values.type || "api_key";
+  const type = typeof values.type === "string" ? values.type : "api_key";
 
   if (!name || !value) {
     throw new Error("Usage: agentpass add <name> <value> [--type api_key|bearer|basic]");
@@ -301,11 +312,16 @@ async function handleRun(args: string[]) {
   const cmd = args[0];
   const cmdArgs = args.slice(1);
 
-  const child = spawn(cmd, cmdArgs, {
+  if (!cmd) {
+    throw new Error("Usage: agentpass run <command>");
+  }
+
+  const child: ChildProcess = spawn(cmd, cmdArgs, {
     env: {
       ...process.env,
       HTTP_PROXY: `http://127.0.0.1:${proxy["config"].port}`,
       HTTPS_PROXY: `http://127.0.0.1:${proxy["config"].port}`,
+      NODE_EXTRA_CA_CERTS: certificateAuthority.certPath(),
     },
     stdio: "inherit",
   });
@@ -316,7 +332,7 @@ async function handleRun(args: string[]) {
     process.exit(0);
   });
 
-  child.on("exit", async (code) => {
+  child.on("exit", async (code: number | null) => {
     await proxy.stop();
     vault.close();
     process.exit(code || 0);
@@ -324,9 +340,10 @@ async function handleRun(args: string[]) {
 }
 
 async function handleStatus() {
-  const vaultExists = existsSync(VAULT_FILE);
+  const vaultExists = existsSync(vaultFile());
   console.log(`Vault: ${vaultExists ? "✅ exists" : "❌ not initialized"}`);
   console.log(`Proxy: ${proxy.isRunning() ? "✅ running" : "❌ stopped"}`);
+  console.log(`CA certificate: ${certificateAuthority.certPath()}`);
 
   const configPath = claudeShim.findConfig();
   if (configPath) {
@@ -336,6 +353,43 @@ async function handleStatus() {
   } else {
     console.log(`Claude config: ❌ not found`);
   }
+}
+
+async function handleAudit(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      limit: { type: "string", short: "n", default: "20" },
+    },
+    allowPositionals: true,
+    strict: false,
+  });
+
+  const limit = Number(values.limit || "20");
+  const rows = listAudit(Number.isFinite(limit) ? limit : 20);
+  if (rows.length === 0) {
+    console.log("No audit events.");
+    return;
+  }
+
+  for (const row of rows) {
+    const timestamp = new Date(row.timestamp).toISOString();
+    const status = row.statusCode || "-";
+    const secrets = row.secretNames.length > 0 ? row.secretNames.join(",") : "-";
+    const error = row.error ? ` error="${row.error}"` : "";
+    console.log(
+      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}`
+    );
+  }
+}
+
+async function handleCa(args: string[]) {
+  const action = args[0];
+  if (action === "path" || !action) {
+    console.log(certificateAuthority.certPath());
+    return;
+  }
+  throw new Error("Usage: agentpass ca path");
 }
 
 async function handleImportClaude() {

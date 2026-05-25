@@ -1,337 +1,354 @@
-# AgentPass — Venture Strategy Memo
+# AgentPass — Venture Strategy Memo (v2)
 
-**Pitch as given:** Credential manager for AI agents — API keys, passwords, secrets so they can keep working without any hiccups.
+**Pitch:** Local-first credential broker for AI coding agents. Free MIT-licensed CLI. Your Claude Code, Cursor, and OpenClaw agents never see your raw API keys.
 **Audience:** Rakesh (solo founder, 30-venture portfolio, profitable AudioPod, Bangalore).
-**Date:** 2026-04-27.
-**Verdict (so you can stop reading if you want):** **KILL the pitch as written.** A narrow re-pitch in §5 has a 25–30% chance. The broad pitch has a 5% chance.
+**Date:** 2026-05-23.
+**Supersedes:** STRATEGY.md v1 (2026-04-27).
+**Verdict (so you can stop reading if you want):** **CONDITIONAL GO for a 30-day validation sprint. NO-GO for the six-month venture plan as written.** OSS-first remains the right posture, but cloud sync, Teams, Observability, enterprise design partners, and $50K+ MRR planning are deferred until the CLI proves real pull.
+
+**Current operating plan:** [VALIDATION_SPRINT.md](./VALIDATION_SPRINT.md) is the active decision document. Sections below remain useful market context, but any claim that assumes generic HTTPS credential rewriting, cloud monetisation, or a $50K–$100K MRR path is shelved until the day-30 exit criteria are hit.
 
 ---
 
-## Phase 0 — Stop-the-clock: why I'm calling this early
+## Phase 0 — What changed since v1
 
-The literal pitch — "vault that holds API keys, passwords, secrets for AI agents" — was shipped, in production, by four well-funded incumbents and three open-source projects in the last 90 days. Specifically:
+Five weeks ago I called the broad pitch dead. I was directionally right but **factually sloppy**. Web research on 2026-05-23 forces three corrections:
 
-- **1Password** launched **Unified Access** on **2026-03-17** with Anthropic, Cursor, GitHub, Perplexity, and Vercel as launch partners. Discovers exposed `.env`, SSH keys, and long-lived tokens; centralises them; will issue scoped credentials at runtime "later in 2026." ([1Password press release](https://1password.com/press/2026/mar/1password-unified-access))
-- **Infisical** open-sourced **Agent Vault** — a credential-injecting HTTP proxy with the exact architecture you'd build (agents get placeholder keys, proxy substitutes the real ones at the network layer). It's free. ([Infisical / GitHub](https://github.com/Infisical/agent-vault), [Show HN](https://news.ycombinator.com/item?id=47865822))
-- **Composio** ($29M, Lightspeed-backed): 850+ pre-built connectors with a token-brokering vault baked in. Free tier is 20K tool calls/mo, paid starts at $29/mo. ([Composio pricing](https://composio.dev/pricing), [Extruct funding profile](https://www.extruct.ai/hub/composio-dev/))
-- **Arcade.dev** ($12M seed, March 2025, Laude Ventures): "MCP runtime for production AI agents" — auth+tools+governance bundled. ([Arcade funding](https://www.businesswire.com/news/home/20250318815130/en/))
-- **HashiCorp Vault** is now IBM-owned (Feb 2025, $6.4B); Vault 2.0 shipped in 2026 with the Vault MCP server beta. ([InfoQ](https://www.infoq.com/news/2026/04/vault-2-0-ibm-identity/))
-- Two more **Show HN credential proxies in 2025–26**: OneCLI (Rust) and AgentSecrets — same architecture, free.
+1. **The competitive map in v1 was wrong.** Only two of the five named "incumbents shipped the headline feature" actually ship the HTTP-proxy-with-placeholder architecture: Infisical Agent Vault (MIT OSS, [GitHub](https://github.com/Infisical/agent-vault), launched 2026-04-22, v0.21.1 shipped 2026-05-20) and HashiCorp Vault native-AI-agent (early-access only, [HashiCorp blog 2026-05-12](https://www.hashicorp.com/en/blog/announcing-native-ai-agent-support-in-hashicorp-vault), public beta "summer"). The other three are different product categories:
+   - **1Password Unified Access** ([2026-03-17 press release](https://1password.com/press/2026/mar/1password-unified-access)) is endpoint discovery + enterprise audit, not a runtime proxy. Scoped credential issuance is "later in 2026." Wrong ICP — sells to CISOs.
+   - **Composio** is Zapier-for-agents — 850 connectors, per-call billing, agent still touches keys via SDK function calls. [composio.dev/agentauth](https://composio.dev/agentauth).
+   - **Arcade.dev** is end-user OAuth delegation for SaaS tools (Gmail, Slack), not developer API keys. [docs.arcade.dev](https://docs.arcade.dev/en/get-started/about-arcade).
 
-When the headline feature has been shipped by the top three incumbents in the last 90 days, my standing kill rule fires. You wrote that rule yourself. I'm going to honour it, then see if there's a narrower wedge worth re-pitching.
+   v1's "five shipped in 90 days" framing collapses to **one direct OSS twin (Infisical), one half-shipped enterprise feature (Vault EA), and three category errors.**
+
+2. **The real threat is one project, not five.** Infisical Agent Vault is the architectural twin. MIT-licensed. Free. ~1.3k GitHub stars at launch. Same MITM HTTPS proxy, same placeholder substitution (their tokens look like `__anthropic_api_key__`; ours look like `{{secret:openai}}`). [Launch blog](https://infisical.com/blog/agent-vault-the-open-source-credential-proxy-and-vault-for-agents), [Show HN thread](https://news.ycombinator.com/item?id=47865822). We enter this fight five weeks behind the OSS leader. If we can't beat them on positioning (we won't beat them on features alone), this is over.
+
+3. **MCP authentication is settled.** RFC 9728 (OAuth 2.0 Protected Resource Metadata) was mandated by the MCP spec in June 2025; the formal authorization spec ratified in the [MCP 2025-11-25 revision](https://modelcontextprotocol.io/specification/2025-11-25); OAuth 2.1 + PKCE is de facto; [MCP 2026 roadmap](https://stackoverflow.blog/2026/01/21/is-that-allowed-authentication-and-authorization-in-model-context-protocol/) prioritises SAML/OIDC enterprise auth. **The key-injection thesis has a 12–24 month window.** After that, the LLM-side static-API-key use case partially evaporates and the moat must evolve into a policy/observability layer (who used what, when, how much, with what scope, against what budget). Plan for that pivot from day one.
+
+What the v1 verdict got *right*: the field is crowded; you don't have an enterprise distribution channel; a $100K-MRR-in-12-months goal is fantasy in this category. What it got *wrong*: it failed to see that **the runtime-specific local-first OSS lane is actually open** — Infisical is a generic vault company shipping an agent feature, not an agent-first vault. That lane is winnable by a solo founder with a 12-week content cadence and an MVP that already exists in the repo. The new verdict reflects that.
 
 ---
 
 ## Phase 1 — Snapshot (the partner memo)
 
-AgentPass wants to be the secrets/credentials layer between AI agents and the APIs they call. The thesis is that agents are non-deterministic, prompt-injection-prone, and leak secrets at industrial scale (GitGuardian: 28.6M secrets exposed on public GitHub in 2025, +34% YoY — [Help Net Security](https://www.helpnetsecurity.com/2026/04/14/gitguardian-ai-agents-credentials-leak/)). The product is, at minimum, an encrypted vault + a brokering proxy that injects creds into agent HTTP traffic so the agent process never holds them. At maximum, it grows into agent identity + scoped runtime auth + audit trail.
+AgentPass is the secrets layer between local AI coding agents and the APIs they call. Architecture: an encrypted SQLite vault with AES-256-GCM at rest (PBKDF2 100k iterations for the KEK), plus a localhost HTTP proxy that intercepts agent traffic and substitutes `{{secret:NAME}}` placeholders for real credentials. The agent process never holds the raw key in memory; the proxy holds it for the lifetime of the request only.
 
-Stage: greenfield (empty repo, 2026-04-07). No customers, no MVP, no landing page. The category around it is in late seed / Series-A consolidation. The buyer profile (security-conscious dev team) is already buying 1Password, Doppler, Infisical, Composio, or HashiCorp. The wedge requires either an underserved segment those buyers don't reach, or a structural advantage you can hold for 12+ months. As pitched, neither is present.
+**Stage (2026-05-23):**
+- Repo: 1 commit (`b7575af`, Initial commit: MVP with encrypted vault, HTTP proxy, CLI).
+- Code: Bun + TypeScript. Vault, proxy, CLI scaffolded. Claude Code shim auto-detects keys in `.claude/settings.json`. No tests.
+- Distribution: no public repo URL, no domain, no landing page, no waitlist, 0 stars, 0 users.
+- Strategic posture (locked by founder, 2026-05-23): **OSS-first land-grab.** Free MIT CLI ships fast. Monetisation via paid cloud tier (sync + Teams + audit) after community traction. Eventual evolution into policy/observability layer for the MCP-OAuth era.
+
+Why now (the question every founder gets asked): **the pain window is open and accelerating.** GitGuardian's [State of Secrets Sprawl 2026](https://blog.gitguardian.com/the-state-of-secrets-sprawl-2026/): 28.65M new secrets leaked on public GitHub in 2025 (+34% YoY); AI-service credential leaks +81% YoY to 1.27M; 24,008 unique secrets in MCP-related config files (2,117 verified valid); commits by Claude Code leaked secrets at ~3.2% — twice the baseline. Public agent disasters now land monthly (full list in §7). The pain is documented, monetisable, and *getting worse*.
+
+Why us (the harder question): you are a solo founder running 30 ventures with no security brand. You will lose any race that requires a sales engineer, a SOC-2 Type II report, or a Fortune-500 logo wall. You can win the race for **the single dev with six AI agents wired into their workflow and a `.env` they're scared of.** That dev does not call CISOs. That dev reads Hacker News, lurks in r/ClaudeAI (862K members) and r/cursor (77K), and installs the first thing whose `README` makes the pain go away in 90 seconds. That's our buyer.
 
 ---
 
 ## Phase 2 — Market diagnosis
 
-### TAM / SAM / SOM (bottoms-up, not the analyst-deck $38B)
+### TAM / SAM / SOM (bottoms-up, ignore the $38B analyst-deck number)
 
-The "Non-Human Identity Access Management" reports throw $11.3B (2025) → $38.8B (2036) at 12.2% CAGR ([GlobeNewswire / Meticulous](https://www.globenewswire.com/news-release/2026/04/22/3279125/0/en/Non-Human-Identity-Access-Management-Market-Global-Forecast-Report-2026-2036.html)). Ignore that — those numbers count every machine identity (service accounts, IoT, K8s tokens, RPA), not the slice you'd actually own. Bottoms-up:
+The "Non-Human Identity Access Management" category is a $11–38B story over 2025–2036 ([GlobeNewswire / Meticulous](https://www.globenewswire.com/news-release/2026/04/22/3279125/0/en/Non-Human-Identity-Access-Management-Market-Global-Forecast-Report-2026-2036.html)) but counts every machine identity (K8s tokens, IoT, RPA, service accounts). Ignore that for our segment.
 
-- **Sized by competitor revenue (proxy for spend that exists today):** Composio is reportedly at <$10M ARR with 850+ connectors and a free tier converting at indie-pricing ($29–229/mo). Doppler claims 16K customers serving 1.5B secrets/mo (2022 data, [SiliconANGLE](https://siliconangle.com/2022/04/27/)) — at a guess $30–60M ARR. Arcade.dev has 29 employees post-seed ([Tracxn](https://tracxn.com/d/companies/arcade/__wcClSaNlV_83fCQ_eaLxJCUM8WuOtHQX28FYfKTH8B0)) — under $5M ARR. **Visible spend on agent-specific credential tooling today: ~$50–100M global, growing 3–4x/yr.**
-- **SAM you could realistically reach as a solo founder:** the long-tail of indie devs and 1–10 person teams building MCP-native agents who refuse to lock into 1Password Enterprise or HashiCorp. Cursor reportedly crossed 1M paying users in 2025; Claude Code is in similar territory. If 5% of those have agent-key management pain and 1% would pay $20/mo, that's **~5,000 customers × $240/yr = $1.2M ARR cap.** Below the $1.2M ARR ($100K MRR) goalpost — barely.
-- **SOM for year 1:** 200–500 customers paying $15–30/mo if you nail an indie wedge. That's $3K–15K MRR realistic.
+**Visible category spend on agent-specific credential tooling today:** ~$50–100M global, growing 3–4× per year.
+- Composio: ~$5–10M ARR, [$29M Series A](https://www.extruct.ai/hub/composio-dev/), 850 connectors.
+- Arcade.dev: <$5M ARR, [$12M seed](https://www.businesswire.com/news/home/20250318815130/en/), 29 employees.
+- Infisical: well-funded, OSS-led, free Agent Vault gating a [paid Pro tier at $18/user/mo](https://infisical.com/pricing).
+- Doppler: ~$30–60M ARR estimate ([2022 SiliconANGLE data](https://siliconangle.com/2022/04/27/) — 16K customers, 1.5B secrets/mo), flat-ish recent growth signal.
+- HashiCorp Vault: now IBM-owned ([$6.4B exit Feb 2025](https://www.ibm.com/think/news/ibm-acquires-hashicorp)).
 
-The honest read: **the slice you can win as a solo founder is ~$1–2M ARR, and it's contested.** Building to $100K MRR in this category requires either an enterprise pivot (which you're not equipped for) or a much narrower wedge.
+**Reachable SAM as solo founder:** the long-tail of devs using Claude Code, Cursor, Cline, Aider, OpenClaw, Codex CLI who refuse enterprise lock-in. Reachable cohorts (verified):
+- Cursor: [~$2B ARR, >1M DAU, multi-million MAU](https://sacra.com/c/cursor/) (Feb 2026).
+- Cline: [5M VS Code installs, $32M Series A](https://www.morphllm.com/best-ai-coding-agents-2026).
+- Aider: 39K stars, ~4.1M installs, ~15B tokens/week.
+- Claude Code: no official MAU; GitGuardian's metric (Claude-Code-assisted commits at 2× the secret-leak baseline) implies measurable share of public GitHub activity.
+- MCP registry: [~2,000 servers, 97M monthly SDK downloads, 81K GitHub stars by March 2026](https://workos.com/blog/everything-your-team-needs-to-know-about-mcp-in-2026).
+- r/ClaudeAI 862K, r/cursor 77K, r/LocalLLaMA ~500K ([Gummysearch](https://gummysearch.com/r/ClaudeAI/)).
+- Stack Overflow 2025: 84% of devs use AI tools, **23% use agents weekly**, 81% concerned about security/privacy of agents ([Stack Overflow](https://stackoverflow.blog/2025/12/29/developers-remain-willing-but-reluctant-to-use-ai-the-2025-developer-survey-results-are-here/)).
 
-### Tailwinds (concrete)
+Order-of-magnitude SAM math: if 23% of pro devs use agents weekly and pro devs globally number ~25M, that's ~5.75M weekly agent users. If 10% are power users with multi-key pain and 1.5% would pay $7/mo for a Personal Cloud tier, that's **~8,600 × $84/yr = $720K ARR cap on the personal tier alone.** Add Teams at $19/seat for 2–10 person AI-native startups (~5,000 such teams reachable in year 2 × 3 seats × $228/yr × 5% capture) = **another $1.7M ARR ceiling.** Total realistic SAM: **$2–3M ARR.** Below venture-scale, above lifestyle-business floor. Inside the user's stated $10K–$100K MRR range, by design.
 
-1. **MCP donated to the Linux Foundation's Agentic AI Foundation (AAIF) in Dec 2025.** Co-founders: Anthropic, Block, OpenAI. This makes MCP a multi-vendor standard, not an Anthropic project, which means MCP-related infra has a real future. ([Wikipedia: Model Context Protocol](https://en.wikipedia.org/wiki/Model_Context_Protocol))
-2. **MCP 2025-06-18 spec mandates OAuth 2.1 for streamable HTTP transport.** Authentication is now a first-class part of the spec, not an afterthought. ([MCP spec](https://modelcontextprotocol.io/specification/2025-11-25), [Stack Overflow blog](https://stackoverflow.blog/2026/01/21/is-that-allowed-authentication-and-authorization-in-model-context-protocol/))
-3. **Cloudflare Agents Week 2026 (Apr 13–17)** shipped Dynamic Workers (isolate sandboxes 100× faster than containers), Sandboxes GA, AI Search GA, expanded Workflows. ([Cloudflare blog recap](https://blog.cloudflare.com/agents-week-in-review/)) — runtime infra is cheaper and more available, *which is bad for you*: it lets every competitor ship the proxy version of this product in a weekend.
-4. **GitGuardian's 2025 report**: 28.6M public-repo secret leaks, +34% YoY. Real, repeated, monetisable pain. ([Help Net Security](https://www.helpnetsecurity.com/2026/04/14/gitguardian-ai-agents-credentials-leak/))
-5. **Recent breaches that prove the threat model is real:** Vercel breach via Context AI supply-chain attack (2026-04-19); infostealer malware targeting OpenClaw config files (Feb 2026). ([Hacker News](https://thehackernews.com/2026/02/infostealer-steals-openclaw-ai-agent.html))
+**Year-1 SOM:** 200–500 paying customers at $7–19/mo blended. **$2K–8K MRR by month 12 is the realistic range.** $10K MRR by month 9–12 is the bull case.
 
-### Headwinds (more concrete)
+### Tailwinds (concrete, cited)
 
-1. **1Password Unified Access (March 2026) is a category-extinction event for the consumer/prosumer slice.** It plugs into Cursor, GitHub, Vercel, Anthropic, Perplexity. If you're a developer, your org already uses 1Password for human creds; turning on Unified Access is a checkbox, not a buy decision.
-2. **HashiCorp + IBM owns the enterprise.** Vault 2.0 ships agent dynamic secrets natively. Banks, fintechs, governments will not switch.
-3. **Composio + Arcade + Nango are eating the integration layer.** Token brokering is a feature inside their broader "AI agent integration platform" pitch. They have $50M+ combined to give it away free at the bottom and upsell governance at the top.
-4. **The "credential-injecting proxy" architecture has at least three open-source implementations** (Agent Vault, OneCLI, AgentSecrets) shipped as Show HN hits in 2025–26. Free, MIT-licensed, working. The HN comment thread on Agent Vault is itself a competitive moat — every smart objection has been raised and roadmapped.
-5. **The buyer who pays is the one with compliance-driven pain (SOC 2, ISO 27001, DPDP, EU AI Act).** That buyer wants a vendor with an audit firm, a SOC 2 Type II report, and a sales engineer. You're none of those.
+1. **Secrets sprawl is an accelerating disaster.** GitGuardian 2026: +34% YoY new public leaks, +81% YoY AI-service leaks, 64% of secrets confirmed valid in 2022 still work in Jan 2026, internal repos 6× more likely than public to contain hardcoded secrets. The pain is real, measured, monetisable.
+2. **Public agent disasters are now monthly news.** Replit AI deleted a production DB in [July 2025](https://cybersrcc.com/2025/08/26/rogue-replit-ai-agent-deletes-production-database-and-executes-deceptive-cover-up/). Johann Rehberger demoed [end-to-end secrets exfiltration from Devin via prompt injection for $500](https://embracethered.com/blog/posts/2025/devin-can-leak-your-secrets/). Claude Code's source map leaked on [2026-03-31](https://www.zscaler.com/blogs/security-research/anthropic-claude-code-leak), making CVE-2026-21852 (key exfil via malicious MCP servers) easier to weaponise. [WordPress 7.0 shipped 2026-05](https://www.techtimes.com/articles/317028/20260522/wordpress-70-ships-ai-agent-infrastructure-api-key-theft-risk-surfaces-launch-day.htm) with an AI form that autofills Anthropic keys in plaintext. Dollar-quantified incidents pile up: [$4,200 over 63 hours](https://medium.com/@sattyamjain96/the-agent-that-burned-4-200-in-63-hours-a-production-ai-postmortem-d38fd9586a85), $72K overnight retry loop, [$1.3M month for the OpenClaw creator](https://www.tomshardware.com/tech-industry/artificial-intelligence/openclaw-creator-burns-through-1-3-million-in-openai-api-tokens-in-a-single-month).
+3. **MCP is now multi-vendor.** Anthropic donated MCP to the [Linux Foundation Agentic AI Foundation in December 2025](https://en.wikipedia.org/wiki/Model_Context_Protocol) (co-founders: Anthropic, Block, OpenAI). Vendor-neutral infra is fundable infra.
+4. **EU AI Act high-risk obligations live 2026-08-02.** Enterprise procurement is rewriting AI vendor questionnaires now ([Orrick](https://www.orrick.com/en/Insights/2025/11/The-EU-AI-Act-6-Steps-to-Take-Before-2-August-2026)). India DPDP Phase II (consent manager) live 2026-11-13; Phase III obligations live 2027-05-13 with penalties up to ₹250 crore ([IAPP](https://iapp.org/news/a/with-rules-finalized-india-s-dpdpa-takes-force)). These are tailwinds for whoever owns the agent-traffic audit log — that's the policy/observability tier we want to build into in year 2.
+5. **23% of devs use agents weekly and the share is growing.** Early enough to define category language, late enough that the buyer cohort exists.
 
-### Capital flows
+### Headwinds (real and serious)
+
+1. **MCP OAuth 2.1 is winning.** RFC 9728 ratified in MCP 2025-11-25 spec. Q2 2026 roadmap = enterprise SAML/OIDC. As MCP servers (Stripe, Linear, GitHub, Sentry, Atlassian, HubSpot, Vercel — all moved from STDIO to remote HTTP in Q2 2026 per [Digital Applied](https://www.digitalapplied.com/blog/mcp-ecosystem-h1-2026-retrospective-adoption-data-points)) migrate to OAuth, **the "static API key I need to inject" problem shrinks** for the MCP-tool side. LLM provider keys (Anthropic, OpenAI, Gemini, Groq, DeepSeek) remain key-shaped for the foreseeable future — that's the durable surface. Plan: lean into LLM-key brokering + non-MCP API keys in V1; pivot to policy/observability for the MCP-OAuth-era flows in V2.
+2. **Infisical Agent Vault is free, MIT, and shipped 5 weeks ahead of us.** They have brand, distribution (existing 50K+ star OSS vault), and an enterprise upsell already wired. They are structurally optimised for generic developer-tools positioning. We win by being **opinionated and runtime-specific** in a way they can't be without alienating their enterprise pipeline.
+3. **Platform-native key isolation incoming.** 1Password Unified Access has Anthropic, Cursor, GitHub, Vercel, Perplexity as launch partners. Anthropic could ship native Claude Code key isolation in 90 days. Cursor could do the same. Our window: ~12 months before native primitives appear; ~24 months before they're enterprise-ready.
+4. **Free OSS ceiling on pricing power.** Doppler free tier, Infisical free OSS, Bitwarden CLI free — devs are anchored to "secrets management = free or near-free." Our paid tier must sell *something the free CLI doesn't do* (sync, audit log, Teams sharing, observability), not the core brokering itself.
+5. **OSS proxies multiplied.** Beyond Infisical Agent Vault: [agentgateway](https://github.com/agentgateway/agentgateway) (OSS MCP+A2A proxy), [mcp-gateway-registry](https://github.com/agentic-community/mcp-gateway-registry) (Keycloak/Entra OAuth), [IBM ContextForge](https://www.lunar.dev/post/the-best-open-source-mcp-gateways-in-2026), Microsoft MCP Gateway, AWS Bedrock AgentCore. The pattern is commodity. Our differentiation is the **personal/indie wedge** — none of these are pitched to a single dev with six agents and a `.env`.
+
+### Capital flows (2025-26 snapshot)
 
 - Composio: $29M Series A (Lightspeed, Together, Mar 2025).
 - Arcade.dev: $12M seed (Laude, Mar 2025).
-- Doppler: $28.9M cumulative; ISO 27001 cert Sep 2025; flat-ish growth signal.
-- Infisical: well-funded; OSS-led; agent feature shipped 2026-Q1.
-- HashiCorp: $6.4B exit to IBM (Feb 2025).
-- 1Password: ~$6.8B last valuation; Unified Access launch Mar 2026.
+- Cline: $32M Series A (2026).
+- Doppler: $28.9M cumulative; ISO 27001 cert Sep 2025; flat-ish growth.
+- Infisical: well-funded; OSS-led; Agent Vault shipped Q1 2026.
+- HashiCorp: $6.4B IBM acquisition Feb 2025.
+- 1Password: ~$6.8B last valuation; Unified Access Mar 2026.
+- YC W26 cohort: Clam, Cascade, Agentic Fabriq all in agent identity/auth/governance ([buildmvpfast YC W26 analysis](https://www.buildmvpfast.com/blog/yc-w26-batch-agent-infrastructure-boom), [TechCrunch Demo Day](https://techcrunch.com/2026/03/26/16-of-the-most-interesting-startups-from-yc-w26-demo-day/)).
 
-This category is **overcapitalized at the top** and **commoditizing at the bottom** (3 free OSS proxies). The middle — which is where a solo founder has to live — is being squeezed.
+This category is **overcapitalised at the top, commoditised at the bottom, with a thin middle.** The middle is what we want — a paid Personal Cloud tier between free OSS and enterprise seat-based. That middle is **uncontested as of 2026-05-23.**
 
-### Regulatory / platform risk
+### Regulatory and platform risk
 
-- **MCP spec changes** can re-architect your product overnight. The spec moved from 2025-03 → 2025-06-18 → 2025-11-25 in 8 months. You'd be chasing it.
-- **OpenAI / Anthropic / Cursor / Claude Code adding native vault features** kills your TAM. 1Password partnership with all five is the warning shot.
-- **India DPDP Act Phase II (consent manager) goes live 2026-11-13; Phase III (full obligations) 2027-05-13.** Penalties up to ₹250 crore. ([IAPP](https://iapp.org/news/a/with-rules-finalized-india-s-dpdpa-takes-force)) This is *theoretically* a tailwind for credential governance — but the buyers under DPDP are large enterprises, not your reachable segment.
+- **MCP spec churn.** Moved from 2025-03 → 2025-06-18 → 2025-11-25 in 8 months. Mitigation: track the spec weekly; ship spec-compliant features within 30 days of revision; never depend on undocumented behaviour.
+- **Anthropic / OpenAI / Cursor / Claude Code shipping native vault primitives.** Mitigation: be the "OSS reference implementation" + "polish-layer" for whatever they ship. If Anthropic ships Claude Code key isolation, we become "the multi-vendor version of that."
+- **EU AI Act / India DPDP** — net tailwind once enterprise tier exists; net neutral for year-1 personal tier.
 
 ---
 
-## Phase 3 — Competitive topology
+## Phase 3 — Competitive topology, corrected
 
 ```
                     BROAD (everything for everyone)         NARROW (one wedge)
                   ┌───────────────────────────────────┬─────────────────────────────┐
-                  │  HashiCorp Vault (IBM)            │  Pomerium (zero-trust prxy) │
-   INCUMBENTS     │  1Password Unified Access         │  Strata (identity fabric)   │
-                  │  Doppler                          │  Pangea (AI security svcs)  │
-                  │  Infisical                        │  Oso (authorization eng)    │
+   INCUMBENTS     │  HashiCorp Vault (IBM, EA)        │  1Password Unified Access   │
+   (enterprise,   │  Doppler                          │    [endpoint discovery]     │
+    seat-based)   │                                   │                             │
                   ├───────────────────────────────────┼─────────────────────────────┤
-   UPSTARTS       │  Composio (850 connectors)        │  Arcade.dev (MCP runtime)   │
-                  │  Nango (code-first integrations)  │  Agent Vault (OSS proxy)    │
-                  │  Merge.dev (unified API)          │  OneCLI (Rust proxy)        │
-                  │  Pipedream Connect                │  AgentSecrets (Show HN)     │
+   UPSTARTS       │  Composio (Zapier-for-agents)     │  Infisical Agent Vault  ◄── DIRECT
+   (PLG, OSS)     │  Arcade.dev (end-user OAuth)      │  agentgateway (MCP+A2A)     │
+                  │  AWS Bedrock AgentCore            │  MS MCP Gateway             │
+                  │  IBM ContextForge                 │  mcp-gateway-registry       │
+                  │                                   │  YC W26: Clam, Cascade,     │
+                  │                                   │     Agentic Fabriq          │
+                  │                                   │                             │
+                  │                                   │  AgentPass  ◄── US          │
                   └───────────────────────────────────┴─────────────────────────────┘
 ```
 
-There is no white space on this map. The "narrow upstart" quadrant — which is where you'd land — has four projects shipping the exact same architecture as your pitch.
+**One direct competitor (Infisical Agent Vault), six adjacent threats, three category errors.** That's a different map than v1 drew.
 
-### The three sharpest competitors and why you can't beat them on the broad pitch
+### The three sharpest competitors and how to beat each
 
-**1Password Unified Access**
-- *Strong:* distribution into every team that already uses 1Password (~150K business customers), launch partners are the exact tools indie devs use (Cursor, GitHub, Vercel, Anthropic, Perplexity).
-- *Bleeds:* "later in 2026 will issue scoped credentials at runtime" — runtime token issuance not yet shipped; Unified Access is currently more discovery+vaulting than active brokering.
-- *Why they can't fix it fast:* their core product is a consumer/SMB password manager; the enterprise agent runtime requires deep dev-tooling integrations they're now negotiating one-by-one. They'll get there in 12 months but Q3 2026 is genuine open ground.
-- *What you could do:* go faster on the runtime brokering primitive, but only if you have a distribution channel they don't.
+**Infisical Agent Vault — the direct twin.**
+- *Strong:* MIT-licensed; free; extends a 50K+ star OSS vault with built-in distribution; HN credibility; Infisical Cloud upsell wired.
+- *Weak:* generic developer-tools positioning; no opinion about which agent runtime you're using; "research preview, not production-ready" framing in their own docs; enterprise-driven roadmap will leave runtime-specific polish on the floor; HN comments already flagged token-refresh leakage, WebSocket auth, MCP outbound brokering, and agent-bootstrapping as open gaps.
+- *Their structural constraint:* their pipeline pays for the enterprise tier. They cannot afford to invest 3 months in "make `agentpass run claude` magical for the Claude Code power user" — that's not how Infisical's GTM works.
+- *Our move:* be the opinionated runtime-specific vault. Ship the four open Agent Vault HN problems as first-class features. Pick fights with named problems in long-form posts. Position as "Infisical Agent Vault, but built by a dev who actually uses Claude Code at midnight."
 
-**Composio**
-- *Strong:* 850 connectors is a real moat; Lightspeed funding; their content engine ([composio.dev/content](https://composio.dev/content)) is *eating SEO* in this category — half my Phase 0 search results were Composio articles.
-- *Bleeds:* tool calls billed per-call ($29 → $229) is the wrong meter for "I want my agent to remember my Gmail token forever" — users want a flat sub or BYO-storage. The brokering pattern locks you into Composio's runtime.
-- *Why they can't fix it:* their pricing model assumes you keep paying them per agent action; flipping to flat or self-hosted breaks the unit economics they pitched to Lightspeed.
-- *What you could do:* ship "Composio's auth pattern, but flat-priced and self-hosted" — but Nango is already that, and Infisical Agent Vault is already free.
+**1Password Unified Access — wrong category for our buyer, right brand for our risk.**
+- *Strong:* distribution into 150K+ business customers; launch partners are the exact tools we care about (Cursor, GitHub, Vercel, Anthropic, Perplexity).
+- *Weak:* enterprise-only; sales-led; "scoped runtime credential issuance later in 2026" — not shipped today; the architecture is endpoint discovery + governance, not runtime brokering.
+- *Risk:* if they ship runtime brokering at re:Invent / Anthropic dev day in Q4 2026, our LLM-key-brokering use case loses oxygen in the prosumer-into-team-into-enterprise flywheel.
+- *Our move:* position not against them but as **the open-source companion for runtimes they don't support yet**. Acquisition story exists if we build a real user base in that segment.
 
-**Infisical (Agent Vault)**
-- *Strong:* MIT-licensed, free, extends the dominant OSS secrets manager. Shipping the agent feature out of an existing 50K+ star project means distribution is solved on day 0.
-- *Bleeds:* generic developer-tool focus; not optimized for any one agent runtime (Cursor, Claude Code, OpenClaw); HN comments flagged real gaps — token-refresh leakage, WebSocket support, MCP server outbound calls, agent-bootstrapping (where the agent itself signs up for new accounts).
-- *Why they can't fix everything fast:* OSS roadmap is community-driven and they're optimising for enterprise upsell, not indie polish.
-- *What you (a solo founder) could do that they structurally can't:* be opinionated about ONE runtime (e.g., "we are the credential broker for Claude Code / OpenClaw users") and ship runtime-specific magic. This is the only narrow re-pitch I'd entertain.
+**HashiCorp Vault native AI agent — sleeping giant, not threat today.**
+- *Strong:* IBM distribution into every bank/fintech/gov.
+- *Weak:* enterprise-only; early-access; K8s-shaped; will never be installable by a single dev in 90 seconds.
+- *Risk:* zero in year 1. Real in year 3 if we try to sell upmarket.
+- *Our move:* never compete head-on. If we ever sell enterprise, sell as the agent-side primitive that *plugs into* Vault 2.0 — read secrets from Vault, broker them at runtime, write audit to Vault. Not a replacement, a companion.
 
 ### Shape of rivalry
 
-This is **not** a winner-take-most market. There's no network effect (your secrets are private; one user's vault doesn't enrich another's). There's no data moat. There's no marketplace dynamic. It's a **fragmented, commoditizing race to the bottom on the OSS side and a bundled-into-the-bigger-platform race at the top.** That is the worst possible market shape for a solo founder: low switching cost, low differentiation ceiling, well-funded competitors in both directions squeezing the middle.
+Same conclusion as v1, sharpened: **not winner-take-most.** No network effect on private vaults. No data moat. Switching cost is low (export-to-`.env` is a one-liner). Differentiation ceiling capped by OSS alternatives and platform-native primitives. The market shape is **fragmented commodity at the bottom, bundled-into-bigger-platforms at the top.** Our slot is the thin paid middle — a Personal Cloud tier and a Teams plan with audit + sharing — that the OSS doesn't offer and the enterprise vendors won't bother selling to.
 
 ---
 
-## Phase 4 — Verdict: **KILL the broad pitch.**
+## Phase 4 — Verdict: **CONDITIONAL GO, 30-day sprint only**
 
-Hits 4 of the 5 explicit kill criteria you wrote:
+Reversal of v1's KILL is now narrowed. The correct decision is not "build the full venture"; it is "prove the technical wedge in 30 days."
 
-1. ❌ Top-3 incumbents shipped the headline feature in the last 90 days. (1Password Unified Access Mar 2026; Infisical Agent Vault Q1 2026; Vault 2.0 with MCP server Apr 2026.)
-2. ❌ Distribution channel is dominated by platforms that can shut you out. (1Password owns the human-vault relationship; Anthropic/OpenAI can ship native MCP credential primitives; Cloudflare's Agents Week shipped half the runtime in one week.)
-3. ❌ No unfair advantage beyond "I'll work harder." Your AudioPod audience is podcasters, not security-conscious devs. Your Bangalore base is a cost advantage but not a distribution one. You don't have a security brand.
-4. ❌ Solo unfunded path to validation > 6 months. To match Composio's 850 connectors or 1Password's 5 launch partners would take ≥9 months alone.
-5. ✅ Unit economics are technically OK at $20–50/mo prosumer pricing, but only if you can find buyers — and you can't, see #2.
+1. **Architecture is plausible but not yet proven.** The repo now has vault password verification, audit logging, direct proxy substitution, and HTTPS CONNECT tunneling. It does **not** yet have tested generic HTTPS header rewriting through CONNECT; that is the sprint blocker.
+2. **The narrow runtime-opinionated wedge is open.** Infisical chose generic; we choose specific. That's a defensible choice for a solo founder who can write better Claude Code / Cursor / OpenClaw shims than a 30-person company will bother to write.
+3. **OSS-first land-grab is the right monetisation curve for our resources.** No paid acquisition ($0 marketing budget), no sales team, no compliance theatre. Earn stars and DMs first; charge for what stars don't pay for (sync, audit, Teams).
+4. **The $50K–$100K MRR path is not an active plan.** Treat $2K–$8K MRR by month 12 as the realistic first-order target if the CLI earns pull.
+5. **Kill criteria move forward to day 30.** If the HTTPS credential-brokering story and demo are not credible by day 30, rotate the code into portfolio-internal credential brokering and stop treating this as a standalone venture.
 
-**What I'd be willing to be wrong about:** I'd reverse to BUILD if (a) you have a personal distribution channel I don't know about into MCP/Cursor/Claude Code power-user communities, (b) you're willing to make this a 6-month time-box with a hard kill at month 6, and (c) you accept the narrow re-pitch in §5 instead of the broad "credential manager for AI agents."
+**The three conditions:**
 
----
-
-## Phase 5 — The narrow re-pitch (only if you ignore the kill)
-
-**"AgentPass = the local-first credential broker for power users running personal AI agents (Claude Code, Cursor, OpenClaw, Codex, custom MCP). One-line install, no cloud account required for the free tier, and it actually solves the four open problems Infisical's HN thread flagged: token-refresh leakage, WebSocket auth, MCP server outbound calls, agent-bootstrapping for new account creation."**
-
-Wedge: be the **opinionated, runtime-specific** vault for the developer who already has Claude Code / Cursor / OpenClaw open right now and just got a Slack ping that their OpenAI key got rotated and three of their agents broke. Not enterprise. Not org-wide. *Personal*. Then expand to "AgentPass Teams" for 2–10 person AI-native startups when you have the user love.
-
-Falsifiable in 6 months. If by month 6 you don't have:
-- 500+ GitHub stars,
-- 100+ active users on the local CLI,
-- 25+ paying customers at $15–30/mo,
-- and at least one of {Cursor, Claude Code, OpenClaw} mentioning AgentPass in their docs/community,
-
-…you're wrong, the broad incumbents have eaten you, kill it and rotate the assets.
-
-In 24 months if it works: $50–100K MRR with ~3K paying users at $20/mo + a Teams plan at $99/seat/mo for ~50 small teams. A nice business, not a venture-scale one. Acquirable by 1Password/Doppler/Infisical for talent + tech for $5–15M.
+- **C1 — OSS-first, single-binary, no cloud account required for the free tier.** This is the structural advantage Infisical can't honestly match without breaking their enterprise upsell. Lose this and we have no moat.
+- **C2 — Runtime-opinionated.** First-class shims for Claude Code, Cursor, OpenClaw, Codex CLI shipped in V1. Generic mode exists, but the marketing copy and onboarding both start from "what agent are you running today?". If we ship a generic vault, we're Infisical-but-smaller and we lose.
+- **C3 — Hard time-box.** 30-day technical and user-signal gate first. The old six-month gate only matters after the sprint passes.
 
 ---
 
-## Phase 6 — Path to $100K MRR (reverse-engineered, narrow re-pitch)
+## Phase 5 — Positioning
 
-**Pricing model:** 1,000 customers × $100/mo. (Not 100×$1K — you can't sell mid-market as a solo. Not 10K×$10 — your CAC is too high for that volume.)
+**One-liner:** "The local-first credential broker for Claude Code, Cursor, and MCP power users."
 
-- **JTBD:** "I have 6 AI agents wired into my dev workflow and they keep breaking when keys rotate or hit rate limits, and my .env has 47 secrets in it that I'm scared of losing or leaking." Today they pay this with `.env` files + 1Password manual paste + private notes. Existing tool that does this *for them*: nothing clean — Composio exists but is per-call billed; Infisical Agent Vault is free but generic; 1Password is org-locked.
-- **WTP anchor:** Composio Hobby $29/mo ([pricing](https://composio.dev/pricing)), 1Password personal $36/yr (so $3/mo), Doppler Developer free → Team $19/seat/mo. **A flat $29–49/mo for a personal AgentPass plan is defensible.** $99/seat/mo for Teams is in line with Doppler/Vercel.
-- **CAC tolerance:** at $29/mo flat with 24-month LTV, LTV ≈ $696. Sustainable CAC is $50–80 for prosumer. That rules out paid ads (Google CPC for "AI agent" terms is $4–11). Channel must be organic.
-- **Realistic monthly add rate:**
-  - Months 1–3: 0 → 5/mo paying. Pre-launch, content-led.
-  - Months 4–6: 5 → 25/mo. Post-Show HN + community traction.
-  - Months 7–12: 25 → 60/mo. Compounding inbound.
-  - This trajectory hits ~$15K MRR by month 12 if everything goes right. **$100K MRR is an 18–24 month target, not 12.** If your kill criterion is $100K in 12 months, KILL it now and don't start.
+**Comparative:** "Faster than Infisical, simpler than 1Password, free as a single binary."
 
-**Milestones with what-has-to-be-true:**
+**90-second pitch:** Your AI coding agents have access to every API key in your `.env`. When one of them gets prompt-injected — and they do, [monthly](https://embracethered.com/blog/posts/2025/devin-can-leak-your-secrets/) — those keys leave your laptop. AgentPass runs a localhost proxy that holds your keys in an encrypted vault and substitutes them into your agent's HTTP traffic at the wire. Your agent process never sees the raw key. Free, MIT, single binary. `brew install agentpass`. 90 seconds to first proxied call.
 
-| Milestone | Month | What has to be true |
-|---|---|---|
-| 10 paying | 3 | Show HN landed in top 30; CLI works on Mac; Claude Code integration documented |
-| 100 paying | 7 | Cursor or OpenClaw community knows the name; Teams plan launched |
-| $10K MRR | 9 | ~350 prosumer + 5–8 Teams accounts |
-| $50K MRR | 18 | 1.5K prosumer + ~30 Teams; first integration partnership signed |
-| $100K MRR | 24 | 3K prosumer + 50–70 Teams; OR one design-partner enterprise at $5K/mo |
+**Voice differentiation:** Infisical writes for SaaS PMs evaluating vaults. Composio writes for the engineering lead picking an integration platform. We write for the dev debugging at midnight whose Claude Code agent just got rate-limited and they don't know which of their five OpenAI keys is exhausted. That voice — practitioner, specific, unsponsored — is the moat Composio's content engine and Infisical's docs can't copy.
+
+**What we are not:**
+- Not an enterprise SSO vault. Not selling SAML.
+- Not a SaaS-connector platform. Not 850 connectors.
+- Not an MCP runtime. Not Arcade.dev.
+- Not an HTTPS pen-testing tool. Not mitmproxy.
+- Not free forever for everything. Personal Cloud and Teams are paid.
 
 ---
 
-## Phase 7 — Roadmap
+## Phase 6 — Path to $10K → $50K → $100K MRR
 
-| COPY (table-stakes) | BUILD (the wedge) | INNOVATE (long-shot moat) |
-|---|---|---|
-| Encrypted local vault (sqlcipher / age) | **Runtime-specific shims** for Claude Code, Cursor, OpenClaw, Codex CLI: drop-in, no config | **Agent-bootstrap brokering**: when an agent says "sign me up for Stripe / Resend / OpenAI", AgentPass spins up the account, captures the key, never hands it to the agent |
-| HTTP-injection proxy (placeholder→real key) | **WebSocket + MCP outbound** support (the gaps the Infisical HN thread flagged) | |
-| `agentpass run <cmd>` wrapping | **Auto-rotation handling**: detects rotated keys, replays the request, no agent-side retry needed | |
-| Audit log + secret scan of `.env`/`claude.json` | **Multi-key fallback for rate limits**: load-balance N OpenAI keys, auto-fallback on 429 | |
-| Sync via Cloudflare D1 + R2 (encrypted) | **CLI-first UX**, `1Password CLI` muscle-memory for the Claude Code crowd | |
+**Anchor:** today = 2026-05-23. All months indexed from here.
 
-**Sequencing (hard scope, hard time):**
+| Gate | Month | Date | What has to be true | Annual run-rate |
+|---|---|---|---|---|
+| First $1 | 2 | 2026-07 | Stripe checkout live; Lifetime founder license $99 × 10 = $990 one-time | — |
+| $1K MRR | 6 | 2026-11 | ~140 Personal × $7 = $980, OR 50 Personal + 10 Teams (5 seats × $19 ÷ 10 = $95 avg). Post-Show-HN, first real waitlist conversion. | $12K ARR |
+| $5K MRR | 9 | 2027-02 | ~700 Personal at $7. Three referenced blog posts ranking on Google. First MCP server maintainer trade closed. | $60K ARR |
+| **$10K MRR** | **12** | **2027-05** | ~1,400 Personal + 5–10 Teams accounts averaging 3 seats. Cursor or Claude Code community knows the name. | **$120K ARR** |
+| $25K MRR | 15 | 2027-08 | Teams plan compounding (30+ accounts). One small enterprise design partner ($2K/mo). | $300K ARR |
+| **$50K MRR** | **18** | **2027-11** | ~5,000 Personal + ~80 Teams seats + 2 enterprise design partners. Policy/Observability tier in private beta. | **$600K ARR** |
+| $75K MRR | 21 | 2028-02 | Observability tier converting (~$50/mo per active vault). Audit-log + spend-policy SKU. | $900K ARR |
+| **$100K MRR** | **24** | **2028-05** | ~7,000 Personal + ~250 Teams seats + 3–5 enterprise design partners at $2–5K/mo OR Observability tier at $50/mo × ~500 active = $25K extra MRR. | **$1.2M ARR** |
 
-- **MVP (4 weeks):** local CLI + sqlcipher vault + HTTP proxy + Claude Code shim only. One config command. One demo video. Open-source MIT.
-- **V1 (Week 5–10):** Cursor + OpenClaw shims, multi-key OpenAI fallback, WebSocket support, Show HN launch.
-- **V2 (Week 11–18):** Cloud sync (D1/R2), Teams plan with seat-based billing, MCP outbound brokering, agent-bootstrap demo.
+The shape of this curve is **slow compound from organic content + community, not blitzscale.** Month 1–6 is brand and credibility (0 MRR is fine). Month 6–12 is the first revenue inflection (Personal Cloud upsell). Month 12–24 is Teams + Observability as compounding revenue layers.
 
-If you can't ship MVP in 4 weeks solo, this is the wrong venture.
+**Critical sequencing rules:**
+- Personal Cloud (sync + multi-device) cannot launch until ≥1K free CLI users — premature monetisation kills the OSS flywheel.
+- Teams plan cannot launch until Personal has 500+ paying users — without that base, Teams looks empty.
+- Observability tier (the post-MCP-OAuth pivot) cannot launch until Teams has 30+ accounts — same reason.
+- Enterprise design partners cannot be pursued until $25K MRR — solo founder bandwidth.
 
----
-
-## Phase 8 — Stack
-
-Map to your defaults:
-
-- **Local CLI**: Bun + TypeScript, single binary via `bun build --compile`. SQLite via `bun:sqlite`. SQLCipher for at-rest encryption.
-- **Proxy**: Bun HTTP server, mitmproxy-style cert installation handled by `mkcert` invocation.
-- **Cloud sync (V2)**: **Cloudflare Workers + D1 + R2**. D1 for metadata, R2 for encrypted blob, Workers KV for ephemeral session tokens. Agents Week 2026 just shipped Dynamic Workers + Sandboxes GA — you do not need GPU and you do not need Modal.
-- **Auth**: Clerk for user accounts on the cloud-sync tier. Skip Razorpay for now (your buyer is global; Stripe-only is fine).
-- **Billing**: Stripe. Add Razorpay only if you discover Indian dev demand at month 6.
-- **MCP integration**: build native MCP server so Claude Code / Cursor users `npx agentpass-mcp` and immediately get vault tools exposed.
-
-**Where defaults DON'T fit:**
-- **No frontier API needed.** Don't use Claude/GPT for product features — this is an infra tool, not a content tool. AI in the product = "scan my .env for likely secret patterns" (regex + heuristics, not LLM).
-- **No Postgres / PlanetScale needed.** D1 is fine for ≤10K users; if you need to migrate at $50K MRR, that's a happy problem.
-- **No Sentry until V1.** Use OpenTelemetry → Cloudflare Workers Logs.
-
-**Most likely thing to break at scale:** the proxy's MITM cert handling on Windows + corporate VPN environments. Swap-out: ship a Tailscale-style userspace network shim (gVisor / wireguard-go) instead of MITM at month 9 if it's biting.
+If month-6 hits under $1K MRR / <500 stars / <50 paying, **kill or rotate** (§9). If month-12 hits under $5K MRR / <2K stars, **rotate to a feature inside another venture.** If month-18 hits under $25K MRR, **stop adding scope, harvest what exists, run as a lifestyle cashflow product.**
 
 ---
 
-## Phase 9 — Distribution & GTM
+## Phase 7 — Tailwinds and headwinds (detail)
 
-This is where the venture actually lives or dies. Don't skim.
+### Tailwinds that compound
 
-### Top 3 channels (ranked, solo-founder-realistic)
+- **Secrets sprawl curve is monotone up.** GitGuardian's [2023→2024→2025→2026 series](https://blog.gitguardian.com/the-state-of-secrets-sprawl-2026/) shows the leak count growing every year. The pain is not getting better.
+- **AI-service-credential leaks +81% YoY.** This is *our* segment growing, not general secrets.
+- **Stack Overflow 2025: 84% of devs use AI tools, 23% use agents weekly, share growing.** Adoption is the inflection of buyer formation.
+- **MCP donated to Linux Foundation December 2025** ([Wikipedia](https://en.wikipedia.org/wiki/Model_Context_Protocol)) — vendor-neutral standardisation is durable infra tailwind.
+- **EU AI Act 2026-08-02 high-risk obligations** — enterprise procurement now demands AI-vendor questionnaires; that buyer pool builds slowly through 2027.
+- **India DPDP Phase II 2026-11-13 / Phase III 2027-05-13** — DPDP penalties ₹250 crore make consent-and-audit revenue-generating, not a cost centre.
+- **Cloudflare Agents Week 2026** ([recap](https://blog.cloudflare.com/agents-week-in-review/)) shipped Dynamic Workers, Sandboxes GA, AI Search GA, Workflows. Net positive for us — cheaper runtime infrastructure to build the cloud tier on.
 
-1. **Show HN + r/LocalLLaMA + r/ClaudeAI launches.** Time-to-first-customer: 24h post-launch. CAC: $0. Tactic: ship MVP with a 90-second demo (Claude Code, key rotates, AgentPass auto-recovers, agent never sees the key). Leading indicator at 30 days: ≥250 GitHub stars, ≥30 signups on the cloud waitlist.
-2. **Long-form posts on the four open Agent-Vault HN problems.** Title example: "Why your AI agent's WebSocket auth is leaking — and the proxy fix." Publish on your own blog + cross-post to dev.to + share on X. SEO/AEO target: when devs Google "agent credential proxy WebSocket" or "AI agent token refresh leak", AgentPass is the top result. This *is* your moat against Composio's content engine — pick fights with named problems they've ignored. Cadence: 1 long post/week for 12 weeks.
-3. **Direct outreach to MCP server authors.** There are ~200 maintained MCP servers on GitHub. DM the top 30 maintainers offering a 1-line "use AgentPass for credential brokering" snippet for their READMEs. Trade: you write the integration code; they get safer-by-default users. Time-to-first-partner: 2–3 weeks.
+### Headwinds we must price in
 
-**Reject:** Google/Bing ads. LinkedIn ads. Cold outbound to security teams. Sales-led GTM. Any channel needing a sales rep.
+- **MCP OAuth eats LLM-side static-key brokering on a 12–24 month curve.** This is the existential clock. Stripe, Linear, GitHub, Sentry, HubSpot, Vercel, Atlassian, Salesforce all moved to remote-HTTP MCP with OAuth in Q1–Q2 2026 ([Digital Applied retrospective](https://www.digitalapplied.com/blog/mcp-ecosystem-h1-2026-retrospective-adoption-data-points)). LLM provider keys (Anthropic, OpenAI, Gemini, Groq, DeepSeek) remain key-shaped — that's the durable surface.
+- **Platform-native isolation.** Anthropic, Cursor, OpenAI each have incentive to ship native vaulting. Anthropic already has surface area in `.claude/settings.json`.
+- **OSS pricing ceiling.** Free Doppler tier, Infisical free OSS, Bitwarden CLI free — secrets management is anchored at "free or near-free." Our paid tier must monetise sync, audit, sharing — not the broker itself.
+- **No security brand.** We will lose any deal that requires SOC 2 Type II in year 1.
+- **Solo founder bandwidth.** With 30 ventures, attention is the scarce input. Every week spent on AgentPass is a week not spent on AudioPod / AgentDrive / MoltWork.
 
-### Content engine
+### The one assumption that, if wrong, kills it
 
-- **Cadence:** 1 deep technical post/week + 2 X threads + 1 short YouTube/Loom demo.
-- **Home base:** your own blog (Astro on Cloudflare Pages, no Hashnode/Medium dependency), syndicated to dev.to and HN.
-- **AEO/LLM-discoverability:** every post has a clear "Problem / Solution / Code" structure with a TL;DR ≤80 words at top — this is the format ChatGPT/Claude prefer when citing in answers. Sprinkle your name + "AgentPass" in every code block and screenshot.
-- **The angle Composio can't copy:** they're a 30-person company writing for SaaS PMs. You're a solo founder writing for the dev who's debugging at midnight. Voice differentiates.
-
-### Community play
-
-The buyers already cluster in: r/ClaudeAI (~200K), r/LocalLLaMA (~400K), r/cursor (~50K), Anthropic Discord, the MCP Discord, the Cursor Discord. **Be a credible regular in two of these for 60 days before you launch.** Answer questions, ship PRs to MCP server repos, file bug reports on Cursor. Then launch. Don't spam — your post must be the most useful thing in the channel that day.
-
-### Launch sequence (with dates, anchored to today 2026-04-27)
-
-- **2026-05-25:** Landing page + waitlist live. Tagline: "Your AI agents will never see your API keys again." 1-paragraph manifesto. Tally form for "what agents do you run?"
-- **2026-06-15:** Private alpha to 10 hand-picked Claude Code / Cursor power users from your X DMs.
-- **2026-07-01:** Show HN. Title: "Show HN: AgentPass — credential broker that makes Claude Code / Cursor agents un-leakable." OSS repo + downloadable binary on launch day.
-- **2026-07-08:** Product Hunt (after HN heat dies down — never the same week).
-- **2026-07-22:** Newsletter cross-promo (TLDR Newsletter Dev edition, Last Week in AI, Indie Hackers). Submit a guest post to one — *not* paid sponsorship.
-- **Throughout July–Sep:** weekly long-form post + 1 maintainer-DM/day.
-
-### Partnership leverage (3 trades worth attempting)
-
-1. **Cursor team** — offer to write the official "secret management with Cursor agents" doc page. Trade: doc citation. Probability of close: 30% if you ship something useful first.
-2. **Anthropic DevRel** — offer a Claude Code skill in the official skills repo + a "best practices for Claude Code secrets" blog post co-authored. Probability: 25%.
-3. **One MCP gateway provider (Pomerium, Strata, or TrueFoundry)** — offer to be the "personal-tier" referral when their enterprise prospect's individual devs need a vault. Trade: their logo on your site, your name on theirs. Probability: 50% with one of the three.
-
-**Skip** any partnership requiring a Bangalore-based founder to fly to a US conference. Stay async.
+**That LLM provider API keys remain the dominant credential surface for AI coding agents through 2027.** If Anthropic + OpenAI + Google all ship OAuth-based user-consent flows for their LLM APIs in 2026 — the way Stripe and GitHub did for MCP servers — then the entire LLM-key-injection use case collapses and we're left with the policy/observability tier 12 months earlier than planned. **Leading indicator (60 days):** an Anthropic blog post announcing OAuth 2.1 for Claude API. **Mitigation:** build observability/policy from V1 even if it's not the headline feature.
 
 ---
 
-## Phase 10 — Devil's advocate
+## Phase 8 — Devil's advocate (ranked failure modes)
 
-I've watched ~200 of these die. Here's the ranked failure mode list for the **narrow re-pitch** (the broad pitch is already dead per §4).
+Five scenarios, ranked by probability, with leading indicators and mitigations.
 
-### 1. (40%) **1Password ships runtime credential issuance for Cursor/Claude Code in Q3 2026.**
-- *Failure mode:* their roadmap explicitly promises this "later in 2026"; they have the partnerships locked.
-- *Leading indicator (30–60 days early):* a 1Password blog post or DevRel talk announcing the runtime API.
-- *Mitigation:* ship faster on the *agent-bootstrapping* and *multi-key fallback* features they don't have on the roadmap. Make AgentPass meaningfully better in 2 specific dimensions, not generally similar.
-- *Pivot:* re-position as "the open-source companion to 1Password Unified Access for runtimes they don't support yet" — become a feature 1Password buys for $5–10M.
+### 1. (35%) Infisical Agent Vault eats our lunch with feature velocity
 
-### 2. (25%) **Composio / Arcade.dev ship a free flat-priced personal tier and undercut you.**
-- *Failure mode:* Composio's existing free tier (20K calls/mo) already covers most indie use; pushing it to "free forever for individuals" is one VC-pressured pricing change away.
-- *Leading indicator:* Composio's pricing page changes; their Discord pivots messaging to "free for indie devs."
-- *Mitigation:* lean harder on **local-first / no cloud account required**. That's the one thing a Lightspeed-funded startup can't honestly offer.
-- *Pivot:* go OSS-hard — make AgentPass a Linux Foundation project, capture mindshare, build a paid hosted tier on top.
+- *Failure mode:* they ship Cursor / Claude Code / OpenClaw shims, multi-key fallback, and WebSocket support in Q3 2026 before we do. The differentiation collapses.
+- *Leading indicator (30 days):* a `runtimes/` directory in their GitHub repo with Claude Code or Cursor modules.
+- *Mitigation:* be visibly opinionated about the runtime in marketing copy from day 1. Get into Anthropic / Cursor Discord and become a known name *before* the head-to-head feature comparison gets written.
+- *Pivot:* lean into local-first as the absolute hard line — Infisical Cloud is their upsell; we don't have one in year 1. "No cloud account required" is structurally easier for us to honour. If they out-feature us on shims, out-position them on data-residency and offline.
 
-### 3. (15%) **MCP spec shifts again and obviates the proxy pattern.**
-- *Failure mode:* the AAIF (Linux Foundation) ratifies a credential-passing primitive in MCP itself, e.g., a `secret://` URI scheme that all MCP runtimes resolve natively.
-- *Leading indicator:* a working group RFC posted on the MCP spec repo.
-- *Mitigation:* watch the spec repo daily; be on the WG if you can.
-- *Pivot:* become the *implementation* of the spec primitive — an OSS reference implementation has its own brand.
+### 2. (25%) Anthropic ships native Claude Code key isolation at dev day Q4 2026
 
-### 4. (10%) **No GTM traction — content engine doesn't compound.**
-- *Failure mode:* you ship MVP, post 6 articles, get 100 stars and 4 paying customers, and the curve flatlines. This is the most common solo-SaaS death.
-- *Leading indicator:* by week 8, organic search impressions <500/week.
-- *Mitigation:* enforce a hard post/week cadence; if cadence slips, you're already losing.
-- *Pivot:* sunset the cloud product, keep the OSS, and use it as a credibility piece for consulting on the next venture.
+- *Failure mode:* Anthropic announces "Claude Code now keeps your API keys in an encrypted enclave; agents see hashed handles, not raw keys." Our V1 use case partially evaporates.
+- *Leading indicator (60 days):* Anthropic DevRel blog post about MCP auth + Claude Code config security; a CVE in Claude Code config handling that forces a rewrite (CVE-2026-21852 already exists).
+- *Mitigation:* multi-runtime support. If Anthropic ships native, we're still the broker for the Cursor + OpenClaw + Codex CLI + custom-MCP users. Cross-runtime aggregation is value Anthropic will not deliver.
+- *Pivot:* position as "the multi-vendor companion to Anthropic's native isolation" and "the audit layer Anthropic doesn't ship."
 
-### 5. (10%) **A breach. Your vault gets compromised. Trust evaporates.**
-- *Failure mode:* a single CVE in your proxy or a sync-tier bug exposes a customer's keys. AI security tools are scrutinized 10× more than other categories.
-- *Leading indicator:* dependabot alerts you ignore; a fuzz-tester filing issues you don't action.
-- *Mitigation:* SOC 2 readiness from week 1 (audit logs, secret-scan dependencies, no telemetry on secret values). Engage Trail of Bits or similar for a paid security review at month 6.
-- *Pivot:* there is no pivot from "the credential manager that leaked credentials." Brand is dead. You shut it down honourably.
+### 3. (15%) MCP spec ratifies a credential primitive that obviates the proxy
 
-### THE ONE assumption that, if wrong, kills it
+- *Failure mode:* the Agentic AI Foundation working group ratifies a `secret://` URI scheme or equivalent that every MCP runtime resolves natively. Our brokering disappears as a layer.
+- *Leading indicator (90 days):* a working-group RFC in the MCP spec repo proposing a credential-passing primitive.
+- *Mitigation:* track the spec repo weekly. Be the OSS reference implementation of whatever the spec adopts. An OSS reference impl has its own brand value.
+- *Pivot:* become the implementation + policy layer on top of the spec primitive. "The spec defines the protocol; we ship the polish."
 
-**That MCP-native AI agents become the dominant runtime for >100K paying indie/prosumer developers within 18 months.** If MCP stalls — if Cursor and Claude Code abandon agent loops in favour of single-shot tool calls, or if the AAIF squabbles and the spec fragments — your buyer disappears. **Watch:** monthly MCP server count on the registry, Claude Code monthly active users (Anthropic publishes), Cursor agent-mode usage. Any flat-line over 60 days = kill.
+### 4. (15%) No content-engine traction — the curve doesn't compound
+
+- *Failure mode:* MVP ships, 6 posts go up, 150 stars, 6 paying customers, organic search impressions flat. Solo-SaaS death by attrition.
+- *Leading indicator (8 weeks):* organic search impressions <500/week; Show HN gets <100 comments; <10 inbound DMs total.
+- *Mitigation:* hard editorial cadence (1 deep post + 2 X threads + 1 video / week, see GTM.md). If cadence slips, we're already losing.
+- *Pivot:* sunset the cloud tier and run as pure OSS with a paid hosted-tier-as-funnel for AudioPod or AgentDrive credential needs.
+
+### 5. (10%) A breach — vault compromised, trust evaporates
+
+- *Failure mode:* a CVE in the proxy or sync tier leaks customer keys. AI security tools are scrutinised 10× more than other categories.
+- *Leading indicator:* dependabot alerts ignored; a fuzz-tester filing issues unactioned; a security researcher asking polite questions.
+- *Mitigation:* SOC 2 readiness practices from week 1 — append-only audit logs, secret-scan our own dependencies, zero telemetry on secret values, signed releases, reproducible builds. Engage Trail of Bits or Latacora for a paid security review at month 6.
+- *Pivot:* there is no pivot from "the credential manager that leaked credentials." Brand is dead. Honourable shutdown, public post-mortem, refunds.
 
 ---
 
-## Phase 11 — 7 / 30 / 90 day plan
+## Phase 9 — 7 / 30 / 90 day plan
 
-Concrete outputs only.
+**T+0 = 2026-05-23.** Concrete outputs only.
 
-### Day 7 (2026-05-04)
-- Decision committed: **kill or run the narrow re-pitch.** No middle ground.
-- If running: domain `agentpass.dev` registered + Cloudflare Pages landing page live with email capture.
+### Day 7 (2026-05-30)
+
+- Repo `Rakesh1002/agentpass` public on GitHub. License: MIT. README.md polished.
+- Domain `agentpass.dev` registered + Cloudflare Pages landing page live with email capture. Tagline: "Your AI agents will never see your API keys again."
 - 3 customer-discovery calls booked with Claude Code / Cursor power users from your X network.
-- 1 X thread shipped: "Why your AI agent leaks API keys (and what 1Password's launch missed)."
-- Empty-repo curse broken: `bun init` + first commit + GitHub repo public.
+- 1 X thread shipped: "Why your AI coding agent leaks API keys — and the localhost-proxy fix Infisical's Agent Vault still ships with TODOs."
+- Test suite skeleton in place (`bun:test`); CI configured (GitHub Actions).
+- Decision finalised on Personal Cloud architecture: D1 + R2 (encrypted blob).
 
-### Day 30 (2026-05-27)
-- MVP CLI in 5 hands. `agentpass run claude` works end-to-end with one demo service (OpenAI key brokering).
-- First $1: pre-order or Stripe Checkout for "Lifetime founder license, $99". Even 5 of these = product validation.
-- Public weekly update rhythm established (X thread every Monday, blog post every Wednesday).
-- Show HN draft written, not yet posted.
+### Day 30 (2026-06-22)
 
-### Day 90 (2026-07-26)
-- Show HN posted (target: top 30, ≥150 comments).
-- $5–10K MRR or hard kill decision. The honest expectation given competitive density: **$2–4K MRR is the realistic range; if you're below $1K, kill.**
-- 1 partnership conversation in motion (Cursor docs, MCP server maintainer co-marketing, or 1Password OSS-companion positioning).
-- Content engine producing measurable inbound: ≥1K monthly organic visits to the blog, ≥3 inbound DMs/week from devs asking "is this for me?"
+- MVP CLI in 10 hands. `agentpass run claude` works end-to-end with OpenAI + Anthropic key brokering.
+- First $1 of revenue: Stripe Checkout for "Lifetime founder license, $99" — even 10 of these ($990) is product validation.
+- Weekly update rhythm established (X thread every Monday, blog post every Wednesday).
+- Show HN draft written, peer-reviewed, not yet posted.
+- Cursor shim ships (V1 scope: drop-in for `cursorrules`-aware agent flows).
 
-If the 90-day numbers come in below the kill thresholds, you've spent ~12 weeks of solo time, still have 29 ventures, AudioPod is still profitable, and you've validated the "this category is too crowded for solo" thesis cheaply. Rotate the assets (Cloudflare-Worker-based credential proxy code) into a feature inside another venture — it's a useful internal tool for AudioPod's webhook signing or any other product you build.
+### Day 90 (2026-08-21)
+
+- Show HN posted in the 2026-07 → 2026-08 window. Target: top 30, ≥150 comments.
+- Product Hunt the week after HN heat dies down.
+- Newsletter cross-promo (TLDR AI, Ben's Bites, Pragmatic Engineer) — guest post, not paid sponsorship.
+- **Honest expected outcome at day 90:** ≥500 GitHub stars, ≥100 active CLI users, ≥10 paying ($100–500 MRR). **Kill threshold:** <100 stars / <20 active users / <$50 MRR / no inbound DMs from MCP server maintainers — at which point rotate the assets into another venture and shut this down.
+- 1 partnership conversation in motion (Cursor docs co-authoring, MCP server maintainer co-marketing, or 1Password "OSS companion" referral trade).
+
+### Day 180 (kill gate — 2026-11-19)
+
+- **Kill threshold (any one of):** <1K stars, <100 paying customers, <$2K MRR, <2 partnership trades closed. Kill or rotate.
+- **Continue threshold (all of):** ≥1K stars, ≥100 paying, ≥$2K MRR, Teams plan in private beta with ≥10 invited teams. Proceed to month-12 plan.
+
+### Day 365 (V1 → V2 transition — 2027-05-22)
+
+- **Continue threshold:** ≥$10K MRR. If hit, V2 (Teams + Observability) scoped and execution begun.
+- **Soft-land threshold:** $2K–10K MRR. Keep running as lifestyle cashflow product; no new feature scope; harvest.
 
 ---
 
-## Bottom line, said plainly
+## Phase 10 — Bottom line, said plainly
 
-The category is real, the pain is real, the buyer exists — but the **slot you'd occupy as a solo founder is currently the most contested square on the AI infra board.** 1Password owns the human-vault relationship, Composio + Arcade own the integration layer, Infisical/Doppler own the dev-secrets layer, HashiCorp/IBM owns the enterprise, and three OSS Show HN projects own the indie technical pattern.
+The v1 verdict was "KILL" because the v1 competitive map said five well-funded incumbents had shipped the headline feature. The map was wrong — only one (Infisical) is a real architectural twin, and the others are different product categories sold to different buyers.
 
-**Kill the broad pitch.** If you must build, build the runtime-specific local-first wedge in §5, time-box it to 6 months, and accept that the realistic ceiling is $30–80K MRR by month 18 — *not* $100K in 12. That's still a fine outcome, but it's not the kind of venture worth pulling focus off AudioPod or one of the 29 others. With 30 ventures already on the board, your scarce resource is *attention*, not ideas. Spend it where the competitive density is half this.
+The new verdict is **BUILD, with three conditions** (OSS-first, runtime-opinionated, 6-month hard kill gate) because the corrected map shows the runtime-specific local-first lane is open and winnable by a solo founder on an 18–24 month curve to $10K → $100K MRR.
+
+The category is real. The pain is documented and accelerating. The buyer exists and clusters in two subreddits, one Discord, and one X-dev-twitter graph we can reach for zero CAC. The Infisical Agent Vault project is the existential threat — but they're playing a generic vault game we can structurally not afford to lose by being opinionated about the runtime in ways they're not optimised to copy.
+
+The downside risk is **6 months of focused solo time and a hard kill if numbers miss**. The code does not get thrown away — credential brokering is reusable as an internal module across AudioPod, AgentDrive, MoltWork, MailMolt, AIGateWay, and at least three other ventures already in the registry.
+
+The upside is **$50–100K MRR on an 18–24 month horizon, with optional evolution into the policy/observability tier as MCP OAuth eats the LLM-key brokering use case.** That is not venture-scale, but it is a fine standalone business and a meaningful infra primitive across the 30-venture portfolio. Acquisition story exists if 1Password, Doppler, Infisical, or Cloudflare want the runtime-specific user base for $5–15M at month 24.
+
+Go.
 
 — end memo —
+
+---
+
+## Companion documents
+
+- `PRODUCT.md` — what AgentPass is, who it's for, JTBDs, user flows, UI/UX screens, journey mapping.
+- `GTM.md` — ICP, channels, content engine, launch sequence, partnerships, pricing, kill criteria.
+
+Both anchor to this strategy memo. All three docs use 2026-05-23 as T+0 and cite the same source set.

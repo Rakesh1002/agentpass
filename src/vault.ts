@@ -1,9 +1,8 @@
 import { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { resolve } from "path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { agentPassDir, saltFile, vaultFile } from "./paths";
 
-const VAULT_FILE = resolve(process.env.HOME || "~", ".agentpass", "vault.db");
-const SALT_FILE = resolve(process.env.HOME || "~", ".agentpass", "vault.salt");
+const VERIFIER_PREFIX = "agentpass-verifier:";
 
 interface Secret {
   id: string;
@@ -21,18 +20,14 @@ export class Vault {
   private isInitialized = false;
 
   async init(masterPassword: string): Promise<void> {
-    const vaultDir = resolve(process.env.HOME || "~", ".agentpass");
-    const dirExists = existsSync(vaultDir);
-
-    if (!dirExists) {
-      const { mkdirSync } = await import("fs");
-      mkdirSync(vaultDir, { recursive: true });
-    }
+    const vaultDir = agentPassDir();
+    mkdirSync(vaultDir, { recursive: true });
 
     this.encryptionKey = await this.deriveKey(masterPassword);
 
-    if (!existsSync(VAULT_FILE)) {
-      this.db = new Database(VAULT_FILE);
+    const isNewVault = !existsSync(vaultFile());
+    if (isNewVault) {
+      this.db = new Database(vaultFile());
       this.db.run(`
         CREATE TABLE IF NOT EXISTS secrets (
           id TEXT PRIMARY KEY,
@@ -47,9 +42,11 @@ export class Vault {
       this.db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
       this.db.run(`INSERT INTO meta (key, value) VALUES ('version', '1')`);
     } else {
-      this.db = new Database(VAULT_FILE);
+      this.db = new Database(vaultFile());
+      this.db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
     }
 
+    await this.verifyPasswordOrUpgrade(isNewVault);
     this.isInitialized = true;
   }
 
@@ -57,12 +54,13 @@ export class Vault {
     const encoder = new TextEncoder();
     const passwordBuffer = encoder.encode(password);
 
-    const salt = existsSync(SALT_FILE)
-      ? readFileSync(SALT_FILE)
+    const saltPath = saltFile();
+    const salt = existsSync(saltPath)
+      ? readFileSync(saltPath)
       : crypto.getRandomValues(new Uint8Array(16));
 
-    if (!existsSync(SALT_FILE)) {
-      writeFileSync(SALT_FILE, salt);
+    if (!existsSync(saltPath)) {
+      writeFileSync(saltPath, salt);
     }
 
     const keyMaterial = await crypto.subtle.importKey(
@@ -87,35 +85,87 @@ export class Vault {
     );
   }
 
-  private encrypt(plaintext: string): string {
+  private async encrypt(plaintext: string): Promise<string> {
     if (!this.encryptionKey) throw new Error("Vault not unlocked");
     const encoder = new TextEncoder();
     const iv = crypto.getRandomValues(new Uint8Array(12));
 
-    return crypto.subtle.encrypt(
+    return crypto.subtle
+      .encrypt(
       { name: "AES-GCM", iv },
       this.encryptionKey,
       encoder.encode(plaintext)
-    ).then((ciphertext) => {
-      const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-      combined.set(iv);
-      combined.set(new Uint8Array(ciphertext), iv.length);
-      return Buffer.from(combined).toString("base64");
-    });
+      )
+      .then((ciphertext) => {
+        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+        combined.set(iv);
+        combined.set(new Uint8Array(ciphertext), iv.length);
+        return Buffer.from(combined).toString("base64");
+      });
   }
 
-  private decrypt(ciphertext: string): string {
+  private async decrypt(ciphertext: string): Promise<string> {
     if (!this.encryptionKey) throw new Error("Vault not unlocked");
-    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
     const combined = Buffer.from(ciphertext, "base64");
     const iv = combined.slice(0, 12);
     const data = combined.slice(12);
 
-    return crypto.subtle.decrypt(
+    return crypto.subtle
+      .decrypt(
       { name: "AES-GCM", iv },
       this.encryptionKey,
       data
-    ).then((plaintext) => encoder.decode(plaintext));
+      )
+      .then((plaintext) => decoder.decode(plaintext));
+  }
+
+  private async writeVerifier(): Promise<void> {
+    if (!this.db) throw new Error("Vault not initialized");
+
+    const verifier = await this.encrypt(`${VERIFIER_PREFIX}${crypto.randomUUID()}`);
+    this.db.run(
+      `INSERT OR REPLACE INTO meta (key, value) VALUES ('passwordVerifier', ?)`,
+      [verifier]
+    );
+  }
+
+  private async verifyPasswordOrUpgrade(isNewVault: boolean): Promise<void> {
+    if (!this.db) throw new Error("Vault not initialized");
+
+    const row = this.db
+      .query(`SELECT value FROM meta WHERE key = 'passwordVerifier'`)
+      .get() as { value: string } | undefined;
+
+    if (row) {
+      try {
+        const verifier = await this.decrypt(row.value);
+        if (!verifier.startsWith(VERIFIER_PREFIX)) {
+          throw new Error("Invalid verifier");
+        }
+      } catch {
+        this.close();
+        throw new Error("Invalid master password");
+      }
+      return;
+    }
+
+    if (!isNewVault) {
+      const secret = this.db
+        .query(`SELECT value FROM secrets LIMIT 1`)
+        .get() as { value: string } | undefined;
+
+      if (secret) {
+        try {
+          await this.decrypt(secret.value);
+        } catch {
+          this.close();
+          throw new Error("Invalid master password");
+        }
+      }
+    }
+
+    await this.writeVerifier();
   }
 
   async add(name: string, value: string, type: string = "api_key"): Promise<void> {
