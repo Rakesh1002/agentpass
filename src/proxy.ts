@@ -4,6 +4,18 @@ import net from "net";
 import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
+import { matchProvider, type Provider } from "./providers";
+
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 interface ProxyConfig {
   port: number;
@@ -74,14 +86,36 @@ export class ProxyServer {
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const started = Date.now();
-    const targetUrl = req.url?.startsWith("http") ? req.url : `https://${req.headers.host}${req.url}`;
-    if (!targetUrl) {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Bad Request");
-      return;
+    const reqUrl = req.url || "";
+    const isAbsolute = reqUrl.startsWith("http://") || reqUrl.startsWith("https://");
+
+    if (!isAbsolute) {
+      if (reqUrl === "/_/health" || reqUrl.startsWith("/_/health?")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      const match = matchProvider(reqUrl.split("?")[0] || "");
+      if (!match) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not_found", path: reqUrl }));
+        return;
+      }
+      const queryIndex = reqUrl.indexOf("?");
+      const upstreamPath = match.rest + (queryIndex >= 0 ? reqUrl.slice(queryIndex) : "");
+      return this.handleProviderRoute(req, res, match.provider, upstreamPath);
     }
 
+    return this.handleForwardProxy(req, res, reqUrl);
+  }
+
+  private async handleForwardProxy(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    targetUrl: string
+  ): Promise<void> {
+    const started = Date.now();
     const url = new URL(targetUrl);
     const isHttps = url.protocol === "https:";
     const client = isHttps ? https : http;
@@ -140,6 +174,111 @@ export class ProxyServer {
     });
 
     req.pipe(proxyReq, { end: true });
+  }
+
+  private async handleProviderRoute(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    provider: Provider,
+    upstreamPath: string
+  ): Promise<void> {
+    const started = Date.now();
+    const destination = `${provider.upstream.host}${upstreamPath}`;
+
+    let pool: { name: string; value: string }[];
+    try {
+      pool = await vault.getPool(provider.name);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "vault_unavailable", message }));
+      return;
+    }
+
+    if (pool.length === 0) {
+      appendAudit({
+        method: req.method || "GET",
+        destination,
+        secretNames: [],
+        statusCode: 503,
+        durationMs: Date.now() - started,
+        error: `no keys configured for provider ${provider.name}`,
+      });
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "no_keys", provider: provider.name }));
+      return;
+    }
+
+    const body = await readBody(req);
+    const client = provider.upstream.protocol === "https" ? https : http;
+    const upstreamPort =
+      provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
+
+    let lastStatus = 502;
+    let lastHeaders: http.IncomingHttpHeaders | null = null;
+    let lastBody: Buffer | null = null;
+
+    for (const { name, value } of pool) {
+      const headers = sanitizeRequestHeaders(req.headers, provider.upstream.host);
+      provider.applyAuth(headers, value);
+
+      const result = await sendUpstream(client, {
+        hostname: provider.upstream.host,
+        port: upstreamPort,
+        path: upstreamPath,
+        method: req.method || "GET",
+        headers,
+        body,
+        rejectUnauthorized: this.config.rejectUnauthorized,
+      });
+
+      if ("error" in result) {
+        appendAudit({
+          method: req.method || "GET",
+          destination,
+          secretNames: [name],
+          statusCode: 502,
+          durationMs: Date.now() - started,
+          error: result.error,
+        });
+        lastStatus = 502;
+        lastHeaders = null;
+        lastBody = Buffer.from(result.error);
+        continue;
+      }
+
+      appendAudit({
+        method: req.method || "GET",
+        destination,
+        secretNames: [name],
+        statusCode: result.status,
+        durationMs: Date.now() - started,
+      });
+
+      lastStatus = result.status;
+      lastHeaders = result.headers;
+      lastBody = result.body;
+
+      if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
+        continue;
+      }
+
+      writeUpstreamResponse(res, result.status, result.headers, result.body);
+      return;
+    }
+
+    if (lastHeaders) {
+      writeUpstreamResponse(res, lastStatus, lastHeaders, lastBody ?? Buffer.alloc(0));
+    } else {
+      res.writeHead(lastStatus || 503, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "all_keys_exhausted",
+          provider: provider.name,
+          lastStatus,
+        })
+      );
+    }
   }
 
   private async handleConnect(
@@ -241,6 +380,97 @@ async function replacePlaceholders(
   }
 
   return { value: output, found, missing };
+}
+
+function readBody(req: http.IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function sanitizeRequestHeaders(
+  source: http.IncomingHttpHeaders,
+  upstreamHost: string
+): Record<string, string | string[] | undefined> {
+  const out: Record<string, string | string[] | undefined> = {};
+  for (const [key, value] of Object.entries(source)) {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower === "host" || lower === "content-length") continue;
+    if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") continue;
+    out[key] = value;
+  }
+  out.host = upstreamHost;
+  return out;
+}
+
+type UpstreamSuccess = {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+};
+
+interface UpstreamRequestSpec {
+  hostname: string;
+  port: number;
+  path: string;
+  method: string;
+  headers: Record<string, string | string[] | undefined>;
+  body: Buffer;
+  rejectUnauthorized: boolean;
+}
+
+function sendUpstream(
+  client: typeof http | typeof https,
+  spec: UpstreamRequestSpec
+): Promise<UpstreamSuccess | { error: string }> {
+  return new Promise((resolve) => {
+    const req = client.request(
+      {
+        hostname: spec.hostname,
+        port: spec.port,
+        path: spec.path,
+        method: spec.method,
+        headers: spec.headers,
+        rejectUnauthorized: spec.rejectUnauthorized,
+      },
+      (upRes) => {
+        const chunks: Buffer[] = [];
+        upRes.on("data", (chunk) => chunks.push(chunk));
+        upRes.on("end", () =>
+          resolve({
+            status: upRes.statusCode ?? 500,
+            headers: upRes.headers,
+            body: Buffer.concat(chunks),
+          })
+        );
+        upRes.on("error", (err) => resolve({ error: err.message }));
+      }
+    );
+    req.on("error", (err) => resolve({ error: err.message }));
+    if (spec.body.length > 0) req.write(spec.body);
+    req.end();
+  });
+}
+
+function writeUpstreamResponse(
+  res: http.ServerResponse,
+  status: number,
+  headers: http.IncomingHttpHeaders,
+  body: Buffer
+): void {
+  const responseHeaders: http.OutgoingHttpHeaders = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    if (key.toLowerCase() === "content-length") continue;
+    if (value !== undefined) responseHeaders[key] = value;
+  }
+  responseHeaders["content-length"] = body.length;
+  res.writeHead(status, responseHeaders);
+  res.end(body);
 }
 
 export async function substitutePlaceholders(
