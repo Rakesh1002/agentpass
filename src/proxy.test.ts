@@ -93,13 +93,7 @@ async function get(url: string, opts?: http.RequestOptions): Promise<{ status: n
   });
 }
 
-// These tests describe a provider-routed reverse proxy with multi-key fallback
-// (e.g. `/openai/v1/models` -> upstream OpenAI with substituted Bearer auth).
-// The current `ProxyServer` is a forward HTTP proxy that substitutes
-// `{{secret:name}}` placeholders in headers — a different architecture.
-// They're skipped until the provider-routed flow is implemented; the file
-// stays in the repo as a spec for that work. See CONTRIBUTING.md.
-describe.skip("ProxyServer (provider-routed — not yet implemented)", () => {
+describe("ProxyServer (provider-routed)", () => {
   test("routes /openai → upstream and substitutes Bearer auth", async () => {
     upstreamHits = [];
     callCount = 0;

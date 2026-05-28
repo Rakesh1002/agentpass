@@ -4,8 +4,9 @@ A local-first credential broker for AI agents. Stores API keys in an encrypted
 vault on your machine and brokers them to agents (Claude Code, Cursor,
 OpenClaw, Codex) through a local HTTP proxy.
 
-> **Status: early development.** Vault encryption, placeholder substitution for
-> direct HTTP proxy requests, audit logging, and a local CA scaffold are
+> **Status: early development.** Vault encryption, provider-routed
+> reverse proxy with multi-key fallback, placeholder substitution for
+> forward-proxy requests, audit logging, and a local CA scaffold are
 > working and covered by tests. Generic HTTPS header rewriting via TLS
 > interception is **not wired up yet** — `CONNECT` traffic is tunneled
 > unmodified. See [SPEC.md](./SPEC.md) for the current acceptance criteria.
@@ -14,15 +15,22 @@ OpenClaw, Codex) through a local HTTP proxy.
 
 - **Encrypted vault** — secrets stored at rest with AES-256-GCM; master
   password derived with PBKDF2 (100k iterations).
-- **Provider-routed proxy** — `agentpass run <cmd>` starts a local proxy on
-  `:8888` and points `HTTP_PROXY` / `HTTPS_PROXY` at it. Requests to
-  `/openai/*`, `/anthropic/*`, `/groq/*`, `/openrouter/*` are forwarded to the
-  upstream provider with the right auth header attached.
-- **Placeholder substitution** — for direct HTTP proxy requests, any
+- **Provider-routed reverse proxy with multi-key pool** — point your agent at
+  `http://localhost:8888/openai/...`, `/anthropic/...`, `/groq/...`, or
+  `/openrouter/...` and the proxy makes the HTTPS call to the real upstream
+  with the right auth header attached from the vault. Add `openai`,
+  `openai-2`, `openai-3` and the proxy falls over to the next key when one
+  returns `429` (rate limited) or `401` (rotated), inside a single request,
+  with the same secret never re-tried.
+- **Placeholder substitution (forward-proxy mode)** — for clients that set
+  `HTTP_PROXY=http://localhost:8888` and send absolute URLs, any
   `Authorization` / `x-api-key` / `api-key` header containing
   `{{secret:name}}` is substituted with the real value from the vault.
-- **HTTPS `CONNECT` tunneling** — standard HTTPS clients tunnel through
-  without breakage, but their encrypted headers are not (yet) rewritten.
+- **HTTPS `CONNECT` tunneling** — standard HTTPS clients in forward-proxy
+  mode tunnel through without breakage, but their encrypted headers are not
+  (yet) rewritten. The provider-routed mode above does not need MITM.
+- **`/_/health`** — returns `{ "ok": true }` so process supervisors and the
+  CLI can probe the proxy.
 - **Local audit log** — every proxied request appends `method`, `destination`,
   `status`, `duration`, and the secret *names* that were used. Raw secret
   values are never logged.
@@ -59,13 +67,18 @@ bun install
 # Initialize the vault (creates ~/.agentpass/vault.db)
 bun run src/cli.ts init
 
-# Add a key
-bun run src/cli.ts add openai sk-...
+# Add a primary key plus a pool of fallbacks
+bun run src/cli.ts add openai   sk-...A
+bun run src/cli.ts add openai-2 sk-...B
+bun run src/cli.ts add openai-3 sk-...C
 
-# List the names (values never displayed)
-bun run src/cli.ts list
+# Start the proxy
+bun run src/cli.ts proxy start
 
-# Run an agent through the proxy
+# In another shell, hit the provider-routed endpoint directly
+curl http://localhost:8888/openai/v1/models
+
+# Or point an agent through forward-proxy mode
 bun run src/cli.ts run curl https://api.openai.com/v1/models
 ```
 

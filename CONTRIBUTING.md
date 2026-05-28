@@ -122,17 +122,23 @@ Before you mark a PR ready for review:
 These are tracked technical debts. Pick one as a starter task if you're
 looking for something real to work on:
 
-- **Provider-routed reverse proxy is not implemented.** The current
-  `src/proxy.ts` is a forward HTTP proxy that substitutes
-  `{{secret:name}}` placeholders. `src/providers.ts` defines a routing
-  table for `/openai`, `/anthropic`, `/groq`, `/openrouter` that nothing
-  consumes yet, and `src/proxy.test.ts` describes the intended behaviour
-  with `describe.skip(...)` blocks. Wiring this up — with multi-key pool,
-  429 fallback, and 401 auto-rotation — would unskip those tests.
 - **TLS interception is not wired in.** `src/ca.ts` mints a local CA and
   per-host certificates, but `proxy.ts` `handleConnect` still raw-tunnels
   CONNECT traffic. Until interception is implemented, HTTPS agent traffic
-  passes through with no header rewriting.
+  in forward-proxy mode passes through with no header rewriting. (The
+  provider-routed reverse-proxy mode does not need this — clients call
+  `http://localhost:8888/openai/...` and the proxy makes the HTTPS call to
+  the upstream itself.)
+- **No cooldown tracking on rate-limited keys.** The provider-routed
+  proxy falls over to the next key on 429 within a single request, but
+  it does not remember which key cooled down across requests. A short
+  in-memory cooldown table (per provider, per key) would make sequential
+  requests skip a cooling-down key without re-incurring its 429.
+- **Streaming responses are buffered.** `sendUpstream` collects the
+  upstream response body into a `Buffer` before forwarding. Fine for
+  models endpoints; not fine for SSE / chat-completions streaming.
+  Switch to streaming once a streaming-safe retry strategy is decided
+  (you can't retry mid-stream).
 - **`agentpass import-claude` is best-effort.** It assumes a specific
   Claude Code config layout; revisit when the upstream layout changes.
 
