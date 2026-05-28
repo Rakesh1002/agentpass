@@ -6,8 +6,12 @@ interface WaitlistEntry {
 }
 
 async function hashIp(ip: string): Promise<string> {
+  const salt = process.env.WAITLIST_IP_SALT;
+  if (!salt) {
+    throw new Error("WAITLIST_IP_SALT is not configured");
+  }
   const encoder = new TextEncoder();
-  const data = encoder.encode(ip + "agentpass-salt-2026");
+  const data = encoder.encode(ip + salt);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
