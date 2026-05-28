@@ -1,103 +1,122 @@
 # AgentPass
 
-Validation sprint for a local-first credential broker for AI agents.
+A local-first credential broker for AI agents. Stores API keys in an encrypted
+vault on your machine and brokers them to agents (Claude Code, Cursor,
+OpenClaw, Codex) through a local HTTP proxy.
 
-See [VALIDATION_SPRINT.md](./VALIDATION_SPRINT.md) for the active go/no-go plan.
+> **Status: early development.** Vault encryption, placeholder substitution for
+> direct HTTP proxy requests, audit logging, and a local CA scaffold are
+> working and covered by tests. Generic HTTPS header rewriting via TLS
+> interception is **not wired up yet** — `CONNECT` traffic is tunneled
+> unmodified. See [SPEC.md](./SPEC.md) for the current acceptance criteria.
 
-## Why AgentPass?
+## What it does
 
-AI agents leak API keys. GitGuardian reported **28.6M secrets exposed on public GitHub in 2025** — a 34% YoY increase. When your agent breaks because a key rotated, or worse, when your key gets stolen — that's a real problem.
+- **Encrypted vault** — secrets stored at rest with AES-256-GCM; master
+  password derived with PBKDF2 (100k iterations).
+- **Provider-routed proxy** — `agentpass run <cmd>` starts a local proxy on
+  `:8888` and points `HTTP_PROXY` / `HTTPS_PROXY` at it. Requests to
+  `/openai/*`, `/anthropic/*`, `/groq/*`, `/openrouter/*` are forwarded to the
+  upstream provider with the right auth header attached.
+- **Placeholder substitution** — for direct HTTP proxy requests, any
+  `Authorization` / `x-api-key` / `api-key` header containing
+  `{{secret:name}}` is substituted with the real value from the vault.
+- **HTTPS `CONNECT` tunneling** — standard HTTPS clients tunnel through
+  without breakage, but their encrypted headers are not (yet) rewritten.
+- **Local audit log** — every proxied request appends `method`, `destination`,
+  `status`, `duration`, and the secret *names* that were used. Raw secret
+  values are never logged.
 
-AgentPass is a local-first credential broker prototype that:
-- Stores your API keys in an encrypted vault
-- Substitutes credential placeholders for direct proxy requests
-- Tunnels standard HTTPS `CONNECT` traffic without pretending it can inspect encrypted headers
-- Writes local audit events for proxied traffic
+## Repository layout
 
-## Features
+```
+.
+├── src/                  # CLI + proxy + vault (Bun + TypeScript)
+│   ├── cli.ts            # Command dispatcher
+│   ├── vault.ts          # SQLite-backed encrypted store
+│   ├── proxy.ts          # HTTP/HTTPS proxy
+│   ├── providers.ts      # Upstream provider map (OpenAI, Anthropic, …)
+│   ├── ca.ts             # Local CA + per-host cert minting (for future MITM)
+│   ├── audit.ts          # Append-only audit log
+│   ├── claude.ts         # Claude Code config importer
+│   ├── paths.ts          # Path resolution (~/.agentpass)
+│   ├── agentpass.test.ts # Vault, substitution, CONNECT, CA tests
+│   └── proxy.test.ts     # Provider-routing tests
+├── apps/web/             # Marketing site (Next.js → Cloudflare Workers)
+├── public/               # Static landing page assets
+├── SPEC.md               # MVP specification
+├── CONTRIBUTING.md       # Onboarding + dev workflow
+└── package.json
+```
 
-- 🔒 **Encrypted local vault** — AES-256-GCM encryption, master password protected
-- ✅ **Password verification** — wrong master passwords are rejected before secret access
-- 🌐 **Direct proxy injection** — substitutes `{{secret:name}}` with real credentials in configured headers
-- 🔌 **HTTPS CONNECT tunneling** — `HTTPS_PROXY` traffic is tunneled safely, but encrypted headers are not rewritten yet
-- 📋 **Local audit log** — records destination, status, duration, and secret names, never secret values
-- 💻 **CLI-first** — built for developers who live in the terminal
-
-## Installation
+## Quick start
 
 ```bash
-# Clone and install
 git clone https://github.com/Rakesh1002/agentpass.git
 cd agentpass
 bun install
-```
 
-## Quick Start
+# Initialize the vault (creates ~/.agentpass/vault.db)
+bun run src/cli.ts init
 
-```bash
-# Initialize vault
-bun run src/cli.ts init --password your-password
+# Add a key
+bun run src/cli.ts add openai sk-...
 
-# Add a secret
-bun run src/cli.ts add openai sk-xxx
-
-# List secrets (values never shown)
+# List the names (values never displayed)
 bun run src/cli.ts list
 
-# Run an agent with proxy
+# Run an agent through the proxy
 bun run src/cli.ts run curl https://api.openai.com/v1/models
-
-# Or start proxy manually
-bun run src/cli.ts proxy start
 ```
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `init` | Initialize vault with master password |
-| `add <name> <value>` | Add a secret |
-| `list` | List all secret names |
-| `get <name>` | Get secret (masked) |
-| `delete <name>` | Delete a secret |
-| `proxy start` | Start HTTP proxy (:8888) |
-| `proxy stop` | Stop HTTP proxy |
-| `run <cmd>` | Run command with proxy enabled |
-| `audit` | Show recent proxy audit events |
-| `ca path` | Print the local CA path reserved for the TLS interception spike |
-| `import-claude` | Import Claude Code API key |
-| `status` | Show vault and proxy status |
+| Command                         | What it does                                    |
+| ------------------------------- | ----------------------------------------------- |
+| `agentpass init`                | Initialize the vault with a master password     |
+| `agentpass add <name> <value>`  | Add a secret                                    |
+| `agentpass list`                | List secret names                               |
+| `agentpass get <name>`          | Show a secret (masked)                          |
+| `agentpass delete <name>`       | Delete a secret                                 |
+| `agentpass proxy start`         | Start the proxy on `:8888`                      |
+| `agentpass proxy stop`          | Stop the proxy                                  |
+| `agentpass run <cmd>`           | Run `<cmd>` with `HTTP(S)_PROXY` set            |
+| `agentpass audit`               | Show recent proxy audit events                  |
+| `agentpass ca path`             | Print the local CA certificate path             |
+| `agentpass import-claude`       | Import an Anthropic key from Claude Code config |
+| `agentpass status`              | Show vault + proxy state                        |
 
 ## Architecture
 
 ```
 ┌─────────────┐    ┌───────────────┐    ┌───────────┐
-│ AI Agent    │───▶│ AgentPass     │───▶│ External  │
-│ (Claude)    │    │ Proxy :8888   │    │ API       │
-└─────────────┘    └───────────────┘    └───────────┘
-                          │
-                    ┌─────┴─────┐
-                    │  Vault    │
-                    │ (encrypted)│
-                    └───────────┘
+│ AI Agent    │───▶│ AgentPass     │───▶│ Upstream  │
+│ (Claude,    │    │ Proxy :8888   │    │ Provider  │
+│  Cursor, …) │    │               │    │ (OpenAI,  │
+└─────────────┘    └───────┬───────┘    │  …)       │
+                           │            └───────────┘
+                    ┌──────▼──────┐
+                    │ Vault       │
+                    │ (SQLite,    │
+                    │  encrypted) │
+                    └─────────────┘
 ```
 
 ## Security
 
-- Secrets encrypted at rest with AES-256-GCM
-- Master password derived with PBKDF2 (100k iterations)
-- Vault stored in `~/.agentpass/`
-- Direct proxy requests use placeholder substitution
-- HTTPS `CONNECT` requests are tunneled; generic HTTPS header substitution requires a future trusted local-CA/TLS interception flow
+- Secrets are encrypted at rest with AES-256-GCM under a PBKDF2-derived key.
+- The vault file (`~/.agentpass/vault.db`) is unreadable without the master
+  password. Wrong passwords are rejected before any secret is decrypted.
+- The local CA (`~/.agentpass/ca.crt` / `ca.key`) is generated on demand and
+  reserved for the upcoming TLS-interception flow. It is **not yet** used by
+  the proxy — installing it in your trust store has no effect today.
+- The audit log records secret *names* only. Raw values are never persisted.
+
+## Contributing
+
+New here? Start with [CONTRIBUTING.md](./CONTRIBUTING.md) — it covers dev
+setup, the test workflow, code style, and how to open your first PR.
 
 ## License
 
 MIT
-
-## Status
-
-⚠️ **Validation sprint** — not ready for production use.
-
-Direct proxy substitution is implemented and tested. Generic HTTPS credential rewriting through `CONNECT` is not implemented yet; the proxy currently tunnels HTTPS traffic without inspecting encrypted headers. That gap is the main day-30 go/no-go blocker.
-
-See [STRATEGY.md](./STRATEGY.md) for product strategy and competitive analysis.

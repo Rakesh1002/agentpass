@@ -209,6 +209,10 @@ export class ProxyServer {
     }
     return this.config.port;
   }
+
+  getPort(): number {
+    return this.port();
+  }
 }
 
 export const proxy = new ProxyServer();
