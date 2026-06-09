@@ -264,15 +264,11 @@ export class ProxyServer {
       lastBody = result.body;
 
       if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
-        
-        // --- ADD THIS BLOCK ---
         if (attempts >= maxAttempts) {
           console.warn(`[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error.`);
           writeUpstreamResponse(res, result.status, result.headers, result.body);
           return;
         }
-        // ----------------------
-        
         continue;
       }
 
