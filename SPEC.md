@@ -79,7 +79,7 @@ interface Secret {
 
 ```
 agentpass init              Initialize vault with master password
-agentpass add <name> <value> [--type api_key|bearer|basic]
+agentpass add <name> [--type api_key|bearer|basic]
 agentpass list              List all secret names (not values)
 agentpass get <name>        Show secret value (redacted)
 agentpass delete <name>     Remove secret
@@ -111,7 +111,7 @@ agentpass status            Show vault status, proxy state
 ## Acceptance Criteria
 
 1. ✅ `agentpass init` creates encrypted vault file, prompts for master password
-2. ✅ `agentpass add openai sk-xxx` stores encrypted secret
+2. ✅ `agentpass add openai` stores encrypted secret
 3. ✅ `agentpass list` shows secret names only (never values)
 4. ✅ `agentpass proxy start` starts HTTP proxy on port 8888
 5. ✅ Proxy intercepts requests to `api.openai.com`, replaces placeholder with real key
