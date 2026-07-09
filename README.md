@@ -4,12 +4,12 @@ A local-first credential broker for AI agents. Stores API keys in an encrypted
 vault on your machine and brokers them to agents (Claude Code, Cursor,
 OpenClaw, Codex) through a local HTTP proxy.
 
-> **Status: early development.** Vault encryption, provider-routed
-> reverse proxy with multi-key fallback, placeholder substitution for
-> forward-proxy requests, audit logging, and a local CA scaffold are
-> working and covered by tests. Generic HTTPS header rewriting via TLS
-> interception is **not wired up yet** — `CONNECT` traffic is tunneled
-> unmodified. See [SPEC.md](./SPEC.md) for the current acceptance criteria.
+> **Status: production-ready core.** Vault encryption, provider-routed
+> reverse proxy with multi-key fallback, placeholder substitution, full
+> HTTPS MITM interception (TLS CONNECT tunneling with per-host certificate
+> minting), and audit logging are all working and covered by tests. The
+> forward-proxy mode rewrites encrypted headers over both HTTP and HTTPS.
+> See [SPEC.md](./SPEC.md) for the acceptance criteria.
 
 ## What it does
 
@@ -26,9 +26,12 @@ OpenClaw, Codex) through a local HTTP proxy.
   `HTTP_PROXY=http://localhost:8888` and send absolute URLs, any
   `Authorization` / `x-api-key` / `api-key` header containing
   `{{secret:name}}` is substituted with the real value from the vault.
-- **HTTPS `CONNECT` tunneling** — standard HTTPS clients in forward-proxy
-  mode tunnel through without breakage, but their encrypted headers are not
-  (yet) rewritten. The provider-routed mode above does not need MITM.
+- **HTTPS MITM interception (forward-proxy mode)** — for clients in
+  `CONNECT` tunnel mode, the proxy terminates TLS using a per-host
+  certificate signed by the local CA, rewrites `Authorization` /
+  `x-api-key` / `api-key` headers via `{{secret:name}}` substitution,
+  then re-encrypts and forwards to the real upstream. Both HTTP and HTTPS
+  forward-proxy traffic is fully intercepted and rewritten.
 - **`/_/health`** — returns `{ "ok": true }` so process supervisors and the
   CLI can probe the proxy.
 - **Local audit log** — every proxied request appends `method`, `destination`,
@@ -44,7 +47,7 @@ OpenClaw, Codex) through a local HTTP proxy.
 │   ├── vault.ts          # SQLite-backed encrypted store
 │   ├── proxy.ts          # HTTP/HTTPS proxy
 │   ├── providers.ts      # Upstream provider map (OpenAI, Anthropic, …)
-│   ├── ca.ts             # Local CA + per-host cert minting (for future MITM)
+│   ├── ca.ts             # Local CA + per-host cert minting (for MITM engine)
 │   ├── audit.ts          # Append-only audit log
 │   ├── claude.ts         # Claude Code config importer
 │   ├── paths.ts          # Path resolution (~/.agentpass)
@@ -120,9 +123,10 @@ bun run src/cli.ts run curl https://api.openai.com/v1/models
 - Secrets are encrypted at rest with AES-256-GCM under a PBKDF2-derived key.
 - The vault file (`~/.agentpass/vault.db`) is unreadable without the master
   password. Wrong passwords are rejected before any secret is decrypted.
-- The local CA (`~/.agentpass/ca.crt` / `ca.key`) is generated on demand and
-  reserved for the upcoming TLS-interception flow. It is **not yet** used by
-  the proxy — installing it in your trust store has no effect today.
+- The local CA (`~/.agentpass/ca.crt` / `ca.key`) is generated on demand
+  and used actively by the HTTPS MITM engine. Install it in your OS/browser
+  trust store so the proxy's per-host certificates are accepted by TLS
+  clients without warnings (`agentpass ca path` prints the file location).
 - The audit log records secret *names* only. Raw values are never persisted.
 
 ## Contributing
