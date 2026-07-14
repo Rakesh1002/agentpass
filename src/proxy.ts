@@ -4,7 +4,28 @@ import net from "net";
 import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
-import { matchProvider, type Provider } from "./providers";
+import { matchProvider, PROVIDERS, type Provider } from "./providers";
+import {
+  loadRoutingConfig,
+  makeRoutingDecision,
+  checkEscalationTriggers,
+  isDuplicateRetry,
+  nextTier,
+  type RoutingConfig,
+  type TaskTier,
+} from "./router";
+import {
+  canTranslate,
+  translateOpenAIToAnthropic,
+  translateAnthropicToOpenAI,
+  translateAnthropicResponseToOpenAI,
+  translateOpenAIResponseToAnthropic,
+  detectRequestFormat,
+  type OpenAIRequest,
+  type AnthropicRequest,
+  type AnthropicResponse,
+  type OpenAIResponse,
+} from "./schema-translator";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -183,6 +204,212 @@ export class ProxyServer {
     upstreamPath: string
   ): Promise<void> {
     const started = Date.now();
+    const body = await readBody(req);
+
+    // --- Cost-Aware Routing (Section 3.4) ---
+    const routingConfig = loadRoutingConfig();
+    let routedTier: TaskTier | undefined;
+    let escalated = false;
+
+    // Parse body JSON for routing decisions (non-destructive)
+    let parsedBody: Record<string, unknown> | null = null;
+    if (routingConfig?.enabled && body.length > 0) {
+      try {
+        parsedBody = JSON.parse(body.toString("utf-8")) as Record<string, unknown>;
+      } catch {
+        // Not JSON — skip routing, forward as-is
+      }
+    }
+
+    // Check for duplicate retry escalation trigger
+    if (parsedBody && routingConfig?.enabled) {
+      if (
+        routingConfig.escalation.trigger_on.includes("duplicate_retry") &&
+        isDuplicateRetry(parsedBody)
+      ) {
+        // Will be handled via force-escalation below
+      }
+    }
+
+    // Determine effective provider and body for this request
+    let effectiveProvider = provider;
+    let effectiveBody = body;
+    let effectivePath = upstreamPath;
+    let needsResponseTranslation = false;
+    let sourceFormat: "openai" | "anthropic" | "unknown" = "unknown";
+
+    if (parsedBody && routingConfig?.enabled) {
+      const decision = makeRoutingDecision(
+        routingConfig,
+        parsedBody,
+        provider.name,
+        req.headers as Record<string, string | string[] | undefined>
+      );
+      routedTier = decision.tier;
+
+      // If the router wants a different provider, redirect
+      if (decision.targetProvider !== provider.name) {
+        const newProvider = PROVIDERS.find((p) => p.name === decision.targetProvider);
+        if (newProvider) {
+          // Attempt schema translation for cross-provider routing
+          if (canTranslate(parsedBody)) {
+            sourceFormat = detectRequestFormat(parsedBody);
+            const translated = translateRequestBody(
+              parsedBody,
+              sourceFormat,
+              decision.targetProvider,
+              decision.targetModel
+            );
+            if (translated) {
+              effectiveProvider = newProvider;
+              effectiveBody = Buffer.from(JSON.stringify(translated), "utf-8");
+              effectivePath = getProviderChatPath(decision.targetProvider);
+              needsResponseTranslation = true;
+              console.log(
+                `[AgentPass] Routed ${provider.name}→${newProvider.name} (tier: ${decision.tier}${decision.forced ? ", forced" : ""})`
+              );
+            }
+          } else {
+            // Can't translate — override model but stay on same provider
+            if (parsedBody.model) {
+              parsedBody.model = decision.targetModel;
+              effectiveBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+            }
+          }
+        }
+      } else {
+        // Same provider — just override the model if routing table says so
+        if (parsedBody.model) {
+          parsedBody.model = decision.targetModel;
+          effectiveBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+        }
+      }
+    }
+
+    // --- Execute the request against the effective provider ---
+    const responseResult = await this.executeProviderRequest(
+      req,
+      effectiveProvider,
+      effectivePath,
+      effectiveBody,
+      started,
+      routedTier,
+      escalated
+    );
+
+    if (!responseResult) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "no_keys", provider: effectiveProvider.name }));
+      return;
+    }
+
+    // --- Escalation check (Section 3.4) ---
+    if (
+      routingConfig?.enabled &&
+      routedTier &&
+      responseResult.status >= 200 &&
+      responseResult.status < 300
+    ) {
+      let responseJson: Record<string, unknown> | null = null;
+      try {
+        responseJson = JSON.parse(responseResult.body.toString("utf-8")) as Record<string, unknown>;
+      } catch {
+        // Not JSON response — skip escalation check
+      }
+
+      if (responseJson) {
+        const trigger = checkEscalationTriggers(routingConfig, responseJson, routedTier);
+        const hopsRemaining = routingConfig.escalation.max_hops;
+
+        if (trigger && hopsRemaining > 0) {
+          const escalatedTier = nextTier(routedTier);
+          if (escalatedTier) {
+            console.log(
+              `[AgentPass] Escalating ${routedTier}→${escalatedTier} (trigger: ${trigger})`
+            );
+            escalated = true;
+            const escalationTarget = routingConfig.routing_table[escalatedTier];
+            const escalationProvider =
+              PROVIDERS.find((p) => p.name === escalationTarget.provider) ?? provider;
+
+            // Re-prepare body for escalation target
+            let escalationBody = body; // original body
+            let escalationPath = upstreamPath;
+            let escalationNeedsTranslation = false;
+            let escalationSourceFormat = sourceFormat;
+
+            if (
+              escalationProvider.name !== provider.name &&
+              parsedBody &&
+              canTranslate(parsedBody)
+            ) {
+              escalationSourceFormat = detectRequestFormat(parsedBody);
+              const translated = translateRequestBody(
+                parsedBody,
+                escalationSourceFormat,
+                escalationTarget.provider,
+                escalationTarget.model
+              );
+              if (translated) {
+                escalationBody = Buffer.from(JSON.stringify(translated), "utf-8");
+                escalationPath = getProviderChatPath(escalationTarget.provider);
+                escalationNeedsTranslation = true;
+              }
+            } else if (parsedBody) {
+              parsedBody.model = escalationTarget.model;
+              escalationBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+            }
+
+            const escalationResult = await this.executeProviderRequest(
+              req,
+              escalationProvider,
+              escalationPath,
+              escalationBody,
+              started,
+              escalatedTier,
+              true
+            );
+
+            if (escalationResult && escalationResult.status >= 200 && escalationResult.status < 300) {
+              let finalBody = escalationResult.body;
+              if (escalationNeedsTranslation) {
+                finalBody = translateResponseBack(
+                  escalationResult.body,
+                  escalationSourceFormat,
+                  escalationProvider.name
+                );
+              }
+              writeUpstreamResponse(res, escalationResult.status, escalationResult.headers, finalBody);
+              return;
+            }
+            // Escalation failed — fall through to original response
+          }
+        }
+      }
+    }
+
+    // --- Translate response back if cross-provider routed ---
+    let finalBody = responseResult.body;
+    if (needsResponseTranslation && responseResult.status >= 200 && responseResult.status < 300) {
+      finalBody = translateResponseBack(responseResult.body, sourceFormat, effectiveProvider.name);
+    }
+
+    writeUpstreamResponse(res, responseResult.status, responseResult.headers, finalBody);
+  }
+
+  /**
+   * Executes a request against a provider's key pool with bounded retry.
+   * Returns the upstream response, or null if no keys are available.
+   */
+  private async executeProviderRequest(
+    req: http.IncomingMessage,
+    provider: Provider,
+    upstreamPath: string,
+    body: Buffer,
+    started: number,
+    routedTier?: TaskTier,
+    escalated?: boolean
+  ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer } | null> {
     const destination = `${provider.upstream.host}${upstreamPath}`;
 
     let pool: { name: string; value: string }[];
@@ -190,9 +417,8 @@ export class ProxyServer {
       pool = await vault.getPool(provider.name);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "vault_unavailable", message }));
-      return;
+      console.error(`[AgentPass] Vault unavailable for ${provider.name}: ${message}`);
+      return null;
     }
 
     if (pool.length === 0) {
@@ -203,13 +429,12 @@ export class ProxyServer {
         statusCode: 503,
         durationMs: Date.now() - started,
         error: `no keys configured for provider ${provider.name}`,
+        routedTier,
+        escalated,
       });
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "no_keys", provider: provider.name }));
-      return;
+      return null;
     }
 
-    const body = await readBody(req);
     const client = provider.upstream.protocol === "https" ? https : http;
     const upstreamPort =
       provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
@@ -218,7 +443,8 @@ export class ProxyServer {
     let lastHeaders: http.IncomingHttpHeaders | null = null;
     let lastBody: Buffer | null = null;
 
-    let attempts = 0;                  // <-- ADD THIS
+    // Bounded iteration: max attempts = pool size (Section 4.1)
+    let attempts = 0;
     const maxAttempts = pool.length;
 
     for (const { name, value } of pool) {
@@ -244,6 +470,8 @@ export class ProxyServer {
           statusCode: 502,
           durationMs: Date.now() - started,
           error: result.error,
+          routedTier,
+          escalated,
         });
         lastStatus = 502;
         lastHeaders = null;
@@ -257,6 +485,8 @@ export class ProxyServer {
         secretNames: [name],
         statusCode: result.status,
         durationMs: Date.now() - started,
+        routedTier,
+        escalated,
       });
 
       lastStatus = result.status;
@@ -265,29 +495,28 @@ export class ProxyServer {
 
       if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
         if (attempts >= maxAttempts) {
-          console.warn(`[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error.`);
-          writeUpstreamResponse(res, result.status, result.headers, result.body);
-          return;
+          console.warn(
+            `[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error (${result.status}).`
+          );
+          return { status: result.status, headers: result.headers, body: result.body };
         }
         continue;
       }
 
-      writeUpstreamResponse(res, result.status, result.headers, result.body);
-      return;
+      return { status: result.status, headers: result.headers, body: result.body };
     }
 
     if (lastHeaders) {
-      writeUpstreamResponse(res, lastStatus, lastHeaders, lastBody ?? Buffer.alloc(0));
-    } else {
-      res.writeHead(lastStatus || 503, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "all_keys_exhausted",
-          provider: provider.name,
-          lastStatus,
-        })
-      );
+      return { status: lastStatus, headers: lastHeaders, body: lastBody ?? Buffer.alloc(0) };
     }
+
+    return { status: lastStatus || 503, headers: {}, body: Buffer.from(
+      JSON.stringify({
+        error: "all_keys_exhausted",
+        provider: provider.name,
+        lastStatus,
+      })
+    ) };
   }
 
   private async handleConnect(
@@ -507,3 +736,70 @@ export async function substitutePlaceholders(
     missingSecrets: [...missingSecrets],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cross-provider translation helpers (Section 3.5)
+// ---------------------------------------------------------------------------
+
+function translateRequestBody(
+  body: Record<string, unknown>,
+  sourceFormat: "openai" | "anthropic" | "unknown",
+  targetProvider: string,
+  targetModel: string
+): Record<string, unknown> | null {
+  try {
+    if (sourceFormat === "openai" && targetProvider === "anthropic") {
+      return translateOpenAIToAnthropic(body as OpenAIRequest, targetModel);
+    }
+    if (sourceFormat === "anthropic" && (targetProvider === "openai" || targetProvider === "groq" || targetProvider === "openrouter")) {
+      return translateAnthropicToOpenAI(body as AnthropicRequest, targetModel);
+    }
+    // Same format family — just swap model
+    return { ...body, model: targetModel };
+  } catch {
+    return null;
+  }
+}
+
+function translateResponseBack(
+  responseBody: Buffer,
+  sourceFormat: "openai" | "anthropic" | "unknown",
+  respondingProvider: string
+): Buffer {
+  try {
+    const parsed = JSON.parse(responseBody.toString("utf-8")) as Record<string, unknown>;
+
+    // If the agent sent OpenAI format but we routed to Anthropic,
+    // translate the Anthropic response back to OpenAI format.
+    if (sourceFormat === "openai" && respondingProvider === "anthropic") {
+      const translated = translateAnthropicResponseToOpenAI(parsed as unknown as AnthropicResponse);
+      return Buffer.from(JSON.stringify(translated), "utf-8");
+    }
+
+    // If the agent sent Anthropic format but we routed to OpenAI/Groq,
+    // translate the OpenAI response back to Anthropic format.
+    if (sourceFormat === "anthropic" && respondingProvider !== "anthropic") {
+      const translated = translateOpenAIResponseToAnthropic(parsed as unknown as OpenAIResponse);
+      return Buffer.from(JSON.stringify(translated), "utf-8");
+    }
+
+    return responseBody;
+  } catch {
+    return responseBody;
+  }
+}
+
+function getProviderChatPath(provider: string): string {
+  switch (provider) {
+    case "openai":
+    case "groq":
+      return "/v1/chat/completions";
+    case "anthropic":
+      return "/v1/messages";
+    case "openrouter":
+      return "/api/v1/chat/completions";
+    default:
+      return "/v1/chat/completions";
+  }
+}
+

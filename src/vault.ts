@@ -28,6 +28,8 @@ export class Vault {
     const isNewVault = !existsSync(vaultFile());
     if (isNewVault) {
       this.db = new Database(vaultFile());
+      this.db.run(`PRAGMA journal_mode = WAL`);
+      this.db.run(`PRAGMA busy_timeout = 5000`);
       this.db.run(`
         CREATE TABLE IF NOT EXISTS secrets (
           id TEXT PRIMARY KEY,
@@ -43,6 +45,8 @@ export class Vault {
       this.db.run(`INSERT INTO meta (key, value) VALUES ('version', '1')`);
     } else {
       this.db = new Database(vaultFile());
+      this.db.run(`PRAGMA journal_mode = WAL`);
+      this.db.run(`PRAGMA busy_timeout = 5000`);
       this.db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
     }
 
