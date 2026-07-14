@@ -90,11 +90,11 @@ export default function Hero() {
 
               <div className="mt-3 flex gap-2">
                 <span className="text-accent">$</span>
-                <span className="text-fg">agentpass add openai sk-...A</span>
+                <span className="text-fg">agentpass add openai</span>
               </div>
               <div className="mt-1 flex gap-2">
                 <span className="text-accent">$</span>
-                <span className="text-fg">agentpass add openai-2 sk-...B</span>
+                <span className="text-fg">agentpass add openai-2</span>
               </div>
               <div className="mt-1 text-accent">2 keys pooled for openai</div>
 

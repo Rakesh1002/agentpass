@@ -71,9 +71,9 @@ bun install
 bun run src/cli.ts init
 
 # Add a primary key plus a pool of fallbacks
-bun run src/cli.ts add openai   sk-...A
-bun run src/cli.ts add openai-2 sk-...B
-bun run src/cli.ts add openai-3 sk-...C
+bun run src/cli.ts add openai
+bun run src/cli.ts add openai-2
+bun run src/cli.ts add openai-3
 
 # Start the proxy
 bun run src/cli.ts proxy start
@@ -90,7 +90,7 @@ bun run src/cli.ts run curl https://api.openai.com/v1/models
 | Command                         | What it does                                    |
 | ------------------------------- | ----------------------------------------------- |
 | `agentpass init`                | Initialize the vault with a master password     |
-| `agentpass add <name> <value>`  | Add a secret                                    |
+| `agentpass add <name>`          | Add a secret                                    |
 | `agentpass list`                | List secret names                               |
 | `agentpass get <name>`          | Show a secret (masked)                          |
 | `agentpass delete <name>`       | Delete a secret                                 |

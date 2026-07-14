@@ -105,7 +105,7 @@ Usage: agentpass <command> [options]
 
 Commands:
   init                  Initialize vault with master password
-  add <name> <value>    Add a secret
+  add <name>            Add a secret
   list                  List all secrets
   get <name>            Get a secret value
   delete <name>         Delete a secret
@@ -123,8 +123,8 @@ Commands:
 
 Examples:
   agentpass init
-  agentpass add openai sk-...
-  agentpass add anthropic sk-ant-...
+  agentpass add openai
+  agentpass add anthropic
   agentpass routing init
   agentpass run claude
   agentpass run cursor-agent
@@ -137,18 +137,61 @@ async function ensureVaultFile(): Promise<void> {
   }
 }
 
+async function promptHidden(question: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    throw new Error("Interactive prompt requires a TTY. For non-interactive use, provide the required secrets via CLI options.");
+  }
+
+  process.stdout.write(question);
+
+  const stdin = process.stdin;
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding("utf8");
+
+  let value = "";
+
+  return await new Promise<string>((resolve, reject) => {
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener("data", onData);
+      stdin.removeListener("error", onError);
+    };
+
+    const finish = (result: string) => {
+      cleanup();
+      process.stdout.write("\n");
+      resolve(result);
+    };
+
+    const fail = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    const onData = (chunk: string) => {
+      if (chunk === "\r" || chunk === "\n") return finish(value);
+      if (chunk === "\u0003") return fail(new Error("Cancelled"));
+      if (chunk === "\u007f") {
+        value = value.slice(0, -1);
+        return;
+      }
+      value += chunk;
+    };
+
+    const onError = (err: Error) => fail(err);
+
+    stdin.on("data", onData);
+    stdin.on("error", onError);
+  });
+}
+
 async function unlock(): Promise<void> {
   if (vault.check()) return;
   let password = globalPassword;
   if (!password) {
-    const readline = await import("readline");
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    password = await new Promise<string>((res) =>
-      rl.question("Master password: ", (a) => {
-        rl.close();
-        res(a);
-      })
-    );
+    password = await promptHidden("Master password: ");
   }
   await vault.init(password);
 }
@@ -171,15 +214,8 @@ async function handleInit(args: string[]) {
 
   let password: string | undefined = typeof values.password === "string" ? values.password : undefined;
   if (!password) {
-    const readline = await import("readline");
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const ask = (q: string) =>
-      new Promise<string>((res) => rl.question(q, (a) => res(a)));
-
-    password = await ask("Enter master password: ");
-    const confirm = await ask("Confirm master password: ");
-    rl.close();
-
+    password = await promptHidden("Enter master password: ");
+    const confirm = await promptHidden("Confirm master password: ");
     if (password !== confirm) throw new Error("Passwords do not match");
   }
 
@@ -197,18 +233,23 @@ async function handleAdd(args: string[]) {
     args,
     options: {
       type: { type: "string", short: "t", default: "api_key" },
+      value: { type: "string", short: "v" },
     },
     allowPositionals: true,
     strict: false,
   });
 
   const name = positionals[0];
-  const value = positionals[1];
   const type = typeof values.type === "string" ? values.type : "api_key";
 
-  if (!name || !value) {
-    throw new Error("Usage: agentpass add <name> <value>");
+  if (!name) {
+    throw new Error("Usage: agentpass add <name>");
   }
+
+  const value =
+    typeof values.value === "string" && values.value.length > 0
+      ? values.value
+      : await promptHidden(`Secret value for ${name}: `);
 
   await unlock();
   await vault.add(name, value, type);
