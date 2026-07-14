@@ -4,7 +4,7 @@
 
 **Name:** AgentPass
 **Type:** CLI tool (local-first credential broker for AI agents)
-**Core functionality:** Encrypted vault + local proxy validation sprint. Direct proxy requests can substitute credential placeholders; HTTPS `CONNECT` is currently tunneled but not decrypted or rewritten.
+**Core functionality:** Encrypted vault + local proxy with full TLS MITM interception. Both direct HTTP forward-proxy requests and HTTPS CONNECT tunnels have credential placeholders substituted. The proxy is live for production use over HTTP and HTTPS.
 **Target users:** Developers running Claude Code, Cursor, OpenClaw agents who manage multiple API keys
 
 ---
@@ -26,7 +26,7 @@
 ### Components
 
 1. **Vault** — Local SQLite database with encryption (using `age` for file encryption, SQLCipher alternative)
-2. **Proxy Server** — HTTP server that intercepts requests, substitutes placeholder tokens with real credentials
+2. **Proxy Server** — HTTP/HTTPS server that intercepts requests (including HTTPS CONNECT tunnels via TLS MITM), substitutes placeholder tokens with real credentials from the vault, and forwards to upstreams
 3. **CLI** — Commands to manage secrets, run agents with proxy
 
 ---
@@ -46,7 +46,7 @@
    - Default port: 8888
    - Intercept direct HTTP proxy requests
    - Replace `{{secret:SECRET_NAME}}` patterns in configured credential headers with real keys
-   - Support HTTPS `CONNECT` tunneling without claiming encrypted header rewriting
+   - Intercept HTTPS `CONNECT` tunnels via TLS MITM (per-host cert signed by local CA); rewrite credential headers inside encrypted traffic
    - Support API key (`Bearer xxx`), Basic auth, custom headers
 
 3. **Agent Runner**
@@ -115,7 +115,7 @@ agentpass status            Show vault status, proxy state
 3. ✅ `agentpass list` shows secret names only (never values)
 4. ✅ `agentpass proxy start` starts HTTP proxy on port 8888
 5. ✅ Proxy intercepts requests to `api.openai.com`, replaces placeholder with real key
-6. ⏳ `agentpass run curl https://api.openai.com/v1/models` works as a CONNECT tunnel; generic HTTPS header substitution requires a future trusted local-CA/TLS interception flow
+6. ✅ `agentpass run curl https://api.openai.com/v1/models` works end-to-end: the proxy intercepts the HTTPS CONNECT tunnel via TLS MITM, substitutes credential placeholders in the encrypted request headers, and forwards to the real upstream
 7. ✅ Vault file is encrypted — cannot read secrets with `cat` or text editor
 8. ✅ MVP ships as single binary or runnable via `bun run`
 

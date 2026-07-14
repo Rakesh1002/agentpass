@@ -38,12 +38,16 @@ The CLI is intentionally small. Read these in order on your first day:
 2. **`src/vault.ts`** — SQLite-backed encrypted store. Uses Web Crypto
    (`crypto.subtle`) for AES-GCM. PBKDF2 derives the encryption key from the
    master password.
-3. **`src/proxy.ts`** — the HTTP proxy. Two paths: `handleRequest` (direct
-   HTTP, where we substitute placeholders) and `handleConnect` (HTTPS
-   tunneling, today a passthrough).
+3. **`src/proxy.ts`** — the HTTP/HTTPS proxy. Three paths: `handleRequest`
+   (direct HTTP, where we substitute placeholders), `handleForwardProxy`
+   (absolute-URL forward proxy), and `handleConnect` (HTTPS CONNECT MITM
+   — terminates TLS with a local CA cert, rewrites credential headers, then
+   re-encrypts to the real upstream).
 4. **`src/providers.ts`** — upstream provider routing table.
-5. **`src/ca.ts`** — local certificate authority. Scaffolded for TLS
-   interception but not yet wired into the proxy.
+5. **`src/ca.ts`** — local certificate authority. Mints per-host TLS
+   certificates signed by the local CA; used actively by the HTTPS MITM
+   engine in `handleConnect`. Includes an in-memory cert cache so disk I/O
+   only happens once per hostname per process lifetime.
 6. **`src/agentpass.test.ts`** and **`src/proxy.test.ts`** — read the tests
    before changing the code they cover.
 
@@ -122,13 +126,6 @@ Before you mark a PR ready for review:
 These are tracked technical debts. Pick one as a starter task if you're
 looking for something real to work on:
 
-- **TLS interception is not wired in.** `src/ca.ts` mints a local CA and
-  per-host certificates, but `proxy.ts` `handleConnect` still raw-tunnels
-  CONNECT traffic. Until interception is implemented, HTTPS agent traffic
-  in forward-proxy mode passes through with no header rewriting. (The
-  provider-routed reverse-proxy mode does not need this — clients call
-  `http://localhost:8888/openai/...` and the proxy makes the HTTPS call to
-  the upstream itself.)
 - **No cooldown tracking on rate-limited keys.** The provider-routed
   proxy falls over to the next key on 429 within a single request, but
   it does not remember which key cooled down across requests. A short

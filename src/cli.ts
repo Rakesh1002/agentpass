@@ -5,10 +5,11 @@ import { proxy } from "./proxy";
 import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
+import { loadRoutingConfig, writeDefaultConfig } from "./router";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
-import { existsSync } from "fs";
-import { vaultFile } from "./paths";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { vaultFile, routingConfigFile } from "./paths";
 
 const VAULT_FILE = vaultFile();
 
@@ -77,6 +78,9 @@ async function main() {
       case "import-claude":
         await handleImportClaude();
         break;
+      case "routing":
+        await handleRouting(args.slice(1));
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -112,11 +116,16 @@ Commands:
   ca path               Print local CA certificate path
   status                Show vault and proxy status
   import-claude         Import existing Anthropic key from Claude Code config
+  routing init          Generate default routing config
+  routing show          Display current routing config
+  routing enable        Enable cost-aware routing
+  routing disable       Disable cost-aware routing
 
 Examples:
   agentpass init
   agentpass add openai
   agentpass add anthropic
+  agentpass routing init
   agentpass run claude
   agentpass run cursor-agent
 `);
@@ -403,6 +412,41 @@ async function handleImportClaude() {
   await unlock();
   await claudeShim.importFromConfig(vault);
   vault.close();
+}
+
+async function handleRouting(args: string[]) {
+  const action = args[0];
+
+  if (action === "init") {
+    const path = writeDefaultConfig();
+    console.log(`Routing config created at ${path}`);
+    console.log("Edit the file to configure tier→provider/model mappings.");
+    return;
+  }
+
+  if (action === "show") {
+    const config = loadRoutingConfig();
+    if (!config) {
+      console.log("No routing config found. Run: agentpass routing init");
+      return;
+    }
+    console.log(JSON.stringify(config, null, 2));
+    return;
+  }
+
+  if (action === "enable" || action === "disable") {
+    const configPath = routingConfigFile();
+    if (!existsSync(configPath)) {
+      throw new Error("No routing config found. Run: agentpass routing init");
+    }
+    const config = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    config.enabled = action === "enable";
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+    console.log(`Cost-aware routing ${action === "enable" ? "enabled" : "disabled"}.`);
+    return;
+  }
+
+  throw new Error("Usage: agentpass routing [init|show|enable|disable]");
 }
 
 main();

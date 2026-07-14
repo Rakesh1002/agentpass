@@ -1,10 +1,32 @@
 import http from "http";
 import https from "https";
 import net from "net";
+import { certificateAuthority } from "./ca";
 import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
-import { matchProvider, type Provider } from "./providers";
+import { matchProvider, PROVIDERS, type Provider } from "./providers";
+import {
+  loadRoutingConfig,
+  makeRoutingDecision,
+  checkEscalationTriggers,
+  isDuplicateRetry,
+  nextTier,
+  type RoutingConfig,
+  type TaskTier,
+} from "./router";
+import {
+  canTranslate,
+  translateOpenAIToAnthropic,
+  translateAnthropicToOpenAI,
+  translateAnthropicResponseToOpenAI,
+  translateOpenAIResponseToAnthropic,
+  detectRequestFormat,
+  type OpenAIRequest,
+  type AnthropicRequest,
+  type AnthropicResponse,
+  type OpenAIResponse,
+} from "./schema-translator";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -73,7 +95,7 @@ export class ProxyServer {
         }
       });
 
-      server.listen(this.config.port, this.config.host, () => {
+      server.listen(this.config.port, this.config.host, async () => {
         this.server = server;
         const address = this.server.address();
         if (address && typeof address === "object") {
@@ -183,6 +205,212 @@ export class ProxyServer {
     upstreamPath: string
   ): Promise<void> {
     const started = Date.now();
+    const body = await readBody(req);
+
+    // --- Cost-Aware Routing (Section 3.4) ---
+    const routingConfig = loadRoutingConfig();
+    let routedTier: TaskTier | undefined;
+    let escalated = false;
+
+    // Parse body JSON for routing decisions (non-destructive)
+    let parsedBody: Record<string, unknown> | null = null;
+    if (routingConfig?.enabled && body.length > 0) {
+      try {
+        parsedBody = JSON.parse(body.toString("utf-8")) as Record<string, unknown>;
+      } catch {
+        // Not JSON — skip routing, forward as-is
+      }
+    }
+
+    // Check for duplicate retry escalation trigger
+    if (parsedBody && routingConfig?.enabled) {
+      if (
+        routingConfig.escalation.trigger_on.includes("duplicate_retry") &&
+        isDuplicateRetry(parsedBody)
+      ) {
+        // Will be handled via force-escalation below
+      }
+    }
+
+    // Determine effective provider and body for this request
+    let effectiveProvider = provider;
+    let effectiveBody = body;
+    let effectivePath = upstreamPath;
+    let needsResponseTranslation = false;
+    let sourceFormat: "openai" | "anthropic" | "unknown" = "unknown";
+
+    if (parsedBody && routingConfig?.enabled) {
+      const decision = makeRoutingDecision(
+        routingConfig,
+        parsedBody,
+        provider.name,
+        req.headers as Record<string, string | string[] | undefined>
+      );
+      routedTier = decision.tier;
+
+      // If the router wants a different provider, redirect
+      if (decision.targetProvider !== provider.name) {
+        const newProvider = PROVIDERS.find((p) => p.name === decision.targetProvider);
+        if (newProvider) {
+          // Attempt schema translation for cross-provider routing
+          if (canTranslate(parsedBody)) {
+            sourceFormat = detectRequestFormat(parsedBody);
+            const translated = translateRequestBody(
+              parsedBody,
+              sourceFormat,
+              decision.targetProvider,
+              decision.targetModel
+            );
+            if (translated) {
+              effectiveProvider = newProvider;
+              effectiveBody = Buffer.from(JSON.stringify(translated), "utf-8");
+              effectivePath = getProviderChatPath(decision.targetProvider);
+              needsResponseTranslation = true;
+              console.log(
+                `[AgentPass] Routed ${provider.name}→${newProvider.name} (tier: ${decision.tier}${decision.forced ? ", forced" : ""})`
+              );
+            }
+          } else {
+            // Can't translate — override model but stay on same provider
+            if (parsedBody.model) {
+              parsedBody.model = decision.targetModel;
+              effectiveBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+            }
+          }
+        }
+      } else {
+        // Same provider — just override the model if routing table says so
+        if (parsedBody.model) {
+          parsedBody.model = decision.targetModel;
+          effectiveBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+        }
+      }
+    }
+
+    // --- Execute the request against the effective provider ---
+    const responseResult = await this.executeProviderRequest(
+      req,
+      effectiveProvider,
+      effectivePath,
+      effectiveBody,
+      started,
+      routedTier,
+      escalated
+    );
+
+    if (!responseResult) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "no_keys", provider: effectiveProvider.name }));
+      return;
+    }
+
+    // --- Escalation check (Section 3.4) ---
+    if (
+      routingConfig?.enabled &&
+      routedTier &&
+      responseResult.status >= 200 &&
+      responseResult.status < 300
+    ) {
+      let responseJson: Record<string, unknown> | null = null;
+      try {
+        responseJson = JSON.parse(responseResult.body.toString("utf-8")) as Record<string, unknown>;
+      } catch {
+        // Not JSON response — skip escalation check
+      }
+
+      if (responseJson) {
+        const trigger = checkEscalationTriggers(routingConfig, responseJson, routedTier);
+        const hopsRemaining = routingConfig.escalation.max_hops;
+
+        if (trigger && hopsRemaining > 0) {
+          const escalatedTier = nextTier(routedTier);
+          if (escalatedTier) {
+            console.log(
+              `[AgentPass] Escalating ${routedTier}→${escalatedTier} (trigger: ${trigger})`
+            );
+            escalated = true;
+            const escalationTarget = routingConfig.routing_table[escalatedTier];
+            const escalationProvider =
+              PROVIDERS.find((p) => p.name === escalationTarget.provider) ?? provider;
+
+            // Re-prepare body for escalation target
+            let escalationBody = body; // original body
+            let escalationPath = upstreamPath;
+            let escalationNeedsTranslation = false;
+            let escalationSourceFormat = sourceFormat;
+
+            if (
+              escalationProvider.name !== provider.name &&
+              parsedBody &&
+              canTranslate(parsedBody)
+            ) {
+              escalationSourceFormat = detectRequestFormat(parsedBody);
+              const translated = translateRequestBody(
+                parsedBody,
+                escalationSourceFormat,
+                escalationTarget.provider,
+                escalationTarget.model
+              );
+              if (translated) {
+                escalationBody = Buffer.from(JSON.stringify(translated), "utf-8");
+                escalationPath = getProviderChatPath(escalationTarget.provider);
+                escalationNeedsTranslation = true;
+              }
+            } else if (parsedBody) {
+              parsedBody.model = escalationTarget.model;
+              escalationBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+            }
+
+            const escalationResult = await this.executeProviderRequest(
+              req,
+              escalationProvider,
+              escalationPath,
+              escalationBody,
+              started,
+              escalatedTier,
+              true
+            );
+
+            if (escalationResult && escalationResult.status >= 200 && escalationResult.status < 300) {
+              let finalBody = escalationResult.body;
+              if (escalationNeedsTranslation) {
+                finalBody = translateResponseBack(
+                  escalationResult.body,
+                  escalationSourceFormat,
+                  escalationProvider.name
+                );
+              }
+              writeUpstreamResponse(res, escalationResult.status, escalationResult.headers, finalBody);
+              return;
+            }
+            // Escalation failed — fall through to original response
+          }
+        }
+      }
+    }
+
+    // --- Translate response back if cross-provider routed ---
+    let finalBody = responseResult.body;
+    if (needsResponseTranslation && responseResult.status >= 200 && responseResult.status < 300) {
+      finalBody = translateResponseBack(responseResult.body, sourceFormat, effectiveProvider.name);
+    }
+
+    writeUpstreamResponse(res, responseResult.status, responseResult.headers, finalBody);
+  }
+
+  /**
+   * Executes a request against a provider's key pool with bounded retry.
+   * Returns the upstream response, or null if no keys are available.
+   */
+  private async executeProviderRequest(
+    req: http.IncomingMessage,
+    provider: Provider,
+    upstreamPath: string,
+    body: Buffer,
+    started: number,
+    routedTier?: TaskTier,
+    escalated?: boolean
+  ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer } | null> {
     const destination = `${provider.upstream.host}${upstreamPath}`;
 
     let pool: { name: string; value: string }[];
@@ -190,9 +418,8 @@ export class ProxyServer {
       pool = await vault.getPool(provider.name);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "vault_unavailable", message }));
-      return;
+      console.error(`[AgentPass] Vault unavailable for ${provider.name}: ${message}`);
+      return null;
     }
 
     if (pool.length === 0) {
@@ -203,13 +430,12 @@ export class ProxyServer {
         statusCode: 503,
         durationMs: Date.now() - started,
         error: `no keys configured for provider ${provider.name}`,
+        routedTier,
+        escalated,
       });
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "no_keys", provider: provider.name }));
-      return;
+      return null;
     }
 
-    const body = await readBody(req);
     const client = provider.upstream.protocol === "https" ? https : http;
     const upstreamPort =
       provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
@@ -218,7 +444,8 @@ export class ProxyServer {
     let lastHeaders: http.IncomingHttpHeaders | null = null;
     let lastBody: Buffer | null = null;
 
-    let attempts = 0;                  // <-- ADD THIS
+    // Bounded iteration: max attempts = pool size (Section 4.1)
+    let attempts = 0;
     const maxAttempts = pool.length;
 
     for (const { name, value } of pool) {
@@ -244,6 +471,8 @@ export class ProxyServer {
           statusCode: 502,
           durationMs: Date.now() - started,
           error: result.error,
+          routedTier,
+          escalated,
         });
         lastStatus = 502;
         lastHeaders = null;
@@ -257,6 +486,8 @@ export class ProxyServer {
         secretNames: [name],
         statusCode: result.status,
         durationMs: Date.now() - started,
+        routedTier,
+        escalated,
       });
 
       lastStatus = result.status;
@@ -265,29 +496,28 @@ export class ProxyServer {
 
       if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
         if (attempts >= maxAttempts) {
-          console.warn(`[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error.`);
-          writeUpstreamResponse(res, result.status, result.headers, result.body);
-          return;
+          console.warn(
+            `[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error (${result.status}).`
+          );
+          return { status: result.status, headers: result.headers, body: result.body };
         }
         continue;
       }
 
-      writeUpstreamResponse(res, result.status, result.headers, result.body);
-      return;
+      return { status: result.status, headers: result.headers, body: result.body };
     }
 
     if (lastHeaders) {
-      writeUpstreamResponse(res, lastStatus, lastHeaders, lastBody ?? Buffer.alloc(0));
-    } else {
-      res.writeHead(lastStatus || 503, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "all_keys_exhausted",
-          provider: provider.name,
-          lastStatus,
-        })
-      );
+      return { status: lastStatus, headers: lastHeaders, body: lastBody ?? Buffer.alloc(0) };
     }
+
+    return { status: lastStatus || 503, headers: {}, body: Buffer.from(
+      JSON.stringify({
+        error: "all_keys_exhausted",
+        provider: provider.name,
+        lastStatus,
+      })
+    ) };
   }
 
   private async handleConnect(
@@ -304,32 +534,154 @@ export class ProxyServer {
       return;
     }
 
-    const upstream = net.connect(port, hostname, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length > 0) upstream.write(head);
-      appendAudit({
-        method: "CONNECT",
-        destination: `${hostname}:${port}`,
-        secretNames: [],
-        statusCode: 200,
-        durationMs: Date.now() - started,
-      });
-      upstream.pipe(clientSocket);
-      (clientSocket as NodeJS.ReadableStream).pipe(upstream);
-    });
+    try {
+      if (head.length > 0) clientSocket.unshift(head);
 
-    upstream.on("error", (err) => {
+      const hostPair = certificateAuthority.getHostCertificate(hostname);
+      const caPair = certificateAuthority.ensureCa();
+      const certChain = `${hostPair.cert}\n${caPair.cert}`;
+
+      const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
+        const startedReq = Date.now();
+        try {
+          const substitution = await substitutePlaceholders(req.headers, (n) => vault.get(n));
+          if (substitution.missingSecrets.length > 0) {
+            appendAudit({
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: substitution.secretNames,
+              statusCode: 400,
+              durationMs: Date.now() - startedReq,
+              error: `missing_secrets:${substitution.missingSecrets.join(",")}`,
+            });
+            res.writeHead(400, { "Content-Type": "text/plain" });
+            res.end("Missing secrets\n");
+            return;
+          }
+
+          const upstreamReq = https.request(
+            {
+              hostname,
+              port,
+              path: req.url || "/",
+              method: req.method,
+              headers: substitution.headers,
+              rejectUnauthorized: this.config.rejectUnauthorized,
+            },
+            (upstreamRes) => {
+              appendAudit({
+                method: req.method || "GET",
+                destination: `${hostname}:${port}`,
+                secretNames: substitution.secretNames,
+                statusCode: upstreamRes.statusCode,
+                durationMs: Date.now() - startedReq,
+              });
+              res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+              upstreamRes.pipe(res, { end: true });
+            }
+          );
+
+          upstreamReq.on("error", (err) => {
+            appendAudit({
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: substitution.secretNames,
+              statusCode: 502,
+              durationMs: Date.now() - startedReq,
+              error: err.message,
+            });
+            try {
+              res.writeHead(502, { "Content-Type": "text/plain" });
+              res.end(`Proxy Error: ${err.message}`);
+            } catch { }
+          });
+
+          req.on("error", () => {
+            try { upstreamReq.destroy(); } catch {}
+          });
+
+          req.pipe(upstreamReq, { end: true });
+        } catch (err: any) {
+          console.error(`[AgentPass] CONNECT handler error for ${hostname}:`, err?.message ?? err);
+          appendAudit({
+            method: req.method || "GET",
+            destination: `${hostname}:${port}`,
+            secretNames: [],
+            statusCode: 502,
+            durationMs: Date.now() - startedReq,
+            error: err?.message ?? String(err),
+          });
+          try {
+            res.writeHead(502, { "Content-Type": "text/plain" });
+            res.end("Proxy Error\n");
+          } catch { }
+        }
+      });
+
+      const onError = (err: Error) => {
+        appendAudit({
+          method: "CONNECT",
+          destination: `${hostname}:${port}`,
+          secretNames: [],
+          statusCode: 502,
+          durationMs: Date.now() - started,
+          error: err.message,
+        });
+        console.error(`[AgentPass] CONNECT error for ${hostname}:${port}:`, err.message);
+        try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); } catch { }
+        try { clientSocket.end(); } catch { }
+      };
+
+      httpsServer.on("error", onError);
+
+      httpsServer.listen(0, "127.0.0.1", () => {
+        const addr = httpsServer.address();
+        const listenPort = typeof addr === "object" && addr ? addr.port : 0;
+        const mitmSocket = net.connect(listenPort, "127.0.0.1", () => {
+          try { clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); } catch { }
+
+          appendAudit({
+            method: "CONNECT",
+            destination: `${hostname}:${port}`,
+            secretNames: [],
+            statusCode: 200,
+            durationMs: Date.now() - started,
+          });
+          clientSocket.pipe(mitmSocket);
+          mitmSocket.pipe(clientSocket);
+        });
+
+        mitmSocket.on("error", (err) => {
+          onError(err as Error);
+          try { httpsServer.close(); } catch { }
+        });
+
+        mitmSocket.on("close", () => {
+          try { httpsServer.close(); } catch { }
+        });
+
+        clientSocket.on("error", (err) => {
+          try { httpsServer.close(); } catch { }
+        });
+
+        clientSocket.on("close", () => {
+          try { httpsServer.close(); } catch { }
+        });
+      });
+    } catch (err: any) {
       appendAudit({
         method: "CONNECT",
         destination: `${hostname}:${port}`,
         secretNames: [],
         statusCode: 502,
         durationMs: Date.now() - started,
-        error: err.message,
+        error: err?.message ?? String(err),
       });
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      clientSocket.end(err.message);
-    });
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        clientSocket.end();
+      } catch { }
+    }
   }
 
   stop(): Promise<void> {
@@ -337,7 +689,7 @@ export class ProxyServer {
       if (this.server) {
         this.server.close(() => {
           this.server = null;
-          console.log("Proxy stopped");
+          console.log("\nProxy stopped");
           resolve();
         });
       } else {
@@ -394,73 +746,72 @@ async function replacePlaceholders(
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
 
 function sanitizeRequestHeaders(
-  source: http.IncomingHttpHeaders,
+  headers: http.IncomingHttpHeaders,
   upstreamHost: string
-): Record<string, string | string[] | undefined> {
-  const out: Record<string, string | string[] | undefined> = {};
-  for (const [key, value] of Object.entries(source)) {
-    const lower = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower === "host" || lower === "content-length") continue;
-    if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") continue;
-    out[key] = value;
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    if (key.toLowerCase() === "host") continue;
+    if (value !== undefined) out[key] = value as string | string[];
   }
-  out.host = upstreamHost;
+  out["host"] = upstreamHost;
   return out;
 }
 
-type UpstreamSuccess = {
+interface UpstreamSuccess {
   status: number;
   headers: http.IncomingHttpHeaders;
   body: Buffer;
-};
-
-interface UpstreamRequestSpec {
-  hostname: string;
-  port: number;
-  path: string;
-  method: string;
-  headers: Record<string, string | string[] | undefined>;
-  body: Buffer;
-  rejectUnauthorized: boolean;
+}
+interface UpstreamError {
+  error: string;
 }
 
 function sendUpstream(
   client: typeof http | typeof https,
-  spec: UpstreamRequestSpec
-): Promise<UpstreamSuccess | { error: string }> {
+  opts: {
+    hostname: string;
+    port: number;
+    path: string;
+    method: string;
+    headers: Record<string, string | string[]>;
+    body: Buffer;
+    rejectUnauthorized: boolean;
+  }
+): Promise<UpstreamSuccess | UpstreamError> {
   return new Promise((resolve) => {
     const req = client.request(
       {
-        hostname: spec.hostname,
-        port: spec.port,
-        path: spec.path,
-        method: spec.method,
-        headers: spec.headers,
-        rejectUnauthorized: spec.rejectUnauthorized,
+        hostname: opts.hostname,
+        port: opts.port,
+        path: opts.path,
+        method: opts.method,
+        headers: opts.headers,
+        rejectUnauthorized: opts.rejectUnauthorized,
       },
-      (upRes) => {
+      (res) => {
         const chunks: Buffer[] = [];
-        upRes.on("data", (chunk) => chunks.push(chunk));
-        upRes.on("end", () =>
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () =>
           resolve({
-            status: upRes.statusCode ?? 500,
-            headers: upRes.headers,
+            status: res.statusCode ?? 502,
+            headers: res.headers,
             body: Buffer.concat(chunks),
           })
         );
-        upRes.on("error", (err) => resolve({ error: err.message }));
+        res.on("error", (err) => resolve({ error: err.message }));
       }
     );
     req.on("error", (err) => resolve({ error: err.message }));
-    if (spec.body.length > 0) req.write(spec.body);
+    if (opts.body.length > 0) req.write(opts.body);
     req.end();
   });
 }
@@ -507,3 +858,70 @@ export async function substitutePlaceholders(
     missingSecrets: [...missingSecrets],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cross-provider translation helpers (Section 3.5)
+// ---------------------------------------------------------------------------
+
+function translateRequestBody(
+  body: Record<string, unknown>,
+  sourceFormat: "openai" | "anthropic" | "unknown",
+  targetProvider: string,
+  targetModel: string
+): Record<string, unknown> | null {
+  try {
+    if (sourceFormat === "openai" && targetProvider === "anthropic") {
+      return translateOpenAIToAnthropic(body as OpenAIRequest, targetModel);
+    }
+    if (sourceFormat === "anthropic" && (targetProvider === "openai" || targetProvider === "groq" || targetProvider === "openrouter")) {
+      return translateAnthropicToOpenAI(body as AnthropicRequest, targetModel);
+    }
+    // Same format family — just swap model
+    return { ...body, model: targetModel };
+  } catch {
+    return null;
+  }
+}
+
+function translateResponseBack(
+  responseBody: Buffer,
+  sourceFormat: "openai" | "anthropic" | "unknown",
+  respondingProvider: string
+): Buffer {
+  try {
+    const parsed = JSON.parse(responseBody.toString("utf-8")) as Record<string, unknown>;
+
+    // If the agent sent OpenAI format but we routed to Anthropic,
+    // translate the Anthropic response back to OpenAI format.
+    if (sourceFormat === "openai" && respondingProvider === "anthropic") {
+      const translated = translateAnthropicResponseToOpenAI(parsed as unknown as AnthropicResponse);
+      return Buffer.from(JSON.stringify(translated), "utf-8");
+    }
+
+    // If the agent sent Anthropic format but we routed to OpenAI/Groq,
+    // translate the OpenAI response back to Anthropic format.
+    if (sourceFormat === "anthropic" && respondingProvider !== "anthropic") {
+      const translated = translateOpenAIResponseToAnthropic(parsed as unknown as OpenAIResponse);
+      return Buffer.from(JSON.stringify(translated), "utf-8");
+    }
+
+    return responseBody;
+  } catch {
+    return responseBody;
+  }
+}
+
+function getProviderChatPath(provider: string): string {
+  switch (provider) {
+    case "openai":
+    case "groq":
+      return "/v1/chat/completions";
+    case "anthropic":
+      return "/v1/messages";
+    case "openrouter":
+      return "/api/v1/chat/completions";
+    default:
+      return "/v1/chat/completions";
+  }
+}
+

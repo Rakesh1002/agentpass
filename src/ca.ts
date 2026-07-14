@@ -1,5 +1,5 @@
 import forge from "node-forge";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "fs";
 import { resolve } from "path";
 import { agentPassDir, caCertFile, caKeyFile, certDir } from "./paths";
 
@@ -15,6 +15,8 @@ function serialNumber(): string {
 function isIpAddress(hostname: string): boolean {
   return /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || hostname.includes(":");
 }
+
+const certCache = new Map<string, PemPair>();
 
 export class CertificateAuthority {
   ensureCa(): PemPair {
@@ -35,6 +37,7 @@ export class CertificateAuthority {
     cert.publicKey = keys.publicKey;
     cert.serialNumber = serialNumber();
     cert.validity.notBefore = new Date();
+    cert.validity.notBefore.setDate(cert.validity.notBefore.getDate() - 1);
     cert.validity.notAfter = new Date();
     cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2);
 
@@ -56,8 +59,12 @@ export class CertificateAuthority {
       key: forge.pki.privateKeyToPem(keys.privateKey),
     };
 
-    writeFileSync(certPath, pair.cert, { mode: 0o644 });
-    writeFileSync(keyPath, pair.key, { mode: 0o600 });
+    const tmpCert = `${certPath}.tmp`;
+    const tmpKey = `${keyPath}.tmp`;
+    writeFileSync(tmpCert, pair.cert, { mode: 0o644 });
+    writeFileSync(tmpKey, pair.key, { mode: 0o600 });
+    renameSync(tmpCert, certPath);
+    renameSync(tmpKey, keyPath);
     return pair;
   }
 
@@ -68,15 +75,20 @@ export class CertificateAuthority {
 
   getHostCertificate(hostname: string): PemPair {
     const normalizedHost = hostname.toLowerCase();
+
+    if (certCache.has(normalizedHost)) return certCache.get(normalizedHost)!;
+
     const safeName = normalizedHost.replace(/[^a-z0-9.-]/gi, "_");
     const hostCertPath = resolve(certDir(), `${safeName}.crt`);
     const hostKeyPath = resolve(certDir(), `${safeName}.key`);
 
     if (existsSync(hostCertPath) && existsSync(hostKeyPath)) {
-      return {
+      const pair = {
         cert: readFileSync(hostCertPath, "utf-8"),
         key: readFileSync(hostKeyPath, "utf-8"),
       };
+      certCache.set(normalizedHost, pair);
+      return pair;
     }
 
     const ca = this.ensureCa();
@@ -89,6 +101,7 @@ export class CertificateAuthority {
     cert.publicKey = keys.publicKey;
     cert.serialNumber = serialNumber();
     cert.validity.notBefore = new Date();
+    cert.validity.notBefore.setDate(cert.validity.notBefore.getDate() - 1);
     cert.validity.notAfter = new Date();
     cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1);
     cert.setSubject([{ name: "commonName", value: normalizedHost }]);
@@ -113,8 +126,13 @@ export class CertificateAuthority {
       key: forge.pki.privateKeyToPem(keys.privateKey),
     };
 
-    writeFileSync(hostCertPath, pair.cert, { mode: 0o644 });
-    writeFileSync(hostKeyPath, pair.key, { mode: 0o600 });
+    const tmpHostCert = `${hostCertPath}.tmp`;
+    const tmpHostKey = `${hostKeyPath}.tmp`;
+    writeFileSync(tmpHostCert, pair.cert, { mode: 0o644 });
+    writeFileSync(tmpHostKey, pair.key, { mode: 0o600 });
+    renameSync(tmpHostCert, hostCertPath);
+    renameSync(tmpHostKey, hostKeyPath);
+    certCache.set(normalizedHost, pair);
     return pair;
   }
 }
