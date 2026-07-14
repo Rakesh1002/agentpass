@@ -1,6 +1,7 @@
 import http from "http";
 import https from "https";
 import net from "net";
+import { certificateAuthority } from "./ca";
 import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
@@ -94,7 +95,7 @@ export class ProxyServer {
         }
       });
 
-      server.listen(this.config.port, this.config.host, () => {
+      server.listen(this.config.port, this.config.host, async () => {
         this.server = server;
         const address = this.server.address();
         if (address && typeof address === "object") {
@@ -533,32 +534,154 @@ export class ProxyServer {
       return;
     }
 
-    const upstream = net.connect(port, hostname, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length > 0) upstream.write(head);
-      appendAudit({
-        method: "CONNECT",
-        destination: `${hostname}:${port}`,
-        secretNames: [],
-        statusCode: 200,
-        durationMs: Date.now() - started,
-      });
-      upstream.pipe(clientSocket);
-      (clientSocket as NodeJS.ReadableStream).pipe(upstream);
-    });
+    try {
+      if (head.length > 0) clientSocket.unshift(head);
 
-    upstream.on("error", (err) => {
+      const hostPair = certificateAuthority.getHostCertificate(hostname);
+      const caPair = certificateAuthority.ensureCa();
+      const certChain = `${hostPair.cert}\n${caPair.cert}`;
+
+      const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
+        const startedReq = Date.now();
+        try {
+          const substitution = await substitutePlaceholders(req.headers, (n) => vault.get(n));
+          if (substitution.missingSecrets.length > 0) {
+            appendAudit({
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: substitution.secretNames,
+              statusCode: 400,
+              durationMs: Date.now() - startedReq,
+              error: `missing_secrets:${substitution.missingSecrets.join(",")}`,
+            });
+            res.writeHead(400, { "Content-Type": "text/plain" });
+            res.end("Missing secrets\n");
+            return;
+          }
+
+          const upstreamReq = https.request(
+            {
+              hostname,
+              port,
+              path: req.url || "/",
+              method: req.method,
+              headers: substitution.headers,
+              rejectUnauthorized: this.config.rejectUnauthorized,
+            },
+            (upstreamRes) => {
+              appendAudit({
+                method: req.method || "GET",
+                destination: `${hostname}:${port}`,
+                secretNames: substitution.secretNames,
+                statusCode: upstreamRes.statusCode,
+                durationMs: Date.now() - startedReq,
+              });
+              res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+              upstreamRes.pipe(res, { end: true });
+            }
+          );
+
+          upstreamReq.on("error", (err) => {
+            appendAudit({
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: substitution.secretNames,
+              statusCode: 502,
+              durationMs: Date.now() - startedReq,
+              error: err.message,
+            });
+            try {
+              res.writeHead(502, { "Content-Type": "text/plain" });
+              res.end(`Proxy Error: ${err.message}`);
+            } catch { }
+          });
+
+          req.on("error", () => {
+            try { upstreamReq.destroy(); } catch {}
+          });
+
+          req.pipe(upstreamReq, { end: true });
+        } catch (err: any) {
+          console.error(`[AgentPass] CONNECT handler error for ${hostname}:`, err?.message ?? err);
+          appendAudit({
+            method: req.method || "GET",
+            destination: `${hostname}:${port}`,
+            secretNames: [],
+            statusCode: 502,
+            durationMs: Date.now() - startedReq,
+            error: err?.message ?? String(err),
+          });
+          try {
+            res.writeHead(502, { "Content-Type": "text/plain" });
+            res.end("Proxy Error\n");
+          } catch { }
+        }
+      });
+
+      const onError = (err: Error) => {
+        appendAudit({
+          method: "CONNECT",
+          destination: `${hostname}:${port}`,
+          secretNames: [],
+          statusCode: 502,
+          durationMs: Date.now() - started,
+          error: err.message,
+        });
+        console.error(`[AgentPass] CONNECT error for ${hostname}:${port}:`, err.message);
+        try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); } catch { }
+        try { clientSocket.end(); } catch { }
+      };
+
+      httpsServer.on("error", onError);
+
+      httpsServer.listen(0, "127.0.0.1", () => {
+        const addr = httpsServer.address();
+        const listenPort = typeof addr === "object" && addr ? addr.port : 0;
+        const mitmSocket = net.connect(listenPort, "127.0.0.1", () => {
+          try { clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); } catch { }
+
+          appendAudit({
+            method: "CONNECT",
+            destination: `${hostname}:${port}`,
+            secretNames: [],
+            statusCode: 200,
+            durationMs: Date.now() - started,
+          });
+          clientSocket.pipe(mitmSocket);
+          mitmSocket.pipe(clientSocket);
+        });
+
+        mitmSocket.on("error", (err) => {
+          onError(err as Error);
+          try { httpsServer.close(); } catch { }
+        });
+
+        mitmSocket.on("close", () => {
+          try { httpsServer.close(); } catch { }
+        });
+
+        clientSocket.on("error", (err) => {
+          try { httpsServer.close(); } catch { }
+        });
+
+        clientSocket.on("close", () => {
+          try { httpsServer.close(); } catch { }
+        });
+      });
+    } catch (err: any) {
       appendAudit({
         method: "CONNECT",
         destination: `${hostname}:${port}`,
         secretNames: [],
         statusCode: 502,
         durationMs: Date.now() - started,
-        error: err.message,
+        error: err?.message ?? String(err),
       });
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      clientSocket.end(err.message);
-    });
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        clientSocket.end();
+      } catch { }
+    }
   }
 
   stop(): Promise<void> {
@@ -566,7 +689,7 @@ export class ProxyServer {
       if (this.server) {
         this.server.close(() => {
           this.server = null;
-          console.log("Proxy stopped");
+          console.log("\nProxy stopped");
           resolve();
         });
       } else {
@@ -623,73 +746,72 @@ async function replacePlaceholders(
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
 
 function sanitizeRequestHeaders(
-  source: http.IncomingHttpHeaders,
+  headers: http.IncomingHttpHeaders,
   upstreamHost: string
-): Record<string, string | string[] | undefined> {
-  const out: Record<string, string | string[] | undefined> = {};
-  for (const [key, value] of Object.entries(source)) {
-    const lower = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower === "host" || lower === "content-length") continue;
-    if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") continue;
-    out[key] = value;
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    if (key.toLowerCase() === "host") continue;
+    if (value !== undefined) out[key] = value as string | string[];
   }
-  out.host = upstreamHost;
+  out["host"] = upstreamHost;
   return out;
 }
 
-type UpstreamSuccess = {
+interface UpstreamSuccess {
   status: number;
   headers: http.IncomingHttpHeaders;
   body: Buffer;
-};
-
-interface UpstreamRequestSpec {
-  hostname: string;
-  port: number;
-  path: string;
-  method: string;
-  headers: Record<string, string | string[] | undefined>;
-  body: Buffer;
-  rejectUnauthorized: boolean;
+}
+interface UpstreamError {
+  error: string;
 }
 
 function sendUpstream(
   client: typeof http | typeof https,
-  spec: UpstreamRequestSpec
-): Promise<UpstreamSuccess | { error: string }> {
+  opts: {
+    hostname: string;
+    port: number;
+    path: string;
+    method: string;
+    headers: Record<string, string | string[]>;
+    body: Buffer;
+    rejectUnauthorized: boolean;
+  }
+): Promise<UpstreamSuccess | UpstreamError> {
   return new Promise((resolve) => {
     const req = client.request(
       {
-        hostname: spec.hostname,
-        port: spec.port,
-        path: spec.path,
-        method: spec.method,
-        headers: spec.headers,
-        rejectUnauthorized: spec.rejectUnauthorized,
+        hostname: opts.hostname,
+        port: opts.port,
+        path: opts.path,
+        method: opts.method,
+        headers: opts.headers,
+        rejectUnauthorized: opts.rejectUnauthorized,
       },
-      (upRes) => {
+      (res) => {
         const chunks: Buffer[] = [];
-        upRes.on("data", (chunk) => chunks.push(chunk));
-        upRes.on("end", () =>
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () =>
           resolve({
-            status: upRes.statusCode ?? 500,
-            headers: upRes.headers,
+            status: res.statusCode ?? 502,
+            headers: res.headers,
             body: Buffer.concat(chunks),
           })
         );
-        upRes.on("error", (err) => resolve({ error: err.message }));
+        res.on("error", (err) => resolve({ error: err.message }));
       }
     );
     req.on("error", (err) => resolve({ error: err.message }));
-    if (spec.body.length > 0) req.write(spec.body);
+    if (opts.body.length > 0) req.write(opts.body);
     req.end();
   });
 }

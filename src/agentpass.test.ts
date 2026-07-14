@@ -105,7 +105,10 @@ describe("HTTPS proxy", () => {
     await new Promise<void>((resolve) => target.close(() => resolve()));
   });
 
-  test("supports HTTPS CONNECT tunneling without seeing encrypted headers", async () => {
+  test("substitutes credential placeholders over HTTPS CONNECT tunnels", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("openai", "sk-test");
+
     const targetCert = certificateAuthority.getHostCertificate("localhost");
     let observedAuthorization = "";
 
@@ -138,7 +141,7 @@ describe("HTTPS proxy", () => {
 
     expect(response).toContain("200 OK");
     expect(response).toContain("ok");
-    expect(observedAuthorization).toBe("Bearer {{secret:openai}}");
+    expect(observedAuthorization).toBe("Bearer sk-test");
 
     await proxy.stop();
     await new Promise<void>((resolve) => target.close(() => resolve()));
