@@ -27,3 +27,7 @@ export function caKeyFile(): string {
 export function certDir(): string {
   return resolve(agentPassDir(), "certs");
 }
+
+export function routingConfigFile(): string {
+  return resolve(agentPassDir(), "routing.json");
+}
