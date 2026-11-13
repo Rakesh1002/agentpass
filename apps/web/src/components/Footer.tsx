@@ -26,7 +26,7 @@ export default function Footer() {
               X
             </a>
             <a
-              href="https://pass.agentdrive.sh"
+              href="https://agentpass.sh"
               className="transition-colors hover:text-fg"
             >
               Docs

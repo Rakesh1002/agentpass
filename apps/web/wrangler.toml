@@ -21,3 +21,11 @@ directory = ".open-next/assets"
 [[routes]]
 pattern = "pass.agentdrive.sh"
 custom_domain = true
+
+[[routes]]
+pattern = "agentpass.sh"
+custom_domain = true
+
+[[routes]]
+pattern = "www.agentpass.sh"
+custom_domain = true
