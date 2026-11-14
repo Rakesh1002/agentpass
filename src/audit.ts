@@ -16,6 +16,7 @@ export interface AuditRecord {
   routedTier?: string;
   escalated?: boolean;
   wildcard?: string[];
+  sessionTag?: string;
 }
 
 export interface StoredAuditRecord extends AuditRecord {
@@ -44,12 +45,13 @@ function openAuditDb(): Database {
       error TEXT,
       routed_tier TEXT,
       escalated INTEGER NOT NULL DEFAULT 0,
-      wildcard_secrets TEXT
+      wildcard_secrets TEXT,
+      session_tag TEXT
     )
   `);
   const columns = db.query(`PRAGMA table_info(audit_events)`).all() as { name: string }[];
-  if (!columns.some((c) => c.name === "wildcard_secrets")) {
-    db.run(`ALTER TABLE audit_events ADD COLUMN wildcard_secrets TEXT`);
+  for (const column of ["wildcard_secrets", "session_tag"]) {
+    if (!columns.some((c) => c.name === column)) db.run(`ALTER TABLE audit_events ADD COLUMN ${column} TEXT`);
   }
   return db;
 }
@@ -60,8 +62,8 @@ export function appendAudit(record: AuditRecord): void {
     db.run(
       `INSERT INTO audit_events (
         timestamp, method, destination, secret_names, status_code,
-        duration_ms, bytes_in, bytes_out, error, routed_tier, escalated, wildcard_secrets
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        duration_ms, bytes_in, bytes_out, error, routed_tier, escalated, wildcard_secrets, session_tag
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.timestamp || Date.now(),
         record.method,
@@ -75,6 +77,7 @@ export function appendAudit(record: AuditRecord): void {
         record.routedTier ?? null,
         record.escalated ? 1 : 0,
         record.wildcard?.length ? JSON.stringify(record.wildcard) : null,
+        record.sessionTag ?? null,
       ]
     );
   } finally {
@@ -90,16 +93,18 @@ export function listAudit(limit = 20): StoredAuditRecord[] {
         `SELECT id, timestamp, method, destination, secret_names as secretNames,
                 status_code as statusCode, duration_ms as durationMs,
                 bytes_in as bytesIn, bytes_out as bytesOut, error,
-                routed_tier as routedTier, escalated, wildcard_secrets as wildcard
+                routed_tier as routedTier, escalated, wildcard_secrets as wildcard,
+                session_tag as sessionTag
          FROM audit_events
          ORDER BY timestamp DESC, id DESC
          LIMIT ?`
       )
       .all(limit) as Array<
-        Omit<StoredAuditRecord, "secretNames" | "escalated" | "wildcard"> & {
+        Omit<StoredAuditRecord, "secretNames" | "escalated" | "wildcard" | "sessionTag"> & {
           secretNames: string;
           escalated: number;
           wildcard: string | null;
+          sessionTag: string | null;
         }
       >;
 
@@ -108,6 +113,7 @@ export function listAudit(limit = 20): StoredAuditRecord[] {
       secretNames: JSON.parse(row.secretNames) as string[],
       escalated: row.escalated === 1,
       wildcard: row.wildcard ? (JSON.parse(row.wildcard) as string[]) : undefined,
+      sessionTag: row.sessionTag ?? undefined,
     }));
   } finally {
     db.close();

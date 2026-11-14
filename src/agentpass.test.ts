@@ -12,6 +12,7 @@ import { appendAudit, listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { agentPassDir, caCertFile, saltFile, vaultFile } from "./paths";
 import { ProxyServer, substitutePlaceholders } from "./proxy";
+import { makePlaceholder } from "./placeholder";
 
 let testHome: string;
 
@@ -227,13 +228,33 @@ describe("audit log", () => {
     expect(rows[0]?.secretNames).toEqual(["openai"]);
     expect(JSON.stringify(rows[0])).not.toContain("sk-test");
   });
+
+  test("stores a session tag and adds the column to an older audit database in place", () => {
+    mkdirSync(agentPassDir(), { recursive: true });
+    const db = new Database(join(agentPassDir(), "audit.db"));
+    db.run(`CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, method TEXT NOT NULL,
+      destination TEXT NOT NULL, secret_names TEXT NOT NULL, status_code INTEGER, duration_ms INTEGER NOT NULL,
+      bytes_in INTEGER NOT NULL DEFAULT 0, bytes_out INTEGER NOT NULL DEFAULT 0, error TEXT, routed_tier TEXT,
+      escalated INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run(`INSERT INTO audit_events (timestamp, method, destination, secret_names, duration_ms) VALUES (1, 'GET', 'old', '[]', 0)`);
+    db.close();
+
+    appendAudit({ method: "GET", destination: "new", secretNames: [], durationMs: 1, sessionTag: "agent-1" });
+
+    const [latest, old] = listAudit(2);
+    expect(latest).toMatchObject({ destination: "new", sessionTag: "agent-1" });
+    expect(old).toMatchObject({ destination: "old" });
+    expect(old?.sessionTag).toBeUndefined();
+  });
 });
 
 describe("HTTPS proxy", () => {
   test("substitutes credential placeholders for direct proxy requests", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("openai", "sk-test", "api_key", [{ host: "127.0.0.1" }]);
     const target = await startTarget();
+    await sharedVault.add("openai", "sk-test", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port);
@@ -249,8 +270,8 @@ describe("HTTPS proxy", () => {
 
   test("substitutes credential placeholders over HTTPS CONNECT tunnels", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("openai", "sk-test", "api_key", [{ host: "localhost" }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("openai", "sk-test", "api_key", [{ host: `localhost:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
@@ -281,7 +302,7 @@ describe("HTTPS proxy", () => {
     expect(tunneled).toContain("200 OK");
     expect(target.requests[0]?.authorization).toBe("Bearer {{secret:openai}}");
 
-    await sharedVault.setPins("openai", [{ host: "localhost" }]);
+    await sharedVault.setPins("openai", [{ host: `localhost:${target.port}` }]);
     const intercepted = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca);
     expect(intercepted).toContain("200 OK");
     expect(target.requests[1]?.authorization).toBe("Bearer sk-test");
@@ -290,9 +311,41 @@ describe("HTTPS proxy", () => {
     await target.close();
   });
 
-  test("intercepts every CONNECT host when a wildcard pin exists", async () => {
+  test("parses bracketed IPv6 authorities on CONNECT and the forward path", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*" }]);
+    const tlsTarget = await startTarget(certificateAuthority.getHostCertificate("::1"), "::1");
+    const plainTarget = await startTarget(undefined, "::1");
+    await sharedVault.add("v6", "sk-v6", "api_key", [
+      { host: `[::1]:${tlsTarget.port}` },
+      { host: `[0:0:0:0:0:0:0:1]:${plainTarget.port}` },
+    ]);
+    const proxy = await startProxy();
+
+    const tunneled = await requestThroughConnectTunnel(proxy.getPort(), tlsTarget.port, readFileSync(caCertFile()), {
+      authority: `[::1]:${tlsTarget.port}`,
+      host: `[::1]:${tlsTarget.port}`,
+      auth: "Bearer {{secret:v6}}",
+      ip: "::1",
+    });
+    expect(tunneled).toContain("200 OK");
+    expect(tlsTarget.requests[0]?.authorization).toBe("Bearer sk-v6");
+    expect(tlsTarget.requests[0]?.host).toBe(`[::1]:${tlsTarget.port}`);
+
+    const forwarded = await requestThroughDirectProxy(proxy.getPort(), plainTarget.port, {
+      auth: "Bearer {{secret:v6}}",
+      origin: `http://[::1]:${plainTarget.port}`,
+    });
+    expect(forwarded.status).toBe(200);
+    expect(plainTarget.requests[0]?.authorization).toBe("Bearer sk-v6");
+
+    await proxy.stop();
+    await tlsTarget.close();
+    await plainTarget.close();
+  });
+
+  test("intercepts every CONNECT host and port when a *:* pin exists", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*:*" }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
     const proxy = await startProxy();
 
@@ -329,10 +382,56 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("a pin without a port never releases the secret to another local port", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("loop", "sk-loop-never-leaks", "api_key", [{ host: "localhost" }]);
+    const target = await startTarget();
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:loop}}",
+      origin: `http://localhost:${target.port}`,
+      path: "/steal",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toEqual({ error: "egress_blocked", secret: "loop", host: "localhost" });
+    expect(target.requests).toHaveLength(0);
+
+    await sharedVault.setPins("loop", [{ host: `localhost:${target.port}` }]);
+    const pinned = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:loop}}",
+      origin: `http://localhost:${target.port}`,
+    });
+    expect(pinned.status).toBe(200);
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-loop-never-leaks");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("a CONNECT to an unpinned port of a pinned host is tunneled, never substituted", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("loop", "sk-loop-never-leaks", "api_key", [{ host: "localhost" }]);
+    const target = await startTarget(certificateAuthority.getHostCertificate("agentpass-target.test"));
+    const proxy = await startProxy();
+
+    const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:loop}}",
+      servername: "agentpass-target.test",
+    });
+
+    expect(response).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer {{secret:loop}}");
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("enforces pinned methods and path prefixes", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1", methods: ["POST"], pathPrefix: "/v1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}`, methods: ["POST"], pathPrefix: "/v1" }]);
     const proxy = await startProxy();
     const auth = "Bearer {{secret:svc}}";
 
@@ -349,8 +448,8 @@ describe("egress lock", () => {
 
   test("blocks encoded path separators under a path pin", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1", pathPrefix: "/v1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}`, pathPrefix: "/v1" }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
@@ -389,7 +488,7 @@ describe("egress lock", () => {
 
   test("allows any host with an explicit wildcard pin and records it in the audit", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*" }]);
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*:*" }]);
     const target = await startTarget();
     const proxy = await startProxy();
 
@@ -423,8 +522,8 @@ describe("egress lock", () => {
 
   test("allows substitution over cleartext HTTP to a loopback host", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port, { auth: "Bearer {{secret:svc}}" });
@@ -436,10 +535,204 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("tags forward requests from the proxy URL username and never forwards Proxy-Authorization", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    const proxy = await startProxy();
+    const basic = (credentials: string) => `Basic ${Buffer.from(credentials).toString("base64")}`;
+    const send = (proxyAuth: string) =>
+      requestThroughDirectProxy(proxy.getPort(), target.port, {
+        auth: "Bearer {{secret:svc}}",
+        headers: { "proxy-authorization": proxyAuth },
+      });
+
+    expect((await send(basic("agent-1:"))).status).toBe(200);
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, sessionTag: "agent-1" });
+
+    expect((await send(basic("claude%40work.2+x:"))).status).toBe(200);
+    expect(listAudit(1)[0]?.sessionTag).toBe("claude@work.2+x");
+
+    for (const ignored of [basic("bad tag:"), basic("a/b:"), basic(`${"a".repeat(97)}:`), basic("agent-1:hunter2"), basic("%E0%A4%A:"), "Bearer agent-1", basic(":")]) {
+      expect((await send(ignored)).status).toBe(200);
+      expect(listAudit(1)[0]?.sessionTag).toBeUndefined();
+    }
+
+    expect(target.requests.every((headers) => headers["proxy-authorization"] === undefined)).toBe(true);
+    expect(JSON.stringify(listAudit(50))).not.toContain("hunter2");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("tags CONNECT tunnels and every request inside them", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `localhost:${target.port}` }]);
+    const proxy = await startProxy();
+
+    const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:svc}}",
+      proxyAuth: `Basic ${Buffer.from("tunnel-7:").toString("base64")}`,
+      innerHeaders: { "Proxy-Authorization": "Basic c211Z2dsZWQ6" },
+    });
+
+    expect(response).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc");
+    expect(target.requests[0]?.["proxy-authorization"]).toBeUndefined();
+    const [inner, connect] = listAudit(2);
+    expect(inner).toMatchObject({ method: "GET", statusCode: 200, sessionTag: "tunnel-7" });
+    expect(connect).toMatchObject({ method: "CONNECT", statusCode: 200, sessionTag: "tunnel-7" });
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("format-preserving placeholders get the same pin, scheme, wildcard and missing checks", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-real-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    await sharedVault.add("stripe", "sk_live_never_leaks", "api_key", [{ host: "api.stripe.com" }, { host: "api.stripe.test" }]);
+    await sharedVault.add("any", "sk-any", "api_key", [{ host: "*:*" }]);
+    const proxy = await startProxy();
+    const port = proxy.getPort();
+
+    const ok = await requestThroughDirectProxy(port, target.port, {
+      auth: `Bearer ${makePlaceholder("svc", "sk-proj-")}`,
+      headers: { "x-api-key": makePlaceholder("svc", "sk-ant-api03-"), "api-key": makePlaceholder("svc") },
+    });
+    expect(ok.status).toBe(200);
+    expect(target.requests[0]).toMatchObject({ authorization: "Bearer sk-real-svc", "x-api-key": "sk-real-svc", "api-key": "sk-real-svc" });
+
+    const pinned = await requestThroughDirectProxy(port, target.port, { auth: `token ${makePlaceholder("stripe", "sk_live_")}` });
+    expect(pinned.status).toBe(403);
+    expect(JSON.parse(pinned.body)).toEqual({ error: "egress_blocked", secret: "stripe", host: "127.0.0.1" });
+
+    const cleartext = await requestThroughDirectProxy(port, 0, {
+      auth: `Basic ${makePlaceholder("stripe", "sk_live_")}`,
+      origin: "http://api.stripe.test",
+    });
+    expect(cleartext.status).toBe(403);
+    expect(JSON.parse(cleartext.body).error).toBe("insecure_scheme");
+
+    const wildcard = await requestThroughDirectProxy(port, target.port, { auth: `Bearer ${makePlaceholder("any", "ghp_")}` });
+    expect(wildcard.status).toBe(200);
+    expect(listAudit(1)[0]).toMatchObject({ secretNames: ["any"], wildcard: ["any"] });
+
+    const missing = await requestThroughDirectProxy(port, target.port, { auth: `Bearer ${makePlaceholder("nope", "sk-")}` });
+    expect(missing.status).toBe(400);
+    expect(missing.body).toBe("Missing secret: nope");
+    const garbled = await requestThroughDirectProxy(port, target.port, { auth: "Bearer sk-AGENTPASSv1xffx" });
+    expect(garbled.status).toBe(400);
+    expect(target.requests).toHaveLength(2);
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk_live_never_leaks");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("format-preserving placeholders are substituted and pin-checked inside CONNECT tunnels", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("gh", "ghp_real", "api_key", [{ host: `localhost:${target.port}`, methods: ["GET"] }]);
+    const proxy = await startProxy();
+    const ca = readFileSync(caCertFile());
+
+    const ok = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, { auth: `token ${makePlaceholder("gh", "ghp_")}` });
+    expect(ok).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("token ghp_real");
+
+    const blocked = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+      auth: `token ${makePlaceholder("gh", "ghp_")}`,
+      method: "POST",
+    });
+    expect(blocked).toContain('"error":"egress_blocked"');
+    expect(target.requests).toHaveLength(1);
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("refuses forward and CONNECT requests aimed back at the proxy itself", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc-no-loop", "api_key", [{ host: "*:*" }]);
+    const proxy = await startProxy();
+    const port = proxy.getPort();
+
+    for (const host of ["127.0.0.1", "localhost", "127.1", "2130706433", "0x7f.0.0.1", "[::1]", "[::ffff:127.0.0.1]", "0.0.0.0", "localhost."]) {
+      const response = await requestThroughDirectProxy(port, 0, {
+        auth: "Bearer {{secret:svc}}",
+        origin: `http://${host}:${port}`,
+        path: "/openai/v1/models",
+      });
+      expect(response.status).toBe(508);
+      expect(JSON.parse(response.body)).toEqual({ error: "loop_detected" });
+      expect(listAudit(1)[0]).toMatchObject({ statusCode: 508, error: "loop_detected" });
+    }
+
+    for (const authority of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`, `0.0.0.0:${port}`]) {
+      const response = await requestThroughConnectTunnel(port, port, Buffer.alloc(0), { authority });
+      expect(response).toStartWith("HTTP/1.1 508");
+      expect(listAudit(1)[0]).toMatchObject({ method: "CONNECT", statusCode: 508, error: "loop_detected" });
+    }
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk-svc-no-loop");
+
+    await proxy.stop();
+  });
+
+  test("refuses an absolute-form target inside a tunnel that names another authority", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc-never-fronted", "api_key", [{ host: `localhost:${target.port}` }]);
+    const proxy = await startProxy();
+    const ca = readFileSync(caCertFile());
+
+    for (const path of ["https://evil.example:443/a", `https://localhost:${target.port + 1}/a`, "http://localhost/a"]) {
+      const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+        auth: "Bearer {{secret:svc}}",
+        path,
+      });
+      expect(response).toContain("403");
+      expect(response).toContain('"error":"egress_blocked"');
+      expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "egress_blocked" });
+    }
+    expect(target.requests).toHaveLength(0);
+
+    const same = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+      auth: "Bearer {{secret:svc}}",
+      path: `https://LOCALHOST:${target.port}/a?b=1`,
+    });
+    expect(same).toContain("200 OK");
+    expect(target.urls).toEqual(["/a?b=1"]);
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc-never-fronted");
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk-svc-never-fronted");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("sends the origin-form target upstream on the forward path", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:svc}}",
+      path: "/v1/x?y=1",
+    });
+
+    expect(response.status).toBe(200);
+    expect(target.urls).toEqual(["/v1/x?y=1"]);
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("blocks placeholders inside CONNECT tunnels when pins do not match", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "localhost", methods: ["POST"] }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `localhost:${target.port}`, methods: ["POST"] }]);
     const proxy = await startProxy();
 
     const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
@@ -460,21 +753,24 @@ describe("egress lock", () => {
 interface Target {
   port: number;
   requests: http.IncomingHttpHeaders[];
+  urls: string[];
   close: () => Promise<void>;
 }
 
-async function startTarget(tlsCert?: { cert: string; key: string }): Promise<Target> {
+async function startTarget(tlsCert?: { cert: string; key: string }, host = "127.0.0.1"): Promise<Target> {
   const requests: http.IncomingHttpHeaders[] = [];
+  const urls: string[] = [];
   const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
     requests.push(req.headers);
+    urls.push(req.url || "");
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
   };
   const server = tlsCert ? https.createServer(tlsCert, handler) : http.createServer(handler);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Target server did not bind to a TCP port");
-  return { port: address.port, requests, close: () => new Promise((resolve) => server.close(() => resolve())) };
+  return { port: address.port, requests, urls, close: () => new Promise((resolve) => server.close(() => resolve())) };
 }
 
 async function startProxy(): Promise<ProxyServer> {
@@ -490,6 +786,11 @@ interface ProxiedRequest {
   host?: string;
   servername?: string;
   origin?: string;
+  authority?: string;
+  ip?: string;
+  headers?: Record<string, string>;
+  proxyAuth?: string;
+  innerHeaders?: Record<string, string>;
 }
 
 // Built by hand from the v1 schema so the test does not depend on the current Vault code.
@@ -555,6 +856,7 @@ async function requestThroughDirectProxy(
     path = "/models",
     auth = "Bearer {{secret:openai}}",
     origin = `http://127.0.0.1:${targetPort}`,
+    headers = {},
   }: ProxiedRequest = {}
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -567,6 +869,7 @@ async function requestThroughDirectProxy(
         headers: {
           authorization: auth,
           connection: "close",
+          ...headers,
         },
       },
       (res) => {
@@ -592,6 +895,10 @@ async function requestThroughConnectTunnel(
     auth = "Bearer {{secret:openai}}",
     host = `localhost:${targetPort}`,
     servername = "localhost",
+    authority = `localhost:${targetPort}`,
+    ip,
+    proxyAuth,
+    innerHeaders = {},
   }: ProxiedRequest = {}
 ): Promise<string> {
   const socket = net.connect(proxyPort, "127.0.0.1");
@@ -600,15 +907,15 @@ async function requestThroughConnectTunnel(
     socket.once("error", reject);
   });
 
-  socket.write(
-    `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\n\r\n`
-  );
+  const connectAuth = proxyAuth ? `Proxy-Authorization: ${proxyAuth}\r\n` : "";
+  socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${connectAuth}\r\n`);
 
-  await readUntil(socket, "\r\n\r\n");
+  const established = await readUntil(socket, "\r\n\r\n");
+  if (!established.startsWith("HTTP/1.1 200")) return established;
 
   const tlsSocket = tls.connect({
     socket,
-    servername,
+    ...(ip ? { checkServerIdentity: (_: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(ip, cert) } : { servername }),
     ca,
     rejectUnauthorized: true,
   });
@@ -623,6 +930,7 @@ async function requestThroughConnectTunnel(
       `${method} ${path} HTTP/1.1`,
       `Host: ${host}`,
       `Authorization: ${auth}`,
+      ...Object.entries(innerHeaders).map(([name, value]) => `${name}: ${value}`),
       "Connection: close",
       "",
       "",

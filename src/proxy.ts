@@ -5,9 +5,20 @@ import type { Duplex } from "stream";
 import { certificateAuthority } from "./ca";
 import { URL } from "url";
 import { vault } from "./vault";
-import { appendAudit } from "./audit";
+import { appendAudit, type AuditRecord } from "./audit";
+import { findPlaceholders, replacePlaceholders } from "./placeholder";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict, isLoopbackHost, type Pin } from "./egress";
+import {
+  egressVerdict,
+  isLocalHost,
+  isLoopbackHost,
+  parseAuthority,
+  pinHostMatches,
+  providerForSecret,
+  unbracket,
+  type Pin,
+  type Scheme,
+} from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -54,7 +65,28 @@ interface SubstitutionResult {
 }
 
 const SCANNED_HEADERS = new Set(["authorization", "x-api-key", "api-key"]);
-const PLACEHOLDER_RE = /\{\{secret:([A-Za-z0-9_.-]+)\}\}/g;
+const SESSION_TAG_RE = /^[A-Za-z0-9._@+-]{1,96}$/;
+
+// set where a request enters: the proxy URL username, or a /_t/<tag> reverse-route prefix
+const sessionTags = new WeakMap<http.IncomingMessage, string>();
+
+function audit(req: http.IncomingMessage, record: AuditRecord): void {
+  appendAudit({ ...record, sessionTag: sessionTags.get(req) });
+}
+
+function tagRequest(req: http.IncomingMessage, raw: string | undefined): void {
+  let tag = "";
+  try {
+    tag = decodeURIComponent(raw ?? "");
+  } catch {}
+  if (SESSION_TAG_RE.test(tag)) sessionTags.set(req, tag);
+}
+
+// http://<tag>@127.0.0.1:<port> as a proxy URL arrives as Proxy-Authorization: Basic base64("<tag>:")
+function proxyAuthUser(header: string | string[] | undefined): string | undefined {
+  const encoded = typeof header === "string" ? /^Basic\s+([A-Za-z0-9+/]+=*)$/i.exec(header.trim())?.[1] : undefined;
+  return encoded ? /^([^:]+):$/.exec(Buffer.from(encoded, "base64").toString("latin1"))?.[1] : undefined;
+}
 
 export class ProxyServer {
   private server: http.Server | null = null;
@@ -112,10 +144,16 @@ export class ProxyServer {
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const reqUrl = req.url || "";
+    let reqUrl = req.url || "";
     const isAbsolute = reqUrl.startsWith("http://") || reqUrl.startsWith("https://");
 
     if (!isAbsolute) {
+      const tagged = /^\/_t\/([^/?]*)/.exec(reqUrl);
+      if (tagged) {
+        tagRequest(req, tagged[1]);
+        reqUrl = reqUrl.slice(tagged[0].length);
+      }
+
       if (reqUrl === "/_/health" || reqUrl.startsWith("/_/health?")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -133,6 +171,7 @@ export class ProxyServer {
       return this.handleProviderRoute(req, res, match.provider, upstreamPath);
     }
 
+    tagRequest(req, proxyAuthUser(req.headers["proxy-authorization"]));
     return this.handleForwardProxy(req, res, reqUrl);
   }
 
@@ -145,12 +184,27 @@ export class ProxyServer {
     const url = new URL(targetUrl);
     const isHttps = url.protocol === "https:";
     const client = isHttps ? https : http;
-    const destination = `${url.hostname}:${url.port || (isHttps ? 443 : 80)}`;
+    const port = Number(url.port) || (isHttps ? 443 : 80);
+    const destination = `${url.hostname}:${port}`;
+
+    if (this.isSelf(url.hostname, port)) {
+      audit(req, {
+        method: req.method || "GET",
+        destination,
+        secretNames: placeholderNames(req.headers),
+        statusCode: 508,
+        durationMs: Date.now() - started,
+        error: "loop_detected",
+      });
+      res.writeHead(508, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "loop_detected" }));
+      return;
+    }
 
     const names = placeholderNames(req.headers);
     // a secret in cleartext is readable by anyone on the path, whatever its pins say
     if (!isHttps && names.length > 0 && !isLoopbackHost(url.hostname)) {
-      appendAudit({
+      audit(req, {
         method: req.method || "GET",
         destination,
         secretNames: names,
@@ -163,14 +217,14 @@ export class ProxyServer {
       return;
     }
 
-    const egress = await this.enforceEgress(req, res, url.hostname, url.pathname, destination, started);
+    const egress = await this.enforceEgress(req, res, url.hostname, port, isHttps ? "https" : "http", url.pathname, started);
     if (!egress) return;
     const { wildcard } = egress;
 
     const substitution = await substitutePlaceholders(req.headers, egress.resolve);
     if (substitution.missingSecrets.length > 0) {
       const error = `Missing secret: ${substitution.missingSecrets.join(", ")}`;
-      appendAudit({
+      audit(req, {
         method: req.method || "GET",
         destination,
         secretNames: substitution.secretNames,
@@ -184,18 +238,19 @@ export class ProxyServer {
     }
     // RFC 9112 3.2.2: use the absolute-form authority, never the client's Host (domain fronting)
     substitution.headers.host = url.host;
+    delete substitution.headers["proxy-authorization"];
 
     const proxyReq = client.request(
       {
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
+        hostname: unbracket(url.hostname),
+        port,
         path: url.pathname + url.search,
         method: req.method,
         headers: substitution.headers,
         rejectUnauthorized: this.config.rejectUnauthorized,
       },
       (proxyRes) => {
-        appendAudit({
+        audit(req, {
           method: req.method || "GET",
           destination,
           secretNames: substitution.secretNames,
@@ -210,7 +265,7 @@ export class ProxyServer {
 
     proxyReq.on("error", (err) => {
       console.error("Proxy error:", err.message);
-      appendAudit({
+      audit(req, {
         method: req.method || "GET",
         destination,
         secretNames: substitution.secretNames,
@@ -231,25 +286,27 @@ export class ProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     host: string,
+    port: number,
+    scheme: Scheme,
     path: string,
-    destination: string,
     started: number
   ): Promise<{ resolve: (name: string) => Promise<string | null>; wildcard: string[] } | null> {
     const method = req.method || "GET";
+    const destination = `${host}:${port}`;
     const names = placeholderNames(req.headers);
     const allowed = new Set<string>();
     const wildcard: string[] = [];
 
     for (const name of names) {
       if (!(await vault.has(name))) continue;
-      const verdict = egressVerdict(name, await vault.getPins(name), host, method, path);
+      const verdict = egressVerdict(name, await vault.getPins(name), destination, method, path, scheme);
       if (verdict === "wildcard") wildcard.push(name);
       if (verdict !== "deny") {
         allowed.add(name);
         continue;
       }
 
-      appendAudit({
+      audit(req, {
         method,
         destination,
         secretNames: names,
@@ -275,6 +332,25 @@ export class ProxyServer {
   ): Promise<void> {
     const started = Date.now();
     const body = await readBody(req);
+
+    // the route picks the provider pool, so a placeholder naming another provider's key cannot be honored
+    const foreign = placeholderNames(req.headers).find((name) => {
+      const owner = providerForSecret(name);
+      return owner !== undefined && owner.name !== provider.name;
+    });
+    if (foreign) {
+      audit(req, {
+        method: req.method || "GET",
+        destination: `${provider.upstream.host}${upstreamPath}`,
+        secretNames: [foreign],
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "egress_blocked",
+      });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "egress_blocked", secret: foreign, host: provider.upstream.host }));
+      return;
+    }
 
     // --- Cost-Aware Routing (Section 3.4) ---
     const routingConfig = loadRoutingConfig();
@@ -501,7 +577,7 @@ export class ProxyServer {
     }
 
     if (pool.length === 0) {
-      appendAudit({
+      audit(req, {
         method: req.method || "GET",
         destination,
         secretNames: [],
@@ -514,12 +590,19 @@ export class ProxyServer {
       return null;
     }
 
+    const upstreamPort =
+      provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
+    const authority = `${provider.upstream.host}:${upstreamPort}`;
     const poolNames = pool.map((key) => key.name);
-    pool = pool.filter(
-      (key) => egressVerdict(key.name, key.pins, provider.upstream.host, method, upstreamPath) !== "deny"
-    );
+    const wildcardNames = new Set<string>();
+    pool = pool.filter((key) => {
+      const verdict = egressVerdict(key.name, key.pins, authority, method, upstreamPath, provider.upstream.protocol);
+      if (verdict === "wildcard") wildcardNames.add(key.name);
+      return verdict !== "deny";
+    });
+    const wildcardOf = (names: string[]) => names.filter((name) => wildcardNames.has(name));
     if (pool.length === 0) {
-      appendAudit({
+      audit(req, {
         method,
         destination,
         secretNames: poolNames,
@@ -539,8 +622,6 @@ export class ProxyServer {
     }
 
     const client = provider.upstream.protocol === "https" ? https : http;
-    const upstreamPort =
-      provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
 
     let lastStatus = 502;
 
@@ -561,7 +642,7 @@ export class ProxyServer {
       });
 
       if ("error" in result) {
-        appendAudit({
+        audit(req, {
           method: req.method || "GET",
           destination,
           secretNames: [name],
@@ -570,12 +651,13 @@ export class ProxyServer {
           error: result.error,
           routedTier,
           escalated,
+          wildcard: wildcardOf([name]),
         });
         lastStatus = 502;
         continue;
       }
 
-      appendAudit({
+      audit(req, {
         method: req.method || "GET",
         destination,
         secretNames: [name],
@@ -583,6 +665,7 @@ export class ProxyServer {
         durationMs: Date.now() - started,
         routedTier,
         escalated,
+        wildcard: wildcardOf([name]),
       });
 
       lastStatus = result.status;
@@ -607,7 +690,7 @@ export class ProxyServer {
     const error = cooling ? "all_keys_cooling" : "all_keys_exhausted";
     const status = cooling ? 429 : 503;
     console.warn(`[AgentPass] All ${pool.length} keys unavailable for ${provider.name} (${error}).`);
-    appendAudit({
+    audit(req, {
       method,
       destination,
       secretNames: pool.map((key) => key.name),
@@ -616,6 +699,7 @@ export class ProxyServer {
       error,
       routedTier,
       escalated,
+      wildcard: wildcardOf(pool.map((key) => key.name)),
     });
 
     if (cooling) {
@@ -639,36 +723,68 @@ export class ProxyServer {
     head: Buffer
   ): Promise<void> {
     const started = Date.now();
-    const [hostname, portText] = (req.url || "").split(":");
-    const port = Number(portText || "443");
-    if (!hostname || !Number.isFinite(port)) {
+    const authority = parseAuthority(req.url || "");
+    if (!authority) {
       clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
       clientSocket.end();
+      return;
+    }
+    const { host: hostname } = authority;
+    const port = authority.port ?? 443;
+    tagRequest(req, proxyAuthUser(req.headers["proxy-authorization"]));
+    const tag = sessionTags.get(req);
+
+    if (this.isSelf(hostname, port)) {
+      audit(req, {
+        method: "CONNECT",
+        destination: `${hostname}:${port}`,
+        secretNames: [],
+        statusCode: 508,
+        durationMs: Date.now() - started,
+        error: "loop_detected",
+      });
+      clientSocket.end("HTTP/1.1 508 Loop Detected\r\n\r\n");
       return;
     }
 
     try {
       if (head.length > 0) clientSocket.unshift(head);
 
-      if (!(await this.shouldIntercept(hostname))) {
-        this.tunnel(clientSocket, hostname, port, started);
+      if (!(await this.shouldIntercept(hostname, port))) {
+        this.tunnel(req, clientSocket, hostname, port, started);
         return;
       }
 
-      const hostPair = certificateAuthority.getHostCertificate(hostname);
+      const hostPair = certificateAuthority.getHostCertificate(unbracket(hostname));
       const caPair = certificateAuthority.ensureCa();
       const certChain = `${hostPair.cert}\n${caPair.cert}`;
 
       const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
         const startedReq = Date.now();
+        if (tag) sessionTags.set(req, tag);
         try {
-          const egress = await this.enforceEgress(req, res, hostname, req.url || "/", `${hostname}:${port}`, startedReq);
+          const path = originFormTarget(req.url || "/", hostname, port);
+          if (path === null) {
+            audit(req, {
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: placeholderNames(req.headers),
+              statusCode: 403,
+              durationMs: Date.now() - startedReq,
+              error: "egress_blocked",
+            });
+            res.writeHead(403, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "egress_blocked", authority: `${hostname}:${port}` }));
+            return;
+          }
+
+          const egress = await this.enforceEgress(req, res, hostname, port, "https", path, startedReq);
           if (!egress) return;
           const { wildcard } = egress;
 
           const substitution = await substitutePlaceholders(req.headers, egress.resolve);
           if (substitution.missingSecrets.length > 0) {
-            appendAudit({
+            audit(req, {
               method: req.method || "GET",
               destination: `${hostname}:${port}`,
               secretNames: substitution.secretNames,
@@ -682,18 +798,19 @@ export class ProxyServer {
           }
           // the upstream connection goes to the CONNECT host, so Host must not front another site
           substitution.headers.host = port === 443 ? hostname : `${hostname}:${port}`;
+          delete substitution.headers["proxy-authorization"];
 
           const upstreamReq = https.request(
             {
-              hostname,
+              hostname: unbracket(hostname),
               port,
-              path: req.url || "/",
+              path,
               method: req.method,
               headers: substitution.headers,
               rejectUnauthorized: this.config.rejectUnauthorized,
             },
             (upstreamRes) => {
-              appendAudit({
+              audit(req, {
                 method: req.method || "GET",
                 destination: `${hostname}:${port}`,
                 secretNames: substitution.secretNames,
@@ -707,7 +824,7 @@ export class ProxyServer {
           );
 
           upstreamReq.on("error", (err) => {
-            appendAudit({
+            audit(req, {
               method: req.method || "GET",
               destination: `${hostname}:${port}`,
               secretNames: substitution.secretNames,
@@ -729,7 +846,7 @@ export class ProxyServer {
           req.pipe(upstreamReq, { end: true });
         } catch (err: any) {
           console.error(`[AgentPass] CONNECT handler error for ${hostname}:`, err?.message ?? err);
-          appendAudit({
+          audit(req, {
             method: req.method || "GET",
             destination: `${hostname}:${port}`,
             secretNames: [],
@@ -745,7 +862,7 @@ export class ProxyServer {
       });
 
       const onError = (err: Error) => {
-        appendAudit({
+        audit(req, {
           method: "CONNECT",
           destination: `${hostname}:${port}`,
           secretNames: [],
@@ -766,7 +883,7 @@ export class ProxyServer {
         const mitmSocket = net.connect(listenPort, "127.0.0.1", () => {
           try { clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); } catch { }
 
-          appendAudit({
+          audit(req, {
             method: "CONNECT",
             destination: `${hostname}:${port}`,
             secretNames: [],
@@ -795,7 +912,7 @@ export class ProxyServer {
         });
       });
     } catch (err: any) {
-      appendAudit({
+      audit(req, {
         method: "CONNECT",
         destination: `${hostname}:${port}`,
         secretNames: [],
@@ -810,10 +927,15 @@ export class ProxyServer {
     }
   }
 
-  private async shouldIntercept(hostname: string): Promise<boolean> {
+  // a request the proxy would send to its own listener could loop without end
+  private isSelf(host: string, port: number): boolean {
+    return port === this.port() && (isLocalHost(host) || host === this.config.host);
+  }
+
+  private async shouldIntercept(hostname: string, port: number): Promise<boolean> {
     try {
       const hosts = await vault.pinnedHosts();
-      return hosts.has("*") || hosts.has(hostname.toLowerCase());
+      return [...hosts].some((pinHost) => pinHostMatches(pinHost, hostname, port, 443));
     } catch {
       // locked vault: nothing can be substituted, so there is no reason to break TLS
       return false;
@@ -821,13 +943,13 @@ export class ProxyServer {
   }
 
   // Unpinned hosts get a raw TCP tunnel, so the local CA never touches their TLS.
-  private tunnel(clientSocket: Duplex, hostname: string, port: number, started: number): void {
+  private tunnel(req: http.IncomingMessage, clientSocket: Duplex, hostname: string, port: number, started: number): void {
     const destination = `${hostname}:${port}`;
     let connected = false;
-    const upstream = net.connect(port, hostname, () => {
+    const upstream = net.connect(port, unbracket(hostname), () => {
       connected = true;
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      appendAudit({
+      audit(req, {
         method: "CONNECT",
         destination,
         secretNames: [],
@@ -843,7 +965,7 @@ export class ProxyServer {
         clientSocket.destroy();
         return;
       }
-      appendAudit({
+      audit(req, {
         method: "CONNECT",
         destination,
         secretNames: [],
@@ -890,49 +1012,35 @@ export class ProxyServer {
 
 export const proxy = new ProxyServer();
 
-async function replacePlaceholders(
-  value: string,
-  resolver: (name: string) => Promise<string | null>
-): Promise<{ value: string; found: string[]; missing: string[] }> {
-  const found: string[] = [];
-  const missing: string[] = [];
-  let output = value;
-  const matches = [...value.matchAll(PLACEHOLDER_RE)];
-
-  for (const match of matches) {
-    const placeholder = match[0];
-    const name = match[1];
-    if (!name) continue;
-
-    found.push(name);
-    const secret = await resolver(name);
-    if (!secret) {
-      missing.push(name);
-      continue;
-    }
-    output = output.split(placeholder).join(secret);
+// RFC 9112 3.2.2: a server routes on an absolute-form authority, so inside a tunnel it must be the tunnel's own
+function originFormTarget(target: string, host: string, port: number): string | null {
+  if (target.startsWith("/") || target === "*") return target;
+  try {
+    const url = new URL(target);
+    const urlPort = Number(url.port) || { "http:": 80, "https:": 443 }[url.protocol];
+    return url.hostname === host && urlPort === port ? url.pathname + url.search : null;
+  } catch {
+    return null;
   }
-
-  return { value: output, found, missing };
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
+// a 429 always cools the key, or Retry-After: 0 would read as exhausted (503) instead of cooling (429)
+const MIN_COOLDOWN_MS = 1_000;
 
 // Retry-After is either delta-seconds or an HTTP-date (RFC 9110 10.2.3).
 function retryAfterMs(value: string | undefined): number {
   const raw = value?.trim();
-  if (raw && /^\d+$/.test(raw)) return Number(raw) * 1000;
-  const date = raw ? Date.parse(raw) : NaN;
-  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : DEFAULT_COOLDOWN_MS;
+  if (raw && /^\d+$/.test(raw)) return Math.max(MIN_COOLDOWN_MS, Number(raw) * 1000);
+  const remaining = raw ? Date.parse(raw) - Date.now() : NaN;
+  return remaining > 0 ? Math.max(MIN_COOLDOWN_MS, remaining) : DEFAULT_COOLDOWN_MS;
 }
 
 function placeholderNames(headers: http.IncomingHttpHeaders): string[] {
   const names = new Set<string>();
   for (const [headerName, headerValue] of Object.entries(headers)) {
     if (!SCANNED_HEADERS.has(headerName.toLowerCase()) || typeof headerValue !== "string") continue;
-    for (const match of headerValue.matchAll(PLACEHOLDER_RE)) {
-      if (match[1]) names.add(match[1]);
-    }
+    for (const { name } of findPlaceholders(headerValue)) names.add(name);
   }
   return [...names];
 }

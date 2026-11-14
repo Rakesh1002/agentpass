@@ -3,6 +3,8 @@ import http from "http";
 import https from "https";
 import { ProxyServer } from "./proxy";
 import { vault } from "./vault";
+import { listAudit } from "./audit";
+import { makePlaceholder } from "./placeholder";
 import { rmSync, existsSync } from "fs";
 import { resolve } from "path";
 
@@ -89,6 +91,7 @@ beforeAll(async () => {
   await vault.add("anthropic", "sk-ant-X", "api_key");
   await vault.add("anthropic-clienta", "sk-ant-clienta", "api_key");
   await vault.add("groq", "gsk-post-only", "api_key", [{ host: "api.groq.com", methods: ["POST"] }]);
+  await vault.add("openrouter", "sk-or-anywhere", "api_key", [{ host: "*" }]);
 });
 
 afterAll(async () => {
@@ -99,13 +102,16 @@ afterAll(async () => {
   process.env.HOME = ORIG_HOME;
 });
 
-async function get(url: string, opts?: http.RequestOptions): Promise<{ status: number; body: string }> {
+async function get(
+  url: string,
+  opts?: http.RequestOptions
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(url, opts || {}, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () =>
-        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") })
+        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8"), headers: res.headers })
       );
     });
     req.on("error", reject);
@@ -277,6 +283,42 @@ describe("ProxyServer (provider-routed)", () => {
     await proxy.stop();
   });
 
+  test("cools a key for at least a second on Retry-After: 0 and answers 429", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "always-429";
+    retryAfterByAuth = { "Bearer sk-key-A": "0", "Bearer sk-key-B": "0" };
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+
+    const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+    expect(res.status).toBe(429);
+    expect(res.headers["retry-after"]).toBe("1");
+    expect(JSON.parse(res.body)).toMatchObject({ error: "all_keys_cooling" });
+
+    await proxy.stop();
+  });
+
+  test("falls back to the 60s cooldown on a negative, malformed or past Retry-After", async () => {
+    mockBehavior = "always-429";
+    for (const value of ["-5", "soon", "1.5", new Date(Date.now() - 60_000).toUTCString()]) {
+      upstreamHits = [];
+      callCount = 0;
+      retryAfterByAuth = { "Bearer sk-key-A": value, "Bearer sk-key-B": value };
+
+      const proxy = new ProxyServer({ port: 0 });
+      await proxy.start();
+
+      const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+      expect(res.status).toBe(429);
+      expect(Number(res.headers["retry-after"])).toBeGreaterThanOrEqual(59);
+      expect(Number(res.headers["retry-after"])).toBeLessThanOrEqual(60);
+
+      await proxy.stop();
+    }
+  });
+
   test("returns 404 for unknown provider prefix", async () => {
     const proxy = new ProxyServer({ port: 18806 });
     await proxy.start();
@@ -305,10 +347,38 @@ describe("ProxyServer (provider-routed)", () => {
     });
     expect(JSON.parse(viaApiKey.body).xkey).toBe("sk-ant-clienta");
 
-    const otherProvider = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
-      headers: { "x-api-key": "{{secret:openai-2}}" },
+    const formatPreserving = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
+      headers: { "x-api-key": makePlaceholder("anthropic-clienta", "sk-ant-api03-") },
     });
-    expect(JSON.parse(otherProvider.body).xkey).toBe("sk-ant-X");
+    expect(JSON.parse(formatPreserving.body).xkey).toBe("sk-ant-clienta");
+
+    await proxy.stop();
+  });
+
+  test("refuses a placeholder naming another provider's key on a reverse route", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+    const base = `http://127.0.0.1:${proxy.getPort()}`;
+
+    const toOpenai = await get(`${base}/openai/v1/models`, { headers: { authorization: "Bearer {{secret:anthropic}}" } });
+    expect(toOpenai.status).toBe(403);
+    expect(JSON.parse(toOpenai.body)).toEqual({ error: "egress_blocked", secret: "anthropic", host: "api.openai.com" });
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "egress_blocked", secretNames: ["anthropic"] });
+
+    const toAnthropic = await get(`${base}/anthropic/v1/messages`, { headers: { "x-api-key": "{{secret:openai-2}}" } });
+    expect(toAnthropic.status).toBe(403);
+    expect(JSON.parse(toAnthropic.body).secret).toBe("openai-2");
+
+    const formatPreserving = await get(`${base}/openai/v1/models`, {
+      headers: { authorization: `Bearer ${makePlaceholder("anthropic", "sk-ant-api03-")}` },
+    });
+    expect(formatPreserving.status).toBe(403);
+    expect(JSON.parse(formatPreserving.body).secret).toBe("anthropic");
+    expect(upstreamHits).toHaveLength(0);
 
     await proxy.stop();
   });
@@ -329,6 +399,49 @@ describe("ProxyServer (provider-routed)", () => {
     const allowed = await get(`http://127.0.0.1:18809/groq/v1/chat/completions`, { method: "POST" });
     expect(allowed.status).toBe(200);
     expect(JSON.parse(allowed.body).auth).toBe("Bearer gsk-post-only");
+
+    await proxy.stop();
+  });
+
+  test("records a wildcard-pinned pool key in the audit", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+
+    const res = await get(`http://127.0.0.1:${proxy.getPort()}/openrouter/api/v1/models`);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).auth).toBe("Bearer sk-or-anywhere");
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, secretNames: ["openrouter"], wildcard: ["openrouter"] });
+
+    await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+    expect(listAudit(1)[0]?.wildcard).toBeUndefined();
+
+    await proxy.stop();
+  });
+
+  test("tags reverse routes from a /_t/<tag> prefix and strips it before routing", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+    const base = `http://127.0.0.1:${proxy.getPort()}`;
+
+    const tagged = await get(`${base}/_t/claude%40work-1/openai/v1/models?limit=1`);
+    expect(tagged.status).toBe(200);
+    expect(upstreamHits[0]?.path).toBe("/v1/models?limit=1");
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, sessionTag: "claude@work-1" });
+
+    for (const ignored of ["bad%20tag", "a%2Fb", "%E0%A4%A", "a".repeat(97), ""]) {
+      const res = await get(`${base}/_t/${ignored}/openai/v1/models`);
+      expect(res.status).toBe(200);
+      expect(listAudit(1)[0]?.sessionTag).toBeUndefined();
+    }
+    expect(upstreamHits.map((hit) => hit.path).slice(1)).toEqual(Array(5).fill("/v1/models"));
 
     await proxy.stop();
   });
