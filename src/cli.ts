@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
 import { vault } from "./vault";
-import { proxy } from "./proxy";
+import { proxy, ProxyServer } from "./proxy";
 import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
@@ -10,6 +10,8 @@ import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { vaultFile, routingConfigFile } from "./paths";
+import { linkVar, resolveProject, unlinkVar } from "./project";
+import { buildEnv, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
 
 const VAULT_FILE = vaultFile();
 
@@ -66,6 +68,21 @@ async function main() {
       case "run":
         await handleRun(args.slice(1));
         break;
+      case "env":
+        handleEnv(args.slice(1));
+        break;
+      case "hook":
+        handleHook(args.slice(1));
+        break;
+      case "link":
+        handleLink(args.slice(1));
+        break;
+      case "unlink":
+        handleUnlink(args.slice(1));
+        break;
+      case "project":
+        await handleProject();
+        break;
       case "status":
         await handleStatus();
         break;
@@ -111,7 +128,13 @@ Commands:
   delete <name>         Delete a secret
   proxy start           Start HTTP/HTTPS proxy (port 8888)
   proxy stop            Stop proxy
-  run <cmd>             Run command with proxy enabled
+  run -- <cmd> [args]   Run command with this project's placeholder env and proxy
+  env [--shell zsh|bash|fish|json] [--dir DIR]
+                        Print the placeholder env for a directory (no vault needed)
+  hook zsh|bash|fish    Print a shell hook: eval "$(agentpass hook zsh)"
+  link <VAR> <secret>   Map an env var to a vault secret in .agentpass.json
+  unlink <VAR>          Remove a mapping from .agentpass.json
+  project               Show the resolved mapping (-p to check the vault)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
   status                Show vault and proxy status
@@ -126,8 +149,9 @@ Examples:
   agentpass add openai
   agentpass add anthropic
   agentpass routing init
-  agentpass run claude
-  agentpass run cursor-agent
+  agentpass link OPENAI_API_KEY openai
+  agentpass run -- claude
+  agentpass run -- cursor-agent
 `);
 }
 
@@ -326,28 +350,28 @@ async function handleProxy(args: string[]) {
 }
 
 async function handleRun(args: string[]) {
-  if (args.length === 0) throw new Error("Usage: agentpass run <command> [args...]");
+  const sep = args.indexOf("--");
+  const argv = sep >= 0 ? args.slice(sep + 1) : args;
+  const cmd = argv[0];
+  if (!cmd) throw new Error("Usage: agentpass run -- <command> [args...]");
 
-  await ensureVaultFile();
-  await unlock();
-  await proxy.start();
+  let port = proxyPort();
+  let local: ProxyServer | null = null;
+  if (!(await proxyReachable(port))) {
+    await ensureVaultFile();
+    await unlock();
+    local = new ProxyServer({ port });
+    await local.start();
+    port = local.port();
+  }
 
-  const cmd = args[0];
-  if (!cmd) throw new Error("Usage: agentpass run <command> [args...]");
-  const cmdArgs = args.slice(1);
-
-  const child: ChildProcess = spawn(cmd, cmdArgs, {
-    env: {
-      ...process.env,
-      HTTP_PROXY: `http://127.0.0.1:${proxy.port()}`,
-      HTTPS_PROXY: `http://127.0.0.1:${proxy.port()}`,
-      NODE_EXTRA_CA_CERTS: certificateAuthority.certPath(),
-    },
+  const child: ChildProcess = spawn(cmd, argv.slice(1), {
+    env: { ...process.env, ...buildEnv(process.cwd(), port) },
     stdio: "inherit",
   });
 
   const cleanup = async (code: number) => {
-    await proxy.stop();
+    await local?.stop();
     vault.close();
     process.exit(code);
   };
@@ -358,6 +382,67 @@ async function handleRun(args: string[]) {
     cleanup(1);
   });
   child.on("exit", (code: number | null) => cleanup(code ?? 0));
+}
+
+function handleEnv(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      shell: { type: "string", default: "zsh" },
+      dir: { type: "string" },
+    },
+    allowPositionals: true,
+    strict: false,
+  });
+  const format = values.shell;
+  if (format !== "zsh" && format !== "bash" && format !== "fish" && format !== "json") {
+    throw new Error("Usage: agentpass env [--shell zsh|bash|fish|json] [--dir DIR]");
+  }
+  const dir = typeof values.dir === "string" ? values.dir : process.cwd();
+  process.stdout.write(formatEnv(buildEnv(dir), format));
+}
+
+function handleHook(args: string[]) {
+  const shell = args[0];
+  if (shell !== "zsh" && shell !== "bash" && shell !== "fish") {
+    throw new Error("Usage: agentpass hook zsh|bash|fish");
+  }
+  // Absolute invocation so the hook works without agentpass on PATH.
+  const self = Bun.main.endsWith(".ts") ? [process.execPath, Bun.main] : [process.execPath];
+  process.stdout.write(hookScript(shell, self));
+}
+
+function handleLink(args: string[]) {
+  const [name, secret] = args;
+  if (!name || !secret) throw new Error("Usage: agentpass link <VAR> <secret>");
+  console.log(`Linked ${name} -> ${secret} in ${linkVar(process.cwd(), name, secret)}`);
+}
+
+function handleUnlink(args: string[]) {
+  const name = args[0];
+  if (!name) throw new Error("Usage: agentpass unlink <VAR>");
+  console.log(`Unlinked ${name} in ${unlinkVar(process.cwd(), name)}`);
+}
+
+async function handleProject() {
+  const { manifest, env } = resolveProject(process.cwd());
+  console.log(`Manifest: ${manifest ?? "none (global defaults only)"}`);
+  const entries = Object.entries(env);
+  if (entries.length === 0) {
+    console.log("No env vars mapped. Add one with: agentpass link <VAR> <secret>");
+    return;
+  }
+
+  // Only check the vault when it opens without prompting.
+  const canOpen = globalPassword !== undefined && existsSync(VAULT_FILE);
+  if (canOpen) await unlock();
+  for (const [name, { secret, source }] of entries) {
+    const missing = canOpen && !(await vault.has(secret)) ? " MISSING from vault" : "";
+    console.log(`  ${name} -> ${secret} (${source})${missing}`);
+  }
+  if (canOpen) vault.close();
+  else if (existsSync(VAULT_FILE)) console.log("vault locked (pass -p to check for missing secrets)");
+  else console.log("vault not initialized");
 }
 
 async function handleStatus() {
