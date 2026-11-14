@@ -2,6 +2,7 @@
   "name": "agentpass",
   "version": "0.1.0",
   "description": "Credential broker for AI agents — API keys, passwords, secrets",
+  "license": "MIT",
   "type": "module",
   "private": true,
   "workspaces": [
@@ -12,6 +13,7 @@
   },
   "scripts": {
     "start": "bun run src/cli.ts",
+    "build:bin": "bun build --compile --minify src/cli.ts --outfile dist/agentpass",
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit"
   },
