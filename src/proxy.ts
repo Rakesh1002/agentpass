@@ -4,7 +4,7 @@ import net from "net";
 import type { Duplex } from "stream";
 import { certificateAuthority } from "./ca";
 import { URL } from "url";
-import { vault } from "./vault";
+import { IntegrityError, vault } from "./vault";
 import { appendAudit, type AuditRecord } from "./audit";
 import { findPlaceholders, replacePlaceholders } from "./placeholder";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
@@ -281,7 +281,8 @@ export class ProxyServer {
     req.pipe(proxyReq, { end: true });
   }
 
-  // Answers 403 and returns null if any placeholder's pins reject this destination.
+  // Answers 403 and returns null if any placeholder's pins reject this destination, or its row fails its
+  // integrity check (pins, name or value edited outside the vault).
   private async enforceEgress(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -294,33 +295,32 @@ export class ProxyServer {
     const method = req.method || "GET";
     const destination = `${host}:${port}`;
     const names = placeholderNames(req.headers);
-    const allowed = new Set<string>();
+    const allowed = new Map<string, string>();
     const wildcard: string[] = [];
+    const deny = (error: "egress_blocked" | "integrity_failed", name: string) => {
+      audit(req, { method, destination, secretNames: names, statusCode: 403, durationMs: Date.now() - started, error });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error, secret: name, host }));
+      return null;
+    };
 
     for (const name of names) {
-      if (!(await vault.has(name))) continue;
-      const verdict = egressVerdict(name, await vault.getPins(name), destination, method, path, scheme);
-      if (verdict === "wildcard") wildcard.push(name);
-      if (verdict !== "deny") {
-        allowed.add(name);
-        continue;
+      let entry: Awaited<ReturnType<typeof vault.getEntry>>;
+      try {
+        entry = await vault.getEntry(name);
+      } catch (err) {
+        if (err instanceof IntegrityError) return deny("integrity_failed", name);
+        throw err;
       }
-
-      audit(req, {
-        method,
-        destination,
-        secretNames: names,
-        statusCode: 403,
-        durationMs: Date.now() - started,
-        error: "egress_blocked",
-      });
-      res.writeHead(403, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "egress_blocked", secret: name, host }));
-      return null;
+      if (!entry) continue;
+      const verdict = egressVerdict(name, entry.pins, destination, method, path, scheme);
+      if (verdict === "wildcard") wildcard.push(name);
+      if (verdict === "deny") return deny("egress_blocked", name);
+      allowed.set(name, entry.value);
     }
 
-    // only names checked above may resolve, so a secret added mid-request cannot skip the check
-    const resolve = async (name: string) => (allowed.has(name) ? vault.get(name) : null);
+    // only values checked above may resolve, so a secret added or edited mid-request cannot skip the check
+    const resolve = async (name: string) => allowed.get(name) ?? null;
     return { resolve, wildcard };
   }
 
@@ -568,12 +568,34 @@ export class ProxyServer {
 
     const method = req.method || "GET";
     let pool: { name: string; value: string; pins: Pin[] | null }[];
+    let failed: string[];
     try {
-      pool = await vault.getPool(placeholderPool(req.headers, provider.name));
+      ({ keys: pool, failed } = await vault.getPool(placeholderPool(req.headers, provider.name)));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[AgentPass] Vault unavailable for ${provider.name}: ${message}`);
       return null;
+    }
+
+    // a key whose row was edited outside the vault is unavailable; the intact keys still serve
+    if (failed.length > 0) {
+      audit(req, {
+        method,
+        destination,
+        secretNames: failed,
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "integrity_failed",
+        routedTier,
+        escalated,
+      });
+      if (pool.length === 0) {
+        return {
+          status: 403,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ error: "integrity_failed", secret: failed[0], host: provider.upstream.host })),
+        };
+      }
     }
 
     if (pool.length === 0) {
@@ -1027,13 +1049,16 @@ function originFormTarget(target: string, host: string, port: number): string | 
 const DEFAULT_COOLDOWN_MS = 60_000;
 // a 429 always cools the key, or Retry-After: 0 would read as exhausted (503) instead of cooling (429)
 const MIN_COOLDOWN_MS = 1_000;
+// an upstream (or anything on its path) must not be able to bench a key for good
+const MAX_COOLDOWN_MS = 3_600_000;
 
 // Retry-After is either delta-seconds or an HTTP-date (RFC 9110 10.2.3).
 function retryAfterMs(value: string | undefined): number {
   const raw = value?.trim();
-  if (raw && /^\d+$/.test(raw)) return Math.max(MIN_COOLDOWN_MS, Number(raw) * 1000);
+  const clamp = (ms: number) => Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, ms));
+  if (raw && /^\d+$/.test(raw)) return clamp(Number(raw) * 1000);
   const remaining = raw ? Date.parse(raw) - Date.now() : NaN;
-  return remaining > 0 ? Math.max(MIN_COOLDOWN_MS, remaining) : DEFAULT_COOLDOWN_MS;
+  return remaining > 0 ? clamp(remaining) : DEFAULT_COOLDOWN_MS;
 }
 
 function placeholderNames(headers: http.IncomingHttpHeaders): string[] {

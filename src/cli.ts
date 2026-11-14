@@ -151,12 +151,14 @@ Commands:
                         unless --passphrase (or AGENTPASS_PASSWORD) is given
   unlock-mode keychain|passphrase
                         Re-encrypt the vault for the other unlock mode (backs up first)
-  add <name>            Add a secret
-      --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name)
+  add <name>            Add a secret; the value comes from a hidden prompt, or from stdin
+                        when piped (printf %s "$VALUE" | agentpass add <name>)
+      --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name;
+                          host forms below)
       --path <prefix>     Only for paths under this prefix
       --method GET,POST   Only for these methods
   pins <name>           Show a secret's pins
-      --set <h>[,<h>]     Replace pins (with --path / --method)
+      --set <h>[,<h>]     Replace pins (with --path / --method; host forms below)
       --clear             Remove explicit pins
   list                  List all secrets
   get <name>            Get a secret value
@@ -185,6 +187,14 @@ Commands:
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
 
+Pin hosts (--host, --set):
+  api.example.com       that host on the default port (443 for https, 80 for http)
+  host:port             that host on that port only, e.g. localhost:8080
+  [::1]:port            an IPv6 address, bracketed, with or without :port
+  *                     any host, default port only
+  *:N                   any host on port N
+  *:*                   any host on any port
+
 Passphrase-mode vaults read AGENTPASS_PASSWORD, or prompt on a TTY.
 
 Examples:
@@ -208,7 +218,7 @@ async function ensureVaultFile(): Promise<void> {
 
 async function promptHidden(question: string): Promise<string> {
   if (!process.stdin.isTTY) {
-    throw new Error("Interactive prompt requires a TTY. Set AGENTPASS_PASSWORD for the master password; pass secret values with -v.");
+    throw new Error("Interactive prompt requires a TTY. Set AGENTPASS_PASSWORD for the master password.");
   }
 
   process.stdout.write(question);
@@ -271,7 +281,14 @@ async function vaultPassword(): Promise<string> {
 
 async function unlock(): Promise<void> {
   if (vault.check()) return;
-  await vault.init(await vaultPassword());
+  const upgradeBackup = await vault.init(await vaultPassword());
+  if (upgradeBackup) {
+    // a proxy still running the old code cannot read upgraded values, so it fails closed until restarted
+    console.error(
+      `Upgraded the vault so each value is bound to its pins. Backup of the previous vault: ${upgradeBackup}\n` +
+        "If the background proxy is running, restart it: agentpass down && agentpass up"
+    );
+  }
 }
 
 async function newPassphrase(): Promise<string> {
@@ -356,37 +373,43 @@ async function handleUnlockMode(args: string[]) {
   }
 }
 
+const ADD_USAGE =
+  "Usage: agentpass add <name> [--host <host>[,<host>...]] [--path <prefix>] [--method GET,POST]\n" +
+  `The value is read from the prompt, or from stdin when piped: printf %s "$VALUE" | agentpass add <name>`;
+
 async function handleAdd(args: string[]) {
   await ensureVaultFile();
 
-  const { values, positionals } = parseArgs({
-    args,
-    options: {
-      type: { type: "string", short: "t", default: "api_key" },
-      value: { type: "string", short: "v" },
-      host: { type: "string" },
-      path: { type: "string" },
-      method: { type: "string" },
-    },
-    allowPositionals: true,
-    strict: false,
-  });
-
-  const name = positionals[0];
-  const type = typeof values.type === "string" ? values.type : "api_key";
-
-  if (!name) {
-    throw new Error("Usage: agentpass add <name> [--host <host>[,<host>...]] [--path <prefix>] [--method GET,POST]");
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args,
+      options: {
+        type: { type: "string", short: "t", default: "api_key" },
+        host: { type: "string" },
+        path: { type: "string" },
+        method: { type: "string" },
+      },
+      allowPositionals: true,
+      strict: true,
+    });
+  } catch {
+    // the rejected argument may be the secret itself (-v, --value=...), so it is never echoed
+    throw new Error(ADD_USAGE);
   }
+  const { values, positionals } = parsed;
+  const name = positionals[0];
+  // a value on the command line is visible to every process through ps
+  if (!name || positionals.length > 1) throw new Error(ADD_USAGE);
   const pins = pinsFromFlags(values.host, values.path, values.method);
 
-  const value =
-    typeof values.value === "string" && values.value.length > 0
-      ? values.value
-      : await promptHidden(`Secret value for ${name}: `);
+  const value = process.stdin.isTTY
+    ? await promptHidden(`Secret value for ${name}: `)
+    : (await Bun.stdin.text()).replace(/\r?\n$/, "");
+  if (!value) throw new Error(`The secret value is empty. ${ADD_USAGE.split("\n")[1]}`);
 
   await unlock();
-  await vault.add(name, value, type, pins);
+  await vault.add(name, value, values.type, pins);
   console.log(`Added secret: ${name}`);
   const stored = await vault.getPins(name);
   if (effectivePins(name, stored).length === 0) {
@@ -739,8 +762,9 @@ async function handleAudit(args: string[]) {
     const secrets = row.secretNames.length > 0 ? row.secretNames.join(",") : "-";
     const error = row.error ? ` error="${row.error}"` : "";
     const wildcard = row.wildcard ? ` wildcard=${row.wildcard.join(",")}` : "";
+    const session = row.sessionTag ? ` session=${row.sessionTag}` : "";
     console.log(
-      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}${wildcard}`
+      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}${wildcard}${session}`
     );
   }
 }

@@ -4,10 +4,10 @@ import https from "https";
 import net from "net";
 import tls from "tls";
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
-import { Vault, vault as sharedVault, vaultUnlockMode } from "./vault";
+import { IntegrityError, Vault, valueAad, vault as sharedVault, vaultUnlockMode } from "./vault";
 import { appendAudit, listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { agentPassDir, caCertFile, saltFile, vaultFile } from "./paths";
@@ -40,7 +40,7 @@ describe("vault", () => {
   });
 
   test("migrates a v1 vault file in place and keeps values decryptable", async () => {
-    await writeV1Vault("correct-password", { openai: "sk-legacy", stripe: "sk_live_legacy" });
+    await writeLegacyVault(1, "correct-password", { openai: "sk-legacy", stripe: "sk_live_legacy" });
 
     await expect(new Vault().init("wrong-password")).rejects.toThrow("Invalid master password");
     expect(vaultSchema().columns).not.toContain("pins");
@@ -53,7 +53,7 @@ describe("vault", () => {
     await vault.setPins("stripe", [{ host: "api.stripe.com" }]);
     vault.close();
 
-    expect(vaultSchema()).toEqual({ columns: expect.arrayContaining(["pins"]), version: "2" });
+    expect(vaultSchema()).toEqual({ columns: expect.arrayContaining(["pins"]), version: "3" });
 
     const reopened = new Vault();
     await reopened.init("correct-password");
@@ -62,12 +62,12 @@ describe("vault", () => {
     reopened.close();
 
     const db = new Database(vaultFile());
-    db.run(`UPDATE meta SET value = '3' WHERE key = 'version'`);
+    db.run(`UPDATE meta SET value = '4' WHERE key = 'version'`);
     db.close();
     const newer = new Vault();
     await newer.init("correct-password");
     newer.close();
-    expect(vaultSchema().version).toBe("3");
+    expect(vaultSchema().version).toBe("4");
   });
 
   test("stores, preserves on rotation, replaces and clears pins", async () => {
@@ -85,6 +85,7 @@ describe("vault", () => {
 
     expect(await vault.setPins("stripe", null)).toBe(true);
     expect(await vault.getPins("stripe")).toBeNull();
+    expect(await vault.get("stripe")).toBe("sk_test_2");
     expect(await vault.setPins("missing", [{ host: "a.example" }])).toBe(false);
 
     const invalid = vault.add("other", "sk-never-echoed", "api_key", [{ host: "https://a.example" }]);
@@ -137,6 +138,11 @@ describe("vault", () => {
     expect(await reopened.get("openai")).toBe("sk-rekey-openai");
     expect(await reopened.get("stripe")).toBe("sk_rekey_stripe");
     expect(await reopened.getPins("stripe")).toEqual([{ host: "api.stripe.com" }]);
+    // the new key keeps each value bound to its pins
+    tamper(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
+    await expect(reopened.get("stripe")).rejects.toThrow(IntegrityError);
+    tamper(`UPDATE secrets SET pins = '[{"host":"api.stripe.com"}]' WHERE name = 'stripe'`);
+    expect(await reopened.get("stripe")).toBe("sk_rekey_stripe");
     reopened.close();
 
     const restored = mkdtempSync(join(tmpdir(), "agentpass-restore-"));
@@ -187,10 +193,142 @@ describe("vault", () => {
     await vault.init("correct-password");
     await vault.add("openai-a_b", "sk-1", "api_key", [{ host: "api.openai.com", methods: ["POST"] }]);
     await vault.add("openai-aXb-1", "sk-2");
-    expect(await vault.getPool("openai-a_b")).toEqual([
-      { name: "openai-a_b", value: "sk-1", pins: [{ host: "api.openai.com", methods: ["POST"] }] },
-    ]);
+    expect(await vault.getPool("openai-a_b")).toEqual({
+      keys: [{ name: "openai-a_b", value: "sk-1", pins: [{ host: "api.openai.com", methods: ["POST"] }] }],
+      failed: [],
+    });
     vault.close();
+  });
+
+  test("binds each value to its name and pins, so editing them outside the vault fails closed", async () => {
+    const vault = new Vault();
+    await vault.init("correct-password");
+    await vault.add("stripe", "sk_live_bound", "api_key", [{ host: "api.stripe.com", pathPrefix: "/v1" }]);
+    await vault.add("anywhere", "sk-anywhere", "api_key", [{ host: "*:*" }]);
+    await vault.add("openai", "sk-implicit");
+    await vault.add("openai-2", "sk-implicit-2");
+
+    // the reviewer's attack: widen pins with sqlite3, no key needed
+    tamper(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
+    await expect(vault.get("stripe")).rejects.toThrow(IntegrityError);
+    await expect(vault.getEntry("stripe")).rejects.toThrow('Secret "stripe" failed its integrity check');
+    // the pins as written decrypt again; a reformatted but equal encoding is the same canonical AAD
+    tamper(`UPDATE secrets SET pins = ' [ { "pathPrefix": "/v1", "host": "api.stripe.com" } ] ' WHERE name = 'stripe'`);
+    expect(await vault.getEntry("stripe")).toEqual({ value: "sk_live_bound", pins: [{ host: "api.stripe.com", pathPrefix: "/v1" }] });
+
+    // pins added to an implicitly pinned key, or JSON null in place of SQL NULL
+    for (const pins of ['[{"host":"*:*"}]', "null", "[]", "not json"]) {
+      tamper(`UPDATE secrets SET pins = ? WHERE name = 'openai'`, pins);
+      expect(await vault.getPool("openai")).toEqual({ keys: [{ name: "openai-2", value: "sk-implicit-2", pins: null }], failed: ["openai"] });
+    }
+    tamper(`UPDATE secrets SET pins = NULL WHERE name = 'openai'`);
+    expect(await vault.get("openai")).toBe("sk-implicit");
+
+    // a ciphertext moved into a row with wider pins
+    tamper(`UPDATE secrets SET value = (SELECT value FROM secrets WHERE name = 'stripe') WHERE name = 'anywhere'`);
+    const moved = vault.get("anywhere");
+    await expect(moved).rejects.toThrow(IntegrityError);
+    await moved.catch((err: Error) => expect(err.message).not.toContain("sk_live_bound"));
+    vault.close();
+  });
+
+  test("the AAD is canonical JSON of name and pins, with null for no pins", () => {
+    const aad = (name: string, pins: string | null) => new TextDecoder().decode(valueAad(name, pins));
+    // every stored value depends on these exact bytes
+    expect(aad("stripe", '[{"methods":["POST"],"host":"api.stripe.com"}]')).toBe(
+      '{"name":"stripe","pins":[{"host":"api.stripe.com","methods":["POST"]}]}'
+    );
+    expect(aad("openai", null)).toBe('{"name":"openai","pins":null}');
+    expect(aad("svc", "[]")).toBe('{"name":"svc","pins":[]}');
+    for (const bad of ["null", '{"host":"*"}', "not json"]) expect(() => aad("svc", bad)).toThrow();
+  });
+
+  test("a renamed row no longer decrypts", async () => {
+    const vault = new Vault();
+    await vault.init("correct-password");
+    await vault.add("stripe", "sk_live_named", "api_key", [{ host: "api.stripe.com" }]);
+    await vault.add("openai", "sk-pool");
+
+    tamper(`UPDATE secrets SET name = 'stripe-2' WHERE name = 'stripe'`);
+    await expect(vault.get("stripe-2")).rejects.toThrow(IntegrityError);
+    expect(await vault.getPool("stripe")).toEqual({ keys: [], failed: ["stripe-2"] });
+
+    tamper(`UPDATE secrets SET name = 'openai-x' WHERE name = 'openai'`);
+    expect(await vault.getPool("openai")).toEqual({ keys: [], failed: ["openai-x"] });
+
+    tamper(`UPDATE secrets SET name = 'stripe' WHERE name = 'stripe-2'`);
+    expect(await vault.get("stripe")).toBe("sk_live_named");
+    vault.close();
+  });
+
+  test("setPins and add re-encrypt under the new pins, and never re-bind pins edited outside the vault", async () => {
+    const vault = new Vault();
+    await vault.init("correct-password");
+    await vault.add("stripe", "sk_live_1", "api_key", [{ host: "api.stripe.com" }]);
+    const before = rawRows()[0]!.value;
+
+    await vault.setPins("stripe", [{ host: "files.stripe.com" }]);
+    expect(rawRows()[0]!.value).not.toBe(before);
+    expect(await vault.get("stripe")).toBe("sk_live_1");
+    await vault.add("stripe", "sk_live_2");
+    expect(await vault.getEntry("stripe")).toEqual({ value: "sk_live_2", pins: [{ host: "files.stripe.com" }] });
+
+    tamper(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
+    await expect(vault.setPins("stripe", [{ host: "*:*" }])).rejects.toThrow(IntegrityError);
+    // rotation keeps the stored pins, so it must not launder tampered ones
+    await expect(vault.add("stripe", "sk_live_3")).rejects.toThrow(IntegrityError);
+    expect(await vault.getPins("stripe")).toEqual([{ host: "*" }]);
+
+    // explicit pins replace the row without reading the old value
+    await vault.add("stripe", "sk_live_4", "api_key", [{ host: "api.stripe.com" }]);
+    expect(await vault.getEntry("stripe")).toEqual({ value: "sk_live_4", pins: [{ host: "api.stripe.com" }] });
+    vault.close();
+  });
+
+  test("upgrades a v2 vault by binding every value to its pins, after a backup, and keeps the values", async () => {
+    await writeLegacyVault(2, "correct-password", {
+      openai: "sk-v2-openai",
+      stripe: ["sk_live_v2", '[{"host":"api.stripe.com"}]'],
+    });
+    const v2 = rawRows();
+
+    await expect(new Vault().init("wrong-password")).rejects.toThrow("Invalid master password");
+    expect(vaultBackups()).toEqual([]);
+    expect(vaultSchema().version).toBe("2");
+
+    const vault = new Vault();
+    await vault.init("correct-password");
+    expect(await vault.get("openai")).toBe("sk-v2-openai");
+    expect(await vault.getEntry("stripe")).toEqual({ value: "sk_live_v2", pins: [{ host: "api.stripe.com" }] });
+    expect(vaultSchema().version).toBe("3");
+    expect(rawRows().map((row) => row.value)).not.toContain(v2[0]!.value);
+
+    const backups = vaultBackups();
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toMatch(/^vault\.db\.bak-v2-\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
+    expect(rawRows(join(agentPassDir(), backups[0]!))).toEqual(v2);
+
+    tamper(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
+    await expect(vault.get("stripe")).rejects.toThrow(IntegrityError);
+    vault.close();
+
+    const reopened = new Vault();
+    await reopened.init("correct-password");
+    expect(await reopened.get("openai")).toBe("sk-v2-openai");
+    reopened.close();
+    expect(vaultBackups()).toHaveLength(1);
+  });
+
+  test("a v2 upgrade that cannot read every value changes nothing and leaves no backup", async () => {
+    await writeLegacyVault(2, "correct-password", { openai: "sk-v2-survives", stripe: null });
+    const v2 = rawRows();
+
+    const failed = new Vault().init("correct-password");
+    await expect(failed).rejects.toThrow('"stripe"');
+    await failed.catch((err: Error) => expect(err.message).not.toContain("sk-"));
+    expect(rawRows()).toEqual(v2);
+    expect(vaultSchema().version).toBe("2");
+    expect(vaultBackups()).toEqual([]);
   });
 });
 
@@ -729,6 +867,36 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("denies a secret whose pins were edited outside the vault, with an integrity_failed audit row", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    const tlsTarget = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc-never-widened", "api_key", [{ host: "api.example.com" }]);
+    const proxy = await startProxy();
+    tamper(`UPDATE secrets SET pins = '[{"host":"*:*"}]' WHERE name = 'svc'`);
+
+    const forward = await requestThroughDirectProxy(proxy.getPort(), target.port, { auth: "Bearer {{secret:svc}}" });
+    expect(forward.status).toBe(403);
+    expect(JSON.parse(forward.body)).toEqual({ error: "integrity_failed", secret: "svc", host: "127.0.0.1" });
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "integrity_failed", secretNames: ["svc"] });
+
+    // the widened plaintext pins still steer interception, but nothing is released inside the tunnel
+    const tunneled = await requestThroughConnectTunnel(proxy.getPort(), tlsTarget.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:svc}}",
+    });
+    expect(tunneled).toContain("403");
+    expect(tunneled).toContain('"error":"integrity_failed"');
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "integrity_failed", secretNames: ["svc"] });
+
+    expect(target.requests).toHaveLength(0);
+    expect(tlsTarget.requests).toHaveLength(0);
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk-svc-never-widened");
+
+    await proxy.stop();
+    await target.close();
+    await tlsTarget.close();
+  });
+
   test("blocks placeholders inside CONNECT tunnels when pins do not match", async () => {
     await sharedVault.init("correct-password");
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
@@ -793,8 +961,14 @@ interface ProxiedRequest {
   innerHeaders?: Record<string, string>;
 }
 
-// Built by hand from the v1 schema so the test does not depend on the current Vault code.
-async function writeV1Vault(password: string, secrets: Record<string, string>): Promise<void> {
+// Built by hand from the v1 and v2 schemas so the tests do not depend on the current Vault code.
+// A v2 vault has a pins column and a password verifier; neither version binds values to anything.
+// A secret given as [value, pins] gets that raw pins column; a value of null stores unreadable ciphertext.
+async function writeLegacyVault(
+  version: 1 | 2,
+  password: string,
+  secrets: Record<string, string | null | [string, string]>
+): Promise<void> {
   mkdirSync(agentPassDir(), { recursive: true });
   const salt = crypto.getRandomValues(new Uint8Array(16));
   writeFileSync(saltFile(), salt);
@@ -813,6 +987,12 @@ async function writeV1Vault(password: string, secrets: Record<string, string>): 
     ["encrypt"]
   );
 
+  const encrypt = async (plaintext: string) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext));
+    return Buffer.concat([iv, new Uint8Array(ciphertext)]).toString("base64");
+  };
+
   const db = new Database(vaultFile());
   db.run(`CREATE TABLE secrets (
     id TEXT PRIMARY KEY,
@@ -822,19 +1002,46 @@ async function writeV1Vault(password: string, secrets: Record<string, string>): 
     created INTEGER NOT NULL,
     updated INTEGER NOT NULL,
     lastUsed INTEGER
+    ${version === 2 ? ", pins TEXT" : ""}
   )`);
   db.run(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`);
-  db.run(`INSERT INTO meta (key, value) VALUES ('version', '1')`);
-  for (const [name, value] of Object.entries(secrets)) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(value));
+  db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [String(version)]);
+  if (version === 2) {
+    db.run(`INSERT INTO meta (key, value) VALUES ('passwordVerifier', ?)`, [await encrypt(`agentpass-verifier:${crypto.randomUUID()}`)]);
+  }
+  for (const [name, secret] of Object.entries(secrets)) {
+    const [value, pins] = Array.isArray(secret) ? secret : [secret, null];
+    const stored = value === null ? Buffer.alloc(40, 7).toString("base64") : await encrypt(value);
     const now = Date.now();
-    db.run(
-      `INSERT INTO secrets (id, name, type, value, created, updated) VALUES (?, ?, 'api_key', ?, ?, ?)`,
-      [crypto.randomUUID(), name, Buffer.concat([iv, new Uint8Array(ciphertext)]).toString("base64"), now, now]
-    );
+    db.run(`INSERT INTO secrets (id, name, type, value, created, updated) VALUES (?, ?, 'api_key', ?, ?, ?)`, [
+      crypto.randomUUID(), name, stored, now, now,
+    ]);
+    if (pins !== null) db.run(`UPDATE secrets SET pins = ? WHERE name = ?`, [pins, name]);
   }
   db.close();
+}
+
+function vaultBackups(): string[] {
+  return readdirSync(agentPassDir()).filter((f) => /^vault\.db\.bak-[^-]*/.test(f) && !/-(wal|shm)$/.test(f));
+}
+
+function rawRows(file = vaultFile()): { name: string; value: string; pins: string | null }[] {
+  const db = new Database(file);
+  try {
+    return db.query(`SELECT name, value, pins FROM secrets ORDER BY name`).all() as { name: string; value: string; pins: string | null }[];
+  } finally {
+    db.close();
+  }
+}
+
+// What an agent running as the same user can do to the vault file without any key.
+function tamper(sql: string, ...params: (string | null)[]): void {
+  const db = new Database(vaultFile());
+  try {
+    db.run(sql, params);
+  } finally {
+    db.close();
+  }
 }
 
 function vaultSchema(): { columns: string[]; version: string | undefined } {
