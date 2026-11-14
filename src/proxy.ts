@@ -7,7 +7,16 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict, isLoopbackHost, parseAuthority, pinHostMatches, unbracket, type Pin, type Scheme } from "./egress";
+import {
+  egressVerdict,
+  isLocalHost,
+  isLoopbackHost,
+  parseAuthority,
+  pinHostMatches,
+  unbracket,
+  type Pin,
+  type Scheme,
+} from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -147,6 +156,20 @@ export class ProxyServer {
     const client = isHttps ? https : http;
     const port = Number(url.port) || (isHttps ? 443 : 80);
     const destination = `${url.hostname}:${port}`;
+
+    if (this.isSelf(url.hostname, port)) {
+      appendAudit({
+        method: req.method || "GET",
+        destination,
+        secretNames: placeholderNames(req.headers),
+        statusCode: 508,
+        durationMs: Date.now() - started,
+        error: "loop_detected",
+      });
+      res.writeHead(508, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "loop_detected" }));
+      return;
+    }
 
     const names = placeholderNames(req.headers);
     // a secret in cleartext is readable by anyone on the path, whatever its pins say
@@ -652,6 +675,19 @@ export class ProxyServer {
     const { host: hostname } = authority;
     const port = authority.port ?? 443;
 
+    if (this.isSelf(hostname, port)) {
+      appendAudit({
+        method: "CONNECT",
+        destination: `${hostname}:${port}`,
+        secretNames: [],
+        statusCode: 508,
+        durationMs: Date.now() - started,
+        error: "loop_detected",
+      });
+      clientSocket.end("HTTP/1.1 508 Loop Detected\r\n\r\n");
+      return;
+    }
+
     try {
       if (head.length > 0) clientSocket.unshift(head);
 
@@ -828,6 +864,11 @@ export class ProxyServer {
         clientSocket.end();
       } catch { }
     }
+  }
+
+  // a request the proxy would send to its own listener could loop without end
+  private isSelf(host: string, port: number): boolean {
+    return port === this.port() && (isLocalHost(host) || host === this.config.host);
   }
 
   private async shouldIntercept(hostname: string, port: number): Promise<boolean> {

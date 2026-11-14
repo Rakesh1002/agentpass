@@ -441,6 +441,33 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("refuses forward and CONNECT requests aimed back at the proxy itself", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc-no-loop", "api_key", [{ host: "*:*" }]);
+    const proxy = await startProxy();
+    const port = proxy.getPort();
+
+    for (const host of ["127.0.0.1", "localhost", "127.1", "2130706433", "0x7f.0.0.1", "[::1]", "[::ffff:127.0.0.1]", "0.0.0.0", "localhost."]) {
+      const response = await requestThroughDirectProxy(port, 0, {
+        auth: "Bearer {{secret:svc}}",
+        origin: `http://${host}:${port}`,
+        path: "/openai/v1/models",
+      });
+      expect(response.status).toBe(508);
+      expect(JSON.parse(response.body)).toEqual({ error: "loop_detected" });
+      expect(listAudit(1)[0]).toMatchObject({ statusCode: 508, error: "loop_detected" });
+    }
+
+    for (const authority of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`, `0.0.0.0:${port}`]) {
+      const response = await requestThroughConnectTunnel(port, port, Buffer.alloc(0), { authority });
+      expect(response).toStartWith("HTTP/1.1 508");
+      expect(listAudit(1)[0]).toMatchObject({ method: "CONNECT", statusCode: 508, error: "loop_detected" });
+    }
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk-svc-no-loop");
+
+    await proxy.stop();
+  });
+
   test("refuses an absolute-form target inside a tunnel that names another authority", async () => {
     await sharedVault.init("correct-password");
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));

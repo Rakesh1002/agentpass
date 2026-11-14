@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectivePins, egressVerdict, isLoopbackHost, parseAuthority, parseStoredPins, validatePins } from "./egress";
+import { effectivePins, egressVerdict, isLocalHost, isLoopbackHost, parseAuthority, parseStoredPins, validatePins } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 
 describe("egress pins", () => {
@@ -159,6 +159,15 @@ describe("egress pins", () => {
     }
     for (const host of ["128.0.0.1", "10.0.0.1", "api.stripe.com", "localhost.evil.example", "127.0.0.1.evil.example", "::2"]) {
       expect(isLoopbackHost(host)).toBe(false);
+    }
+  });
+
+  test("isLocalHost covers every loopback, unspecified and IPv4-embedded spelling for the loop guard", () => {
+    for (const host of ["localhost.", "app.localhost", "0.0.0.0", "[::]", "[::ffff:7f00:1]", "[::7f00:1]", "[::ffff:0:0]", "127.9.9.9", "[::1]"]) {
+      expect(isLocalHost(host)).toBe(true);
+    }
+    for (const host of ["api.stripe.com", "10.0.0.1", "128.0.0.1", "[::2]", "[2001:db8::1]", "[::ffff:a00:1]", "localhost.evil.example"]) {
+      expect(isLocalHost(host)).toBe(false);
     }
   });
 

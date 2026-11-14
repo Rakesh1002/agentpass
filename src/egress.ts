@@ -107,6 +107,14 @@ export function isLoopbackHost(host: string): boolean {
   return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
 }
 
+// wider than isLoopbackHost: every spelling that can reach a listener on this machine
+export function isLocalHost(host: string): boolean {
+  const h = unbracket(host.toLowerCase()).replace(/\.$/, "");
+  if (isLoopbackHost(h) || h.endsWith(".localhost") || h === "::" || /^0(\.\d{1,3}){3}$/.test(h)) return true;
+  const embedded = /^::(?:ffff:)?([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(h);
+  return !!embedded && [0, 127].includes(parseInt(embedded[1]!, 16) >> 8);
+}
+
 // host must be canonical (as parseAuthority or URL.hostname returns it)
 export function pinHostMatches(pinHost: string, host: string, port: number, defaultPort: number): boolean {
   const pin = splitAuthority(pinHost, true);
