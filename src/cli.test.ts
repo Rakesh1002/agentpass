@@ -154,6 +154,12 @@ describe("cli", () => {
     for (const form of ["host:port", "[::1]:port", "*:*", "*:N", "default port"]) expect(help).toContain(form);
   });
 
+  test("version and --version print the package version", () => {
+    const { version } = JSON.parse(readFileSync(resolve(import.meta.dir, "..", "package.json"), "utf-8"));
+    for (const arg of ["version", "--version"]) expect(cli([arg])).toEqual({ out: `${version}\n`, err: "", code: 0 });
+    expect(cli(["help"]).out).toMatch(/^  version\s/m);
+  });
+
   test("run uses a reachable proxy without the vault and passes the exit code", async () => {
     const server = http.createServer((_req, res) => res.writeHead(200).end("{}"));
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));

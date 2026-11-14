@@ -124,6 +124,10 @@ async function main() {
         break;
       case "scan":
         process.exit(runScan(args.slice(1)));
+      case "version":
+      case "--version":
+        console.log(version);
+        break;
       case "help":
       case "--help":
       case "-h":
@@ -186,6 +190,7 @@ Commands:
   routing show          Display current routing config
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
+  version               Print the AgentPass version
 
 Pin hosts (--host, --set):
   api.example.com       that host on the default port (443 for https, 80 for http)
