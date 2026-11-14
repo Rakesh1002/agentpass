@@ -155,6 +155,26 @@ describe("audit log", () => {
     expect(rows[0]?.secretNames).toEqual(["openai"]);
     expect(JSON.stringify(rows[0])).not.toContain("sk-test");
   });
+
+  test("stores a session tag and adds the column to an older audit database in place", () => {
+    mkdirSync(agentPassDir(), { recursive: true });
+    const db = new Database(join(agentPassDir(), "audit.db"));
+    db.run(`CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, method TEXT NOT NULL,
+      destination TEXT NOT NULL, secret_names TEXT NOT NULL, status_code INTEGER, duration_ms INTEGER NOT NULL,
+      bytes_in INTEGER NOT NULL DEFAULT 0, bytes_out INTEGER NOT NULL DEFAULT 0, error TEXT, routed_tier TEXT,
+      escalated INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run(`INSERT INTO audit_events (timestamp, method, destination, secret_names, duration_ms) VALUES (1, 'GET', 'old', '[]', 0)`);
+    db.close();
+
+    appendAudit({ method: "GET", destination: "new", secretNames: [], durationMs: 1, sessionTag: "agent-1" });
+
+    const [latest, old] = listAudit(2);
+    expect(latest).toMatchObject({ destination: "new", sessionTag: "agent-1" });
+    expect(old).toMatchObject({ destination: "old" });
+    expect(old?.sessionTag).toBeUndefined();
+  });
 });
 
 describe("HTTPS proxy", () => {
@@ -442,6 +462,59 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("tags forward requests from the proxy URL username and never forwards Proxy-Authorization", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    const proxy = await startProxy();
+    const basic = (credentials: string) => `Basic ${Buffer.from(credentials).toString("base64")}`;
+    const send = (proxyAuth: string) =>
+      requestThroughDirectProxy(proxy.getPort(), target.port, {
+        auth: "Bearer {{secret:svc}}",
+        headers: { "proxy-authorization": proxyAuth },
+      });
+
+    expect((await send(basic("agent-1:"))).status).toBe(200);
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, sessionTag: "agent-1" });
+
+    expect((await send(basic("claude%40work.2+x:"))).status).toBe(200);
+    expect(listAudit(1)[0]?.sessionTag).toBe("claude@work.2+x");
+
+    for (const ignored of [basic("bad tag:"), basic("a/b:"), basic(`${"a".repeat(97)}:`), basic("agent-1:hunter2"), basic("%E0%A4%A:"), "Bearer agent-1", basic(":")]) {
+      expect((await send(ignored)).status).toBe(200);
+      expect(listAudit(1)[0]?.sessionTag).toBeUndefined();
+    }
+
+    expect(target.requests.every((headers) => headers["proxy-authorization"] === undefined)).toBe(true);
+    expect(JSON.stringify(listAudit(50))).not.toContain("hunter2");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("tags CONNECT tunnels and every request inside them", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `localhost:${target.port}` }]);
+    const proxy = await startProxy();
+
+    const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:svc}}",
+      proxyAuth: `Basic ${Buffer.from("tunnel-7:").toString("base64")}`,
+      innerHeaders: { "Proxy-Authorization": "Basic c211Z2dsZWQ6" },
+    });
+
+    expect(response).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc");
+    expect(target.requests[0]?.["proxy-authorization"]).toBeUndefined();
+    const [inner, connect] = listAudit(2);
+    expect(inner).toMatchObject({ method: "GET", statusCode: 200, sessionTag: "tunnel-7" });
+    expect(connect).toMatchObject({ method: "CONNECT", statusCode: 200, sessionTag: "tunnel-7" });
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("format-preserving placeholders get the same pin, scheme, wildcard and missing checks", async () => {
     await sharedVault.init("correct-password");
     const target = await startTarget();
@@ -643,6 +716,8 @@ interface ProxiedRequest {
   authority?: string;
   ip?: string;
   headers?: Record<string, string>;
+  proxyAuth?: string;
+  innerHeaders?: Record<string, string>;
 }
 
 // Built by hand from the v1 schema so the test does not depend on the current Vault code.
@@ -749,6 +824,8 @@ async function requestThroughConnectTunnel(
     servername = "localhost",
     authority = `localhost:${targetPort}`,
     ip,
+    proxyAuth,
+    innerHeaders = {},
   }: ProxiedRequest = {}
 ): Promise<string> {
   const socket = net.connect(proxyPort, "127.0.0.1");
@@ -757,7 +834,8 @@ async function requestThroughConnectTunnel(
     socket.once("error", reject);
   });
 
-  socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
+  const connectAuth = proxyAuth ? `Proxy-Authorization: ${proxyAuth}\r\n` : "";
+  socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${connectAuth}\r\n`);
 
   const established = await readUntil(socket, "\r\n\r\n");
   if (!established.startsWith("HTTP/1.1 200")) return established;
@@ -779,6 +857,7 @@ async function requestThroughConnectTunnel(
       `${method} ${path} HTTP/1.1`,
       `Host: ${host}`,
       `Authorization: ${auth}`,
+      ...Object.entries(innerHeaders).map(([name, value]) => `${name}: ${value}`),
       "Connection: close",
       "",
       "",

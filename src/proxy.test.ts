@@ -422,6 +422,30 @@ describe("ProxyServer (provider-routed)", () => {
     await proxy.stop();
   });
 
+  test("tags reverse routes from a /_t/<tag> prefix and strips it before routing", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+    const base = `http://127.0.0.1:${proxy.getPort()}`;
+
+    const tagged = await get(`${base}/_t/claude%40work-1/openai/v1/models?limit=1`);
+    expect(tagged.status).toBe(200);
+    expect(upstreamHits[0]?.path).toBe("/v1/models?limit=1");
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, sessionTag: "claude@work-1" });
+
+    for (const ignored of ["bad%20tag", "a%2Fb", "%E0%A4%A", "a".repeat(97), ""]) {
+      const res = await get(`${base}/_t/${ignored}/openai/v1/models`);
+      expect(res.status).toBe(200);
+      expect(listAudit(1)[0]?.sessionTag).toBeUndefined();
+    }
+    expect(upstreamHits.map((hit) => hit.path).slice(1)).toEqual(Array(5).fill("/v1/models"));
+
+    await proxy.stop();
+  });
+
   test("streams upstream bytes to the client before upstream finishes", async () => {
     upstreamHits = [];
     callCount = 0;
