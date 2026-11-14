@@ -4,10 +4,10 @@ import https from "https";
 import net from "net";
 import tls from "tls";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
-import { Vault, vault as sharedVault } from "./vault";
+import { basename, dirname, join } from "path";
+import { Vault, vault as sharedVault, vaultUnlockMode } from "./vault";
 import { appendAudit, listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { agentPassDir, caCertFile, saltFile, vaultFile } from "./paths";
@@ -106,6 +106,79 @@ describe("vault", () => {
     await vault.delete("openai");
     expect([...(await vault.pinnedHosts())]).toEqual(["api.stripe.com"]);
     vault.close();
+  });
+
+  test("records the unlock mode, readable without the password", async () => {
+    const vault = new Vault();
+    await vault.init("correct-password");
+    expect(vaultUnlockMode()).toBe("passphrase");
+    vault.setUnlockMode("keychain");
+    vault.close();
+    expect(vaultUnlockMode()).toBe("keychain");
+  });
+
+  test("rekey backs up, re-encrypts every value under the new password and switches mode", async () => {
+    const vault = new Vault();
+    await vault.init("old-password");
+    await vault.add("openai", "sk-rekey-openai");
+    await vault.add("stripe", "sk_rekey_stripe", "api_key", [{ host: "api.stripe.com" }]);
+
+    const backup = await vault.rekey("new-password-123", "keychain");
+    expect(basename(backup)).toMatch(/^vault\.db\.bak-\d{4}-\d{2}-\d{2}T/);
+    expect(dirname(backup)).toBe(agentPassDir());
+    expect(vaultUnlockMode()).toBe("keychain");
+    expect(await vault.get("openai")).toBe("sk-rekey-openai");
+    vault.close();
+
+    await expect(new Vault().init("old-password")).rejects.toThrow("Invalid master password");
+    const reopened = new Vault();
+    await reopened.init("new-password-123");
+    expect(await reopened.get("openai")).toBe("sk-rekey-openai");
+    expect(await reopened.get("stripe")).toBe("sk_rekey_stripe");
+    expect(await reopened.getPins("stripe")).toEqual([{ host: "api.stripe.com" }]);
+    reopened.close();
+
+    const restored = mkdtempSync(join(tmpdir(), "agentpass-restore-"));
+    try {
+      for (const suffix of ["", "-wal", "-shm"]) {
+        if (existsSync(backup + suffix)) copyFileSync(backup + suffix, join(restored, "vault.db" + suffix));
+      }
+      copyFileSync(saltFile(), join(restored, "vault.salt"));
+      process.env.AGENTPASS_HOME = restored;
+      const old = new Vault();
+      await old.init("old-password");
+      expect(await old.get("stripe")).toBe("sk_rekey_stripe");
+      old.close();
+    } finally {
+      process.env.AGENTPASS_HOME = testHome;
+      rmSync(restored, { recursive: true, force: true });
+    }
+  });
+
+  test("rekey changes nothing when any value fails to decrypt", async () => {
+    const vault = new Vault();
+    await vault.init("old-password");
+    await vault.add("openai", "sk-survives");
+    await vault.add("stripe", "sk_corrupt");
+    const raw = new Database(vaultFile());
+    raw.run(`UPDATE secrets SET value = ? WHERE name = 'stripe'`, [Buffer.alloc(40, 7).toString("base64")]);
+    const before = raw.query(`SELECT name, value FROM secrets ORDER BY name`).all();
+    const verifier = raw.query(`SELECT value FROM meta WHERE key = 'passwordVerifier'`).get();
+
+    const failed = vault.rekey("new-password-123", "keychain");
+    await expect(failed).rejects.toThrow("stripe");
+    await failed.catch((err: Error) => expect(err.message).not.toContain("sk-"));
+    expect(raw.query(`SELECT name, value FROM secrets ORDER BY name`).all()).toEqual(before);
+    expect(raw.query(`SELECT value FROM meta WHERE key = 'passwordVerifier'`).get()).toEqual(verifier);
+    raw.close();
+    expect(vaultUnlockMode()).toBe("passphrase");
+    expect(await vault.get("openai")).toBe("sk-survives");
+    vault.close();
+
+    const reopened = new Vault();
+    await reopened.init("old-password");
+    expect(await reopened.get("openai")).toBe("sk-survives");
+    reopened.close();
   });
 
   test("getPool returns pins and treats pool names literally", async () => {

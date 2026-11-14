@@ -15,8 +15,8 @@ afterEach(() => {
 });
 
 function run(...args: string[]): { code: number; out: string; err: string } {
-  const proc = Bun.spawnSync([process.execPath, CLI, ...args, "--password=test-password"], {
-    env: { ...process.env, AGENTPASS_HOME: home },
+  const proc = Bun.spawnSync([process.execPath, CLI, ...args], {
+    env: { ...process.env, HOME: home, AGENTPASS_HOME: home, AGENTPASS_PASSWORD: "test-password" },
   });
   return { code: proc.exitCode, out: proc.stdout.toString(), err: proc.stderr.toString() };
 }

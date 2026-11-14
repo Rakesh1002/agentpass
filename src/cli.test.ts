@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { certificateAuthority } from "./ca";
+import { freePort, selfProxyEnv } from "./testing";
 import { Vault } from "./vault";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
@@ -12,26 +13,45 @@ let root: string;
 let home: string;
 let proj: string;
 
-function cli(args: string[], cwd = proj) {
+function cli(args: string[], extra: Record<string, string> = {}, cwd = proj) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: "utf-8",
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+    env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept", ...extra },
   });
   return { out: r.stdout, err: r.stderr, code: r.status };
 }
 
-function cliAsync(args: string[]): Promise<{ out: string; code: number | null }> {
+function cliAsync(args: string[], extra: Record<string, string> = {}): Promise<{ out: string; code: number | null }> {
   return new Promise((done) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd: proj,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+      env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept", ...extra },
     });
     let out = "";
     child.stdout.on("data", (c) => (out += c));
     child.on("exit", (code) => done({ out, code }));
   });
 }
+
+// Child-side check: print the proxy it was given, that proxy's health, and an upstream request through it.
+const PROBE = `
+const http = require("http");
+const proxy = new URL(process.env.HTTPS_PROXY);
+const get = (path) => new Promise((done) => {
+  const req = http.request({ host: proxy.hostname, port: proxy.port, path, timeout: 4000 }, (res) => { res.resume(); done(String(res.statusCode)); });
+  req.on("timeout", () => { req.destroy(); done("timeout"); });
+  req.on("error", () => done("error"));
+  req.end();
+});
+(async () => {
+  const parts = [process.env.HTTPS_PROXY, await get("/_/health")];
+  if (process.env.UPSTREAM) parts.push(await get(process.env.UPSTREAM));
+  console.log(parts.join(" "));
+})();
+`;
+
+const probeLine = (out: string) => out.split("\n").find((line) => line.startsWith("http://")) ?? out;
 
 beforeAll(async () => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "agentpass-cli-")));
@@ -64,7 +84,7 @@ describe("cli", () => {
     expect(locked.out).toContain("OPENAI_API_KEY -> openai (project)");
     expect(locked.out).toContain("vault locked");
 
-    const open = cli(["project", "-p", "test-password"]);
+    const open = cli(["project"], { AGENTPASS_PASSWORD: "test-password" });
     expect(open.out).toContain("STRIPE_SECRET_KEY -> stripe-test (project) MISSING from vault");
     expect(open.out).not.toContain("OPENAI_API_KEY -> openai (project) MISSING");
     expect(open.out + open.err).not.toContain("sk-real-value");
@@ -105,6 +125,60 @@ describe("cli", () => {
     }
   });
 
+  test("run exits 128+signum when the child dies by a signal", async () => {
+    const server = http.createServer((_req, res) => res.writeHead(200).end("{}"));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port: (server.address() as { port: number }).port }));
+    try {
+      expect((await cliAsync(["run", "--", "sh", "-c", "kill -TERM $$"])).code).toBe(143);
+      expect((await cliAsync(["run", "--", "sh", "-c", "kill -KILL $$"])).code).toBe(137);
+    } finally {
+      server.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
+  test("run's in-process proxy hands the child its actual port when the configured one is taken", async () => {
+    const taken = http.createServer((_req, res) => res.writeHead(404).end());
+    await new Promise<void>((r) => taken.listen(0, "127.0.0.1", r));
+    const port = (taken.address() as { port: number }).port;
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
+    try {
+      const r = await cliAsync(["run", "--", process.execPath, "-e", PROBE], { AGENTPASS_PASSWORD: "test-password" });
+      const [proxyUrl, health] = probeLine(r.out).split(" ");
+      expect(proxyUrl).not.toBe(`http://127.0.0.1:${port}`);
+      expect(health).toBe("200");
+      expect(r.code).toBe(0);
+    } finally {
+      taken.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
+  test("run's in-process proxy ignores proxy env pointing at itself, and the child still gets it", async () => {
+    let hits = 0;
+    const upstream = http.createServer((_req, res) => {
+      hits++;
+      res.writeHead(200).end("ok");
+    });
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
+    const port = await freePort();
+    const self = `http://127.0.0.1:${port}`;
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
+    try {
+      const r = await cliAsync(["run", "--", process.execPath, "-e", PROBE], {
+        AGENTPASS_PASSWORD: "test-password",
+        UPSTREAM: `http://127.0.0.1:${(upstream.address() as { port: number }).port}/ping`,
+        ...selfProxyEnv(self),
+      });
+      expect(probeLine(r.out)).toBe(`${self} 200 200`);
+      expect(hits).toBe(1);
+    } finally {
+      upstream.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
   test("run starts the proxy in-process when none is reachable", async () => {
     const probe = http.createServer();
     await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
@@ -112,7 +186,7 @@ describe("cli", () => {
     await new Promise<void>((r) => probe.close(() => r()));
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
-      const r = await cliAsync(["run", "-p", "test-password", "--", "sh", "-c", 'echo "$HTTPS_PROXY"']);
+      const r = await cliAsync(["run", "--", "sh", "-c", 'echo "$HTTPS_PROXY"'], { AGENTPASS_PASSWORD: "test-password" });
       expect(r.out).toContain(`http://127.0.0.1:${port}\n`);
       expect(r.code).toBe(0);
     } finally {

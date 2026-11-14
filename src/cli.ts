@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
-import { vault } from "./vault";
+import { vault, vaultUnlockMode } from "./vault";
+import { keychain, keychainAccount, randomSecret } from "./keychain";
 import { proxy, ProxyServer } from "./proxy";
 import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
@@ -10,15 +11,17 @@ import { loadRoutingConfig, writeDefaultConfig } from "./router";
 import { effectivePins, validatePins, type Pin } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
+import { constants } from "os";
+import { maskSecret } from "./mask";
 import type { ChildProcess } from "child_process";
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { vaultFile, routingConfigFile } from "./paths";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { agentPassDir, daemonLogFile, vaultFile, routingConfigFile } from "./paths";
+import { daemonState, installService, removeDaemonInfo, removeService, serviceFile, writeDaemonInfo } from "./daemon";
+import { version } from "../package.json";
 import { linkVar, resolveProject, unlinkVar } from "./project";
 import { buildEnv, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
 
 const VAULT_FILE = vaultFile();
-
-let globalPassword: string | undefined;
 
 async function main() {
   const args = process.argv.slice(2);
@@ -31,7 +34,6 @@ async function main() {
   const { values } = parseArgs({
     args,
     options: {
-      password: { type: "string", short: "p" },
       help: { type: "boolean", short: "h", default: false },
     },
     allowPositionals: true,
@@ -43,14 +45,15 @@ async function main() {
     process.exit(0);
   }
 
-  globalPassword = typeof values.password === "string" ? values.password : undefined;
-
   const command = args[0];
 
   try {
     switch (command) {
       case "init":
         await handleInit(args.slice(1));
+        break;
+      case "unlock-mode":
+        await handleUnlockMode(args.slice(1));
         break;
       case "add":
         await handleAdd(args.slice(1));
@@ -73,6 +76,15 @@ async function main() {
         break;
       case "run":
         await handleRun(args.slice(1));
+        break;
+      case "daemon":
+        await handleDaemon(args.slice(1));
+        break;
+      case "up":
+        await handleUp();
+        break;
+      case "down":
+        handleDown();
         break;
       case "env":
         handleEnv(args.slice(1));
@@ -129,7 +141,10 @@ AgentPass — credential broker for AI agents
 Usage: agentpass <command> [options]
 
 Commands:
-  init                  Initialize vault with master password
+  init [--passphrase]   Initialize the vault; it unlocks from the OS keychain
+                        unless --passphrase (or AGENTPASS_PASSWORD) is given
+  unlock-mode keychain|passphrase
+                        Re-encrypt the vault for the other unlock mode (backs up first)
   add <name>            Add a secret
       --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name)
       --path <prefix>     Only for paths under this prefix
@@ -142,22 +157,27 @@ Commands:
   delete <name>         Delete a secret
   proxy start           Start HTTP/HTTPS proxy (port 8888)
   proxy stop            Stop proxy
+  up                    Start the proxy in the background now and at login (keychain mode)
+  down                  Stop the background proxy and remove it from login
+  daemon [--port N]     Run the proxy in the foreground (what the service runs)
   run -- <cmd> [args]   Run command with this project's placeholder env and proxy
   env [--shell zsh|bash|fish|json] [--dir DIR]
                         Print the placeholder env for a directory (no vault needed)
   hook zsh|bash|fish    Print a shell hook: eval "$(agentpass hook zsh)"
   link <VAR> <secret>   Map an env var to a vault secret in .agentpass.json
   unlink <VAR>          Remove a mapping from .agentpass.json
-  project               Show the resolved mapping (-p to check the vault)
+  project               Show the resolved mapping (checks the vault if it unlocks without a prompt)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
-  status                Show vault and proxy status
+  status                Show vault mode, lock state, daemon, port and CA path
   import-claude         Import existing Anthropic key from Claude Code config
   scan [--root <dir>]   Find plaintext secrets your AI agents can read (--json)
   routing init          Generate default routing config
   routing show          Display current routing config
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
+
+Passphrase-mode vaults read AGENTPASS_PASSWORD, or prompt on a TTY.
 
 Examples:
   agentpass scan
@@ -180,7 +200,7 @@ async function ensureVaultFile(): Promise<void> {
 
 async function promptHidden(question: string): Promise<string> {
   if (!process.stdin.isTTY) {
-    throw new Error("Interactive prompt requires a TTY. For non-interactive use, provide the required secrets via CLI options.");
+    throw new Error("Interactive prompt requires a TTY. Set AGENTPASS_PASSWORD for the master password; pass secret values with -v.");
   }
 
   process.stdout.write(question);
@@ -228,21 +248,41 @@ async function promptHidden(question: string): Promise<string> {
   });
 }
 
+async function vaultPassword(): Promise<string> {
+  if (vaultUnlockMode() === "keychain") {
+    const secret = keychain()?.get(keychainAccount());
+    if (!secret) throw new Error(`The OS keychain has no key for this vault (service sh.agentpass, account ${keychainAccount()})`);
+    return secret;
+  }
+  if (process.env.AGENTPASS_PASSWORD) return process.env.AGENTPASS_PASSWORD;
+  if (!process.stdin.isTTY) {
+    throw new Error("The vault is in passphrase mode and there is no TTY to prompt on. Set AGENTPASS_PASSWORD, or switch with: agentpass unlock-mode keychain");
+  }
+  return promptHidden("Master password: ");
+}
+
 async function unlock(): Promise<void> {
   if (vault.check()) return;
-  let password = globalPassword;
+  await vault.init(await vaultPassword());
+}
+
+async function newPassphrase(): Promise<string> {
+  let password = process.env.AGENTPASS_PASSWORD;
   if (!password) {
-    password = await promptHidden("Master password: ");
+    password = await promptHidden("Enter master password: ");
+    const confirm = await promptHidden("Confirm master password: ");
+    if (password !== confirm) throw new Error("Passwords do not match");
   }
-  await vault.init(password);
+  if (password.length < 8) throw new Error("Password must be at least 8 characters");
+  return password;
 }
 
 async function handleInit(args: string[]) {
   const { values } = parseArgs({
     args,
     options: {
-      password: { type: "string", short: "p" },
       force: { type: "boolean", short: "f", default: false },
+      passphrase: { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: false,
@@ -253,18 +293,59 @@ async function handleInit(args: string[]) {
     return;
   }
 
-  let password: string | undefined = typeof values.password === "string" ? values.password : undefined;
-  if (!password) {
-    password = await promptHidden("Enter master password: ");
-    const confirm = await promptHidden("Confirm master password: ");
-    if (password !== confirm) throw new Error("Passwords do not match");
+  const kc = values.passphrase || process.env.AGENTPASS_PASSWORD ? null : keychain();
+  if (!kc) {
+    await vault.init(await newPassphrase());
+    vault.setUnlockMode("passphrase");
+    console.log(`Vault initialized at ${VAULT_FILE} (passphrase mode)`);
+    vault.close();
+    return;
   }
 
-  if (password.length < 8) throw new Error("Password must be at least 8 characters");
-
-  await vault.init(password);
-  console.log("Vault initialized at ~/.agentpass/vault.db");
+  const isNew = !existsSync(VAULT_FILE);
+  const secret = randomSecret();
+  await vault.init(secret);
+  vault.setUnlockMode("keychain");
+  try {
+    kc.set(keychainAccount(), secret);
+  } catch (err) {
+    vault.close();
+    // the random key is gone, so a vault created for it could never be opened
+    if (isNew) for (const suffix of ["", "-wal", "-shm"]) rmSync(VAULT_FILE + suffix, { force: true });
+    throw new Error(`${err instanceof Error ? err.message : err}. Use agentpass init --passphrase to use a password instead.`);
+  }
+  console.log(`Vault initialized at ${VAULT_FILE} (keychain mode: it unlocks from your OS keychain, no password needed)`);
   vault.close();
+}
+
+async function handleUnlockMode(args: string[]) {
+  const target = args[0];
+  if (target !== "keychain" && target !== "passphrase") throw new Error("Usage: agentpass unlock-mode keychain|passphrase");
+  await ensureVaultFile();
+  if (vaultUnlockMode() === target) {
+    console.log(`Vault already uses ${target} mode.`);
+    return;
+  }
+
+  const kc = target === "keychain" ? keychain() : null;
+  if (target === "keychain" && !kc) throw new Error("No OS keychain available (macOS Keychain or Linux secret-tool)");
+  await unlock();
+  const password = kc ? randomSecret() : await newPassphrase();
+  // stored and read back before any value is re-encrypted under it
+  kc?.set(keychainAccount(), password);
+  const backup = await vault.rekey(password, target);
+  vault.close();
+
+  console.log(`Vault now uses ${target} mode. Backup of the previous vault: ${backup}`);
+  if (target === "passphrase") {
+    console.log(
+      `The old key stays in the OS keychain (service sh.agentpass, account ${keychainAccount()}) so the backup still opens. Delete both once the new passphrase works.`
+    );
+  }
+  const daemon = await daemonState();
+  if (daemon.healthy) {
+    console.log(`The background proxy (pid ${daemon.info?.pid}) still holds the old key; restart it: agentpass down && agentpass up`);
+  }
 }
 
 async function handleAdd(args: string[]) {
@@ -390,11 +471,7 @@ async function handleGet(args: string[]) {
   const value = await vault.get(name);
   if (value === null) throw new Error(`Secret "${name}" not found`);
 
-  const masked =
-    value.length <= 12
-      ? "*".repeat(value.length)
-      : value.slice(0, 7) + "..." + value.slice(-4);
-  console.log(`${name}: ${masked}`);
+  console.log(`${name}: ${maskSecret(value)}`);
   vault.close();
 }
 
@@ -415,6 +492,7 @@ async function handleProxy(args: string[]) {
   const action = args[0];
 
   if (action === "start") {
+    if (rerunWithoutProxyEnv()) return;
     await ensureVaultFile();
     await unlock();
     await proxy.start();
@@ -439,6 +517,7 @@ async function handleRun(args: string[]) {
   let port = proxyPort();
   let local: ProxyServer | null = null;
   if (!(await proxyReachable(port))) {
+    if (rerunWithoutProxyEnv()) return;
     await ensureVaultFile();
     await unlock();
     local = new ProxyServer({ port });
@@ -462,7 +541,79 @@ async function handleRun(args: string[]) {
     console.error(`Failed to start "${cmd}":`, err.message);
     cleanup(1);
   });
-  child.on("exit", (code: number | null) => cleanup(code ?? 0));
+  child.on("exit", (code, signal) => cleanup(exitStatus(code, signal)));
+}
+
+function exitStatus(code: number | null, signal: NodeJS.Signals | null): number {
+  return code ?? 128 + (signal ? constants.signals[signal] : 0);
+}
+
+const PROXY_ENV = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NODE_USE_ENV_PROXY"];
+
+// A proxy started from a hooked shell inherits HTTPS_PROXY pointing at itself and loops its own upstream
+// requests. Bun reads proxy env once at startup, so deleting it from process.env does nothing: rerun this
+// command in a clean env instead. Returns true when it did.
+function rerunWithoutProxyEnv(): boolean {
+  if (!PROXY_ENV.some((name) => process.env[name])) return false;
+  const env: Record<string, string | undefined> = { ...process.env, NO_PROXY: "*", no_proxy: "*" };
+  for (const name of PROXY_ENV) delete env[name];
+  const [exe, ...self] = selfCommand();
+  const child = spawn(exe!, [...self, ...process.argv.slice(2)], { env, stdio: "inherit" });
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, () => child.kill(signal));
+  child.on("exit", (code, signal) => process.exit(exitStatus(code, signal)));
+  return true;
+}
+
+async function handleDaemon(args: string[]) {
+  const { values } = parseArgs({ args, options: { port: { type: "string" } }, allowPositionals: true, strict: false });
+  const raw = values.port ?? "8888";
+  const port = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!(port >= 0 && port < 65536)) throw new Error("Usage: agentpass daemon [--port <port>]");
+  if (rerunWithoutProxyEnv()) return;
+  await ensureVaultFile();
+
+  const existing = await daemonState();
+  if (existing.healthy && existing.info) {
+    throw new Error(`The AgentPass daemon is already running (pid ${existing.info.pid}, port ${existing.info.port})`);
+  }
+  await unlock();
+  const server = new ProxyServer({ port });
+  await server.start();
+  writeDaemonInfo({ pid: process.pid, port: server.port(), startedAt: new Date().toISOString(), version });
+
+  // Exit without draining: open tunnels would otherwise hold the process past the service manager's timeout.
+  const shutdown = () => {
+    removeDaemonInfo(process.pid);
+    vault.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+async function handleUp() {
+  await ensureVaultFile();
+  if (vaultUnlockMode() !== "keychain") {
+    throw new Error("The background proxy unlocks from the OS keychain, but this vault uses a passphrase. Switch first: agentpass unlock-mode keychain");
+  }
+  // fail here rather than in a service restart loop
+  await unlock();
+  vault.close();
+
+  const env: Record<string, string> = process.env.AGENTPASS_HOME ? { AGENTPASS_HOME: agentPassDir() } : {};
+  const result = installService({ command: [...selfCommand(), "daemon"], env, log: daemonLogFile() });
+  if (result === "already running") console.log("The AgentPass background proxy is already running.");
+  else console.log(`Started the AgentPass background proxy (${serviceFile()}). Logs: ${daemonLogFile()}`);
+}
+
+function handleDown() {
+  if (removeService()) console.log("Stopped the AgentPass background proxy and removed it from login.");
+  else console.log("The AgentPass background proxy was not installed.");
+}
+
+// Absolute invocation so hooks and services work without agentpass on PATH.
+function selfCommand(): string[] {
+  return Bun.main.endsWith(".ts") ? [process.execPath, Bun.main] : [process.execPath];
 }
 
 function handleEnv(args: string[]) {
@@ -488,9 +639,7 @@ function handleHook(args: string[]) {
   if (shell !== "zsh" && shell !== "bash" && shell !== "fish") {
     throw new Error("Usage: agentpass hook zsh|bash|fish");
   }
-  // Absolute invocation so the hook works without agentpass on PATH.
-  const self = Bun.main.endsWith(".ts") ? [process.execPath, Bun.main] : [process.execPath];
-  process.stdout.write(hookScript(shell, self));
+  process.stdout.write(hookScript(shell, selfCommand()));
 }
 
 function handleLink(args: string[]) {
@@ -515,21 +664,42 @@ async function handleProject() {
   }
 
   // Only check the vault when it opens without prompting.
-  const canOpen = globalPassword !== undefined && existsSync(VAULT_FILE);
+  const canOpen = existsSync(VAULT_FILE) && (vaultUnlockMode() === "keychain" || !!process.env.AGENTPASS_PASSWORD);
   if (canOpen) await unlock();
   for (const [name, { secret, source }] of entries) {
     const missing = canOpen && !(await vault.has(secret)) ? " MISSING from vault" : "";
     console.log(`  ${name} -> ${secret} (${source})${missing}`);
   }
   if (canOpen) vault.close();
-  else if (existsSync(VAULT_FILE)) console.log("vault locked (pass -p to check for missing secrets)");
+  else if (existsSync(VAULT_FILE)) console.log("vault locked (set AGENTPASS_PASSWORD to check for missing secrets)");
   else console.log("vault not initialized");
 }
 
+async function vaultStatus(): Promise<string> {
+  if (!existsSync(VAULT_FILE)) return "not initialized";
+  const mode = vaultUnlockMode();
+  if (mode === "passphrase" && !process.env.AGENTPASS_PASSWORD) return "passphrase mode, locked (needs the passphrase)";
+  try {
+    await unlock();
+    return `${mode} mode, unlockable`;
+  } catch (err) {
+    return `${mode} mode, locked (${err instanceof Error ? err.message : err})`;
+  } finally {
+    vault.close();
+  }
+}
+
+function describeDaemon({ info, alive, healthy }: Awaited<ReturnType<typeof daemonState>>): string {
+  if (!info) return "not running";
+  if (healthy) return `running (pid ${info.pid}, port ${info.port}, since ${info.startedAt})`;
+  if (alive) return `not responding (pid ${info.pid}, port ${info.port})`;
+  return `not running (stale daemon.json for pid ${info.pid})`;
+}
+
 async function handleStatus() {
-  const vaultExists = existsSync(VAULT_FILE);
-  console.log(`Vault: ${vaultExists ? "initialized" : "not initialized"}`);
-  console.log(`Proxy: ${proxy.isRunning() ? `running on :${proxy.port()}` : "stopped"}`);
+  console.log(`Vault: ${await vaultStatus()}`);
+  console.log(`Daemon: ${describeDaemon(await daemonState())}`);
+  console.log(`Proxy port: ${proxyPort()}`);
   console.log(`CA certificate: ${certificateAuthority.certPath()}`);
 
   const configPath = claudeShim.findConfig();
