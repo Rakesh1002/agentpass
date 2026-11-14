@@ -3,7 +3,7 @@ import http from "http";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { certificateAuthority } from "./ca";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { MANIFEST_NAME, resolveProject } from "./project";
+import { BASE_URLS, MANIFEST_NAME, resolveProject } from "./project";
 import { PROVIDERS } from "./providers";
 
 export type Shell = "bash" | "zsh" | "fish";
@@ -12,14 +12,6 @@ export type EnvFormat = Shell | "json";
 const DEFAULT_PORT = 8888;
 const NO_PROXY = "localhost,127.0.0.1,::1";
 const LINUX_ROOTS = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"];
-
-// Each SDK's default base URL path, rewritten to the local reverse route.
-const BASE_URLS: Record<string, { env: string; path: string }> = {
-  anthropic: { env: "ANTHROPIC_BASE_URL", path: "" },
-  openai: { env: "OPENAI_BASE_URL", path: "/v1" },
-  groq: { env: "GROQ_BASE_URL", path: "" },
-  openrouter: { env: "OPENROUTER_BASE_URL", path: "/api/v1" },
-};
 
 export function proxyPort(): number {
   try {
@@ -69,7 +61,9 @@ export function proxyReachable(port: number): Promise<boolean> {
 export function buildEnv(dir: string, port = proxyPort()): Record<string, string> {
   const proxyUrl = `http://127.0.0.1:${port}`;
   const env: Record<string, string> = {};
-  for (const [name, { secret }] of Object.entries(resolveProject(dir).env)) {
+  const project = resolveProject(dir);
+  for (const warning of project.warnings) console.error(`agentpass: ${warning}`);
+  for (const [name, { secret }] of Object.entries(project.env)) {
     env[name] = `{{secret:${secret}}}`;
     const provider = PROVIDERS.find((p) => p.name === secret.split("-")[0]);
     const base = provider && BASE_URLS[provider.name];

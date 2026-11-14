@@ -3,7 +3,7 @@ import { spawnSync } from "child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { findManifest, linkVar, resolveProject, unlinkVar } from "./project";
+import { findManifest, forbiddenVar, linkVar, resolveProject, unlinkVar } from "./project";
 
 let root: string;
 let home: string;
@@ -67,7 +67,7 @@ describe("manifest resolution", () => {
   });
 
   test("works with no manifest and no global config", () => {
-    expect(resolveProject(root)).toEqual({ manifest: null, env: {} });
+    expect(resolveProject(root)).toEqual({ manifest: null, env: {}, warnings: [] });
   });
 
   test("rejects invalid files with clear errors", () => {
@@ -86,9 +86,106 @@ describe("manifest resolution", () => {
     expect(() => resolveProject(root)).toThrow(`${m}: must be a JSON object`);
   });
 
+  test("parse errors never echo file content", () => {
+    const m = join(root, ".agentpass.json");
+    const token = "sk_live_PLANTED123";
+    for (const [file, text] of [
+      [m, `{"env": {"OPENAI_API_KEY": ${token}}}`],
+      [join(home, "config.json"), `{"env": {"OPENAI_API_KEY": "x" ${token}}`],
+    ] as const) {
+      write(file, text);
+      let message = "";
+      try {
+        resolveProject(root);
+      } catch (err) {
+        message = String(err instanceof Error ? err.message : err);
+      }
+      expect(message).toBe(`${file}: invalid JSON`);
+      rmSync(file);
+    }
+  });
+
   test("validates the global config too", () => {
     write(join(home, "config.json"), { env: { "A-B": "x" } });
     expect(() => resolveProject(root)).toThrow('invalid env var name "A-B"');
+  });
+});
+
+describe("variable name policy", () => {
+  const allowed = [
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GITHUB_PAT",
+    "GH_TOKEN",
+    "GOOGLE_API_KEY",
+    "NPM_TOKEN",
+    "DATABASE_URL",
+    "MONGODB_URI",
+    "SENTRY_DSN",
+    "TWILIO_ACCOUNT_SID",
+    "DB_PASSWORD",
+    "AWS_SECRET_ACCESS_KEY",
+    "stripe_secret_key",
+  ];
+  const denied = [
+    "GIT_CONFIG_GLOBAL",
+    "GIT_TOKEN",
+    "GIT_EXEC_PATH",
+    "BASH_ENV",
+    "ZDOTDIR",
+    "PYTHONPATH",
+    "PATH",
+    "IFS",
+    "HOME",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "NODE_AUTH_TOKEN",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "SSH_AUTH_SOCK",
+    "GOAUTH",
+    "GOPATH",
+    "npm_config__auth",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_BASE_URL",
+    "AGENTPASS_TOKEN",
+    "AGENTPASS_EXPORTED",
+    "__AGENTPASS_SAVED_OPENAI_API_KEY",
+    "_JAVA_OPTIONS",
+    "HGRCPATH",
+    "CLASSPATH",
+    "SSLKEYLOGFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "SUDO_ASKPASS",
+    "HISTFILE_KEY",
+    "FOO",
+    "STRIPE",
+  ];
+
+  test("only credential-shaped names that no shell, toolchain or agentpass reads", () => {
+    expect(allowed.filter((n) => forbiddenVar(n) !== null)).toEqual([]);
+    expect(denied.filter((n) => forbiddenVar(n) === null)).toEqual([]);
+  });
+
+  test("skips forbidden names in the manifest and global config with one warning each", () => {
+    write(join(home, "config.json"), { env: { GROQ_API_KEY: "groq", PYTHONPATH: "p" } });
+    write(join(root, ".agentpass.json"), { env: { OPENAI_API_KEY: "openai", GIT_CONFIG_GLOBAL: "g", BASH_ENV: "b" } });
+    const resolved = resolveProject(root);
+    expect(Object.keys(resolved.env)).toEqual(["GROQ_API_KEY", "OPENAI_API_KEY"]);
+    expect(resolved.warnings).toHaveLength(3);
+    for (const name of ["PYTHONPATH", "GIT_CONFIG_GLOBAL", "BASH_ENV"]) {
+      expect(resolved.warnings.filter((w) => w.includes(` ${name}:`))).toHaveLength(1);
+    }
+  });
+
+  test("link refuses forbidden names", () => {
+    expect(() => linkVar(root, "GIT_CONFIG_GLOBAL", "g")).toThrow("cannot link GIT_CONFIG_GLOBAL");
+    expect(() => linkVar(root, "BASH_ENV", "b")).toThrow("cannot link BASH_ENV");
+    expect(linkVar(root, "GITHUB_TOKEN", "github")).toBe(join(root, ".agentpass.json"));
   });
 });
 
@@ -111,12 +208,12 @@ describe("link and unlink", () => {
   });
 
   test("edits the nearest existing manifest and keeps other keys", () => {
-    write(join(root, ".agentpass.json"), { version: 1, env: { B: "b" } });
+    write(join(root, ".agentpass.json"), { version: 1, env: { B_KEY: "b" } });
     mkdirSync(join(root, "sub"));
-    linkVar(join(root, "sub"), "A", "a");
+    linkVar(join(root, "sub"), "A_KEY", "a");
     expect(JSON.parse(readFileSync(join(root, ".agentpass.json"), "utf-8"))).toEqual({
       version: 1,
-      env: { A: "a", B: "b" },
+      env: { A_KEY: "a", B_KEY: "b" },
     });
   });
 

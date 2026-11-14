@@ -9,6 +9,33 @@ const VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Same charset the proxy accepts inside {{secret:NAME}}.
 const SECRET_RE = /^[A-Za-z0-9_.-]+$/;
 
+// Each SDK's default base URL path, rewritten to the local reverse route.
+export const BASE_URLS: Record<string, { env: string; path: string }> = {
+  anthropic: { env: "ANTHROPIC_BASE_URL", path: "" },
+  openai: { env: "OPENAI_BASE_URL", path: "/v1" },
+  groq: { env: "GROQ_BASE_URL", path: "" },
+  openrouter: { env: "OPENROUTER_BASE_URL", path: "/api/v1" },
+};
+
+const CREDENTIAL_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PAT|CRED|CREDENTIAL|AUTH|DSN|_URL|URI|SID)/i;
+const RESERVED = new Set([
+  ..."PATH HOME IFS SHELL USER LOGNAME TMPDIR TMP TEMP PWD OLDPWD CDPATH FPATH MANPATH ENV BASH_ENV ZDOTDIR".split(" "),
+  ..."PROMPT_COMMAND PS0 PS1 PS2 PS3 PS4 PROMPT RPROMPT EDITOR VISUAL PAGER BROWSER TERM LANG TZ".split(" "),
+  ...Object.values(BASE_URLS).map((b) => b.env),
+]);
+// Placeholder values also land in paths and commands (a repo can commit a file named {{secret:x}}), so names a
+// shell, toolchain or agentpass itself reads are off limits. `_` covers _JAVA_ and agentpass's own shell state,
+// GO spares GOOGLE_, and PATH, ASKPASS and *FILE close names CREDENTIAL_RE would otherwise admit
+// (HGRCPATH, CLASSPATH, SUDO_ASKPASS, SSLKEYLOGFILE).
+const RESERVED_RE =
+  /^(LD_|DYLD_|GIT_|SSH_|GPG|GNUPG|PYTHON|NODE_|NPM_CONFIG_|RUBY|GEM_|PERL|JAVA_|_|JDK_|MAVEN_|GRADLE_|DOTNET_|GO(?!OGLE_)|CARGO_|RUST|XDG_|LC_|LESS|SSL_|CURL_|REQUESTS_|AGENTPASS_|BUN_|DENO_|ZSH|BASH|HIST)|_PROXY$|PATH|ASKPASS|FILE$/i;
+
+export function forbiddenVar(name: string): string | null {
+  if (RESERVED.has(name.toUpperCase()) || RESERVED_RE.test(name)) return "reserved for the shell, a toolchain or agentpass";
+  if (!CREDENTIAL_RE.test(name)) return "not a credential name (needs KEY, TOKEN, SECRET, PASSWORD, AUTH, _URL, ...)";
+  return null;
+}
+
 export interface Mapping {
   secret: string;
   source: "project" | "global";
@@ -17,6 +44,7 @@ export interface Mapping {
 export interface ResolvedProject {
   manifest: string | null;
   env: Record<string, Mapping>;
+  warnings: string[];
 }
 
 export function checkVar(file: string, name: string): void {
@@ -34,8 +62,9 @@ function readConfig(file: string): Record<string, unknown> {
   let data: unknown;
   try {
     data = JSON.parse(readFileSync(file, "utf-8"));
-  } catch (err) {
-    throw new Error(`${file}: invalid JSON (${err instanceof Error ? err.message : err})`);
+  } catch {
+    // The parser's message quotes the offending token, which may be a pasted secret.
+    throw new Error(`${file}: invalid JSON`);
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error(`${file}: must be a JSON object`);
@@ -71,17 +100,19 @@ export function findManifest(dir: string): string | null {
 export function resolveProject(dir: string): ResolvedProject {
   const manifest = findManifest(dir);
   const env: Record<string, Mapping> = {};
-  for (const [name, secret] of Object.entries(envOf(globalConfigFile()))) {
-    env[name] = { secret, source: "global" };
-  }
-  if (manifest) {
-    for (const [name, secret] of Object.entries(envOf(manifest))) {
-      env[name] = { secret, source: "project" };
+  const warnings: string[] = [];
+  const add = (file: string, source: Mapping["source"]) => {
+    for (const [name, secret] of Object.entries(envOf(file))) {
+      const why = forbiddenVar(name);
+      if (why) warnings.push(`${file}: skipping ${name}: ${why}`);
+      else env[name] = { secret, source };
     }
-  }
+  };
+  add(globalConfigFile(), "global");
+  if (manifest) add(manifest, "project");
   const sorted: Record<string, Mapping> = {};
   for (const name of Object.keys(env).sort()) sorted[name] = env[name]!;
-  return { manifest, env: sorted };
+  return { manifest, env: sorted, warnings };
 }
 
 function gitToplevel(dir: string): string | null {
@@ -105,6 +136,8 @@ function editManifest(dir: string, edit: (env: Record<string, string>) => void):
 export function linkVar(dir: string, name: string, secret: string): string {
   checkVar(MANIFEST_NAME, name);
   checkSecret(MANIFEST_NAME, name, secret);
+  const why = forbiddenVar(name);
+  if (why) throw new Error(`cannot link ${name}: ${why}`);
   return editManifest(dir, (env) => {
     env[name] = secret;
   });

@@ -15,9 +15,15 @@ import { join, resolve } from "path";
 import { certificateAuthority } from "./ca";
 import { matchProvider } from "./providers";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
+import { forbiddenVar } from "./project";
 import { buildEnv, ensureCaBundle, formatEnv, hookScript, proxyPort } from "./shellenv";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
+
+function git(cwd: string, ...args: string[]) {
+  const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  if (r.status !== 0) throw new Error(r.stderr);
+}
 let root: string;
 let home: string;
 let proj: string;
@@ -88,7 +94,7 @@ describe("buildEnv", () => {
     writeFileSync(
       globalConfigFile(),
       JSON.stringify({
-        env: { A: "anthropic", O: "openai", G: "groq-2", R: "openrouter", X: "openaix" },
+        env: { A_KEY: "anthropic", O_KEY: "openai", G_KEY: "groq-2", R_KEY: "openrouter", X_KEY: "openaix" },
       })
     );
     const env = buildEnv(root, 8888);
@@ -113,6 +119,16 @@ describe("buildEnv", () => {
   test("manifest vars cannot override the proxy settings", () => {
     writeFileSync(globalConfigFile(), JSON.stringify({ env: { HTTPS_PROXY: "evil" } }));
     expect(buildEnv(root, 8888).HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+  });
+
+  test("every var the env layer sets is a name no manifest may map", () => {
+    writeFileSync(
+      globalConfigFile(),
+      JSON.stringify({ env: { A_KEY: "anthropic", O_KEY: "openai", G_KEY: "groq", R_KEY: "openrouter" } })
+    );
+    const own = Object.keys(buildEnv(root, 8888)).filter((k) => !k.endsWith("_KEY"));
+    expect(own.length).toBeGreaterThan(10);
+    expect(own.filter((k) => forbiddenVar(k) === null)).toEqual([]);
   });
 });
 
@@ -244,6 +260,24 @@ cd "${bad}"; TICK; TICK; TICK; show bad`
       expect(r.calls).toBe(3);
     });
   }
+
+  test("a repo cannot run code through GIT_CONFIG_GLOBAL or BASH_ENV", () => {
+    const evil = join(root, "evil");
+    mkdirSync(evil);
+    git(evil, "init", "-q", "-b", "main");
+    writeFileSync(join(evil, ".agentpass.json"), JSON.stringify({ env: { GIT_CONFIG_GLOBAL: "g", BASH_ENV: "b" } }));
+    writeFileSync(join(evil, "{{secret:g}}"), '[core]\n\tfsmonitor = "touch pwned-git; false"\n');
+    writeFileSync(join(evil, "{{secret:b}}"), "touch pwned-bash\n");
+    git(evil, "add", "-A");
+    git(evil, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+
+    const r = runHook(
+      "zsh",
+      `cd "${evil}"; TICK; git status >/dev/null 2>&1; bash -c true; echo "\${GIT_CONFIG_GLOBAL-unset}:\${BASH_ENV-unset}"`
+    );
+    expect([existsSync(join(evil, "pwned-git")), existsSync(join(evil, "pwned-bash"))]).toEqual([false, false]);
+    expect(r.out).toBe("unset:unset\n");
+  });
 
   test("bash hook keeps an existing PROMPT_COMMAND and installs once", () => {
     const hook = hookScript("bash", ["true"]);
