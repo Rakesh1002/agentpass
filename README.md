@@ -33,15 +33,17 @@ bun install
 alias agentpass="bun run $PWD/src/cli.ts"
 
 agentpass scan                                  # find plaintext keys your agents can read
-agentpass init                                  # vault unlocks from the OS keychain
-agentpass add stripe --host api.stripe.com      # value from a hidden prompt
-agentpass add anthropic                         # provider names are pinned to their API host
-agentpass up                                    # background proxy, now and at login
+agentpass onboard                               # vault, agent lockout, background proxy
+agentpass add anthropic                         # value from a hidden prompt; pinned to its API host
 
 cd ~/code/my-app
-agentpass link STRIPE_SECRET_KEY stripe         # writes .agentpass.json
+agentpass import                                # move keys from .env* into the vault, leave placeholders
+agentpass link STRIPE_SECRET_KEY stripe         # or map one by hand in .agentpass.json
 agentpass run -- claude                         # placeholders + proxy env for this project
 ```
+
+`onboard` runs `init`, `protect` and `up` in turn, and `agentpass add stripe --host api.stripe.com` pins any
+other key to the host you name.
 
 To pipe a value instead of typing it: `printf %s "$VALUE" | agentpass add <name>`.
 Values are never accepted as command-line arguments, because other processes can
@@ -58,6 +60,9 @@ eval "$(agentpass hook zsh)"    # or bash, fish
 
 | Command | What it does |
 | --- | --- |
+| `agentpass onboard` | First-time setup: `init` if there is no vault, then `protect` and `up` |
+| `agentpass import [file...] [--yes]` | Move recognised keys from `.env` files (default: `./.env*`) into the vault, pinned to their provider's host, replace each with its placeholder and link it in `.agentpass.json` |
+| `agentpass protect [--remove]` | Add deny rules so Claude Code and Codex can't run `agentpass` or ask the keychain for the vault key, and Claude Code can't read the vault or edit `~/.agentpass` |
 | `agentpass init [--passphrase] [--force]` | Create the vault. It unlocks from the OS keychain unless `--passphrase` (or `AGENTPASS_PASSWORD`) is given |
 | `agentpass unlock-mode keychain\|passphrase` | Re-encrypt the vault for the other unlock mode (backs it up first) |
 | `agentpass add <name> [--host h[,h]] [--path prefix] [--method GET,POST]` | Add a secret with its pins. The value comes from a hidden prompt, or stdin when piped |
@@ -75,7 +80,7 @@ eval "$(agentpass hook zsh)"    # or bash, fish
 | `agentpass run -- <cmd> [args]` | Run a command with this project's placeholders and proxy env, starting a proxy for it if none is running |
 | `agentpass up` | Start the proxy in the background, now and at login (keychain mode only) |
 | `agentpass down` | Stop the background proxy and remove it from login |
-| `agentpass status` | Show vault mode, lock state, background proxy, port and CA path |
+| `agentpass status` (or `doctor`) | Show vault mode, lock state, background proxy, port, CA path, agent lockout and whether this shell uses the proxy |
 | `agentpass proxy start` / `proxy stop` | Run the proxy in the foreground on port 8888 |
 | `agentpass daemon [--port N]` | Run the proxy in the foreground (what the background service runs) |
 | `agentpass audit [-n N]` | Show the last N proxied requests (default 20) |
@@ -208,13 +213,18 @@ log lives in `~/.agentpass/audit.db` and never contains secret values.
   key is pinned to. Everything else is refused and logged.
 - Manifests from cloned repos need your explicit approval before they map
   anything.
+- With `agentpass protect`, Claude Code and Codex refuse to run `agentpass` or
+  ask the keychain for the vault key. Claude Code also refuses to read the vault
+  or the CA key, or to edit anything in `~/.agentpass`.
 
 ## What it doesn't
 
 AgentPass keeps keys out of what an agent sees and limits where they can be
-sent. It is not a sandbox. A process running as your user can still read
-AgentPass's files, use your keychain, or change its configuration if it sets
-out to. If you run an agent you don't trust, run it in its own sandbox or
+sent. It is not a sandbox. The `protect` rules stop an agent's ordinary commands,
+not one that deliberately works around its own permission system, and Codex
+has no rule that keeps it from reading files in `~/.agentpass` (the vault stays
+encrypted). A process running as your user can still read AgentPass's files,
+use your keychain, or change its configuration if it sets out to. If you run an agent you don't trust, run it in its own sandbox or
 container as well.
 
 ## Security details

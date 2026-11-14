@@ -42,9 +42,12 @@ const PATTERNS: [string, RegExp][] = [
   ["SendGrid", new RegExp(`${B}SG\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}`)],
 ];
 
+const GLOBAL_PATTERNS = PATTERNS.map(([service, re]) => [service, new RegExp(re.source, re.flags + "g")] as const);
+
 const SECRET_NAME = /KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION|(?:^|[_-])PAT(?:$|[_-])/i;
 const PUBLIC_NAME = /PUBLIC|PUBLISHABLE/i;
-const PLACEHOLDER = /\{\{secret:|\$\{|^\$|your[-_ ]|x{4,}|^x+$|change[-_]?me|example|placeholder|dummy|redacted|replace[-_]?me|<[^<>]*>|\*{3,}/i;
+// AGENTPASSv1x marks a format-preserving placeholder that `agentpass import` left behind.
+const PLACEHOLDER = /\{\{secret:|AGENTPASSv1x|\$\{|^\$|your[-_ ]|x{4,}|^x+$|change[-_]?me|example|placeholder|dummy|redacted|replace[-_]?me|<[^<>]*>|\*{3,}/i;
 // Names start only at a token boundary so a long run cannot backtrack quadratically.
 const ASSIGN = /(?:["']([A-Za-z_]\w{0,63})["']\s*:|(?<![\w.])([A-Za-z_]\w{0,63})\s*=)\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`,;)}\]]+))/g;
 const DISPLAY_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
@@ -76,9 +79,11 @@ function looksRandom(v: string): boolean {
 }
 
 export function detect(name: string, value: string): { service: string; token: string } | null {
-  for (const [service, re] of PATTERNS) {
-    const token = value.match(re)?.[0];
-    if (token && !PLACEHOLDER.test(token)) return { service, token };
+  // every match, so a placeholder earlier on the line cannot hide a real key after it
+  for (const [service, re] of GLOBAL_PATTERNS) {
+    for (const [token] of value.matchAll(re)) {
+      if (!PLACEHOLDER.test(token)) return { service, token };
+    }
   }
   const token = value.trim().replace(/^(?:Bearer|Basic|token)\s+/i, "");
   if (SECRET_NAME.test(name) && !PUBLIC_NAME.test(name) && !PLACEHOLDER.test(token) && looksRandom(token)) {
@@ -167,7 +172,7 @@ function scanJson(file: string, text: string): Scanned {
 
 // ls-files runs inside untrusted repos: core.fsmonitor would execute a repo-chosen program and a
 // partial clone could lazily fetch (running ssh or credential helpers), so both are disabled.
-function isTracked(file: string): boolean {
+export function isTracked(file: string): boolean {
   try {
     const real = realpathSync(file);
     const r = Bun.spawnSync(
@@ -200,7 +205,7 @@ function isTracked(file: string): boolean {
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "vendor", "Library"]);
-const ENV_TEMPLATES = new Set([".env.example", ".env.sample", ".env.template"]);
+export const ENV_TEMPLATES = new Set([".env.example", ".env.sample", ".env.template"]);
 const MAX_DEPTH = 4;
 
 function claudeSettings(dir: string): [string, Severity][] {

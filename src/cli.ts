@@ -20,6 +20,10 @@ import { daemonState, installService, removeDaemonInfo, removeService, serviceFi
 import { version } from "../package.json";
 import { allowManifest, assertTrusted, denyManifest, linkVar, resolveProject, unlinkVar, UntrustedError } from "./project";
 import { buildEnv, envOutput, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
+import { lockoutStatus, protect, unprotect } from "./lockout";
+import { envFiles, planImport, rewriteEnvFiles, type Move, type Skip } from "./importenv";
+import { isTracked } from "./scan";
+import { basename, dirname, relative, resolve } from "path";
 
 const VAULT_FILE = vaultFile();
 
@@ -108,7 +112,17 @@ async function main() {
         await handleProject();
         break;
       case "status":
+      case "doctor":
         await handleStatus();
+        break;
+      case "protect":
+        handleProtect(args.slice(1));
+        break;
+      case "import":
+        await handleImport(args.slice(1));
+        break;
+      case "onboard":
+        await handleOnboard();
         break;
       case "audit":
         await handleAudit(args.slice(1));
@@ -146,11 +160,12 @@ async function main() {
 
 function printHelp() {
   console.log(`
-AgentPass — credential broker for AI agents
+AgentPass — a local credential firewall for AI coding agents
 
 Usage: agentpass <command> [options]
 
 Commands:
+  onboard               First-time setup: init, protect, and the background proxy
   init [--passphrase]   Initialize the vault; it unlocks from the OS keychain
                         unless --passphrase (or AGENTPASS_PASSWORD) is given
   unlock-mode keychain|passphrase
@@ -183,7 +198,11 @@ Commands:
   project               Show the resolved mapping (checks the vault if it unlocks without a prompt)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
-  status                Show vault mode, lock state, daemon, port and CA path
+  status, doctor        Show vault, daemon, port, CA path, agent lockout and shell hook
+  import [file...]      Move keys from .env files (default: ./.env*) into the vault,
+                        leaving placeholders and links in .agentpass.json (--yes)
+  protect [--remove]    Stop Claude Code and Codex from running agentpass or reading the vault
+                        key from the keychain, and Claude Code from reading the vault
   import-claude         Import existing Anthropic key from Claude Code config
   scan [--root <dir>]   Find plaintext secrets your AI agents can read (--json)
   routing init          Generate default routing config
@@ -204,14 +223,15 @@ Passphrase-mode vaults read AGENTPASS_PASSWORD, or prompt on a TTY.
 
 Examples:
   agentpass scan
-  agentpass init
+  agentpass onboard
+  agentpass import
   agentpass add openai
   agentpass add anthropic
   agentpass add stripe-test --host api.stripe.com --method GET,POST
   agentpass routing init
   agentpass link OPENAI_API_KEY openai
   agentpass run -- claude
-  agentpass run -- cursor-agent
+  agentpass run -- codex
 `);
 }
 
@@ -741,6 +761,120 @@ async function handleStatus() {
 
   const configPath = claudeShim.findConfig();
   if (configPath) console.log(`Claude Code config: ${configPath}`);
+
+  for (const { agent, state } of lockoutStatus()) {
+    console.log(`Agent lockout (${agent}): ${state}${state === "off" || state === "partial" ? " (run: agentpass protect)" : ""}`);
+  }
+  // the hook only exports proxy settings, so they are the visible sign that it runs in this shell
+  const hooked = (process.env.HTTPS_PROXY ?? "").includes(`127.0.0.1:${proxyPort()}`);
+  const hook = hookLine();
+  console.log(`This shell: ${hooked ? "routes through the proxy" : `not using the proxy (add to ${hook.rc}: ${hook.line})`}`);
+}
+
+function hookLine(): { rc: string; line: string } {
+  const shell = basename(process.env.SHELL ?? "");
+  if (shell === "fish") return { rc: "~/.config/fish/config.fish", line: "agentpass hook fish | source" };
+  if (shell === "bash") return { rc: "~/.bashrc", line: 'eval "$(agentpass hook bash)"' };
+  return { rc: "~/.zshrc", line: 'eval "$(agentpass hook zsh)"' };
+}
+
+function handleProtect(args: string[]) {
+  if (args.length > 1 || (args[0] && args[0] !== "--remove")) throw new Error("Usage: agentpass protect [--remove]");
+  if (args[0] === "--remove") {
+    const done = unprotect();
+    console.log(done.length ? `Removed the AgentPass rules from:\n${done.map((d) => `  ${d}`).join("\n")}` : "No AgentPass rules were installed.");
+    return;
+  }
+  const done = protect();
+  if (done.length === 0) {
+    console.log("Found no Claude Code or Codex config to protect.");
+    return;
+  }
+  console.log(
+    `Agents can no longer run agentpass or ask the keychain for the vault key, and Claude Code can't read the vault. Rules added to:\n${done.map((d) => `  ${d}`).join("\n")}`
+  );
+  console.log(
+    "Restart running agents to load them. The rules cover an agent's normal commands, not one that deliberately works" +
+      " around its own permissions, and Codex can still read files in ~/.agentpass (the vault stays encrypted)."
+  );
+}
+
+async function handleOnboard() {
+  if (existsSync(VAULT_FILE)) console.log(`Vault: ${VAULT_FILE}`);
+  else await handleInit([]);
+  handleProtect([]);
+  if (vaultUnlockMode() === "keychain") await handleUp();
+  else console.log("A passphrase vault can't start at login; run the proxy with: agentpass proxy start");
+  const hook = hookLine();
+  console.log(`\nLast step: add this line to ${hook.rc} and open a new terminal:\n  ${hook.line}`);
+  console.log("Then, in each project with a .env file: agentpass import");
+}
+
+async function handleImport(args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: { yes: { type: "boolean", short: "y", default: false } },
+    allowPositionals: true,
+    strict: true,
+  });
+  await ensureVaultFile();
+  const files = positionals.length ? positionals.map((f) => resolve(f)) : envFiles(process.cwd());
+  if (files.length === 0) throw new Error("No .env files in this directory. Name one: agentpass import <file>");
+  const { moves, skips } = planImport(files);
+  const show = (f: string) => relative(process.cwd(), f) || f;
+
+  await unlock();
+  try {
+    const keep: Move[] = [];
+    const conflicts: Skip[] = [];
+    const stored = new Set<string>();
+    for (const m of moves) {
+      const existing = await vault.get(m.secret);
+      if (existing === m.token) stored.add(m.secret);
+      if (existing === null || existing === m.token) keep.push(m);
+      else conflicts.push({ ...m, reason: `the vault already has a different ${m.secret}` });
+    }
+    for (const s of [...skips, ...conflicts]) console.log(`  skip  ${show(s.file)}:${s.line} ${s.varName}: ${s.reason}`);
+    for (const m of keep) {
+      // an existing secret keeps its own pins, which may be wider than the provider host
+      const where = stored.has(m.secret) ? `already in the vault; see agentpass pins ${m.secret}` : `only sent to ${m.host}`;
+      console.log(`  move  ${show(m.file)}:${m.line} ${m.varName} -> ${m.secret} (${where})`);
+    }
+    if (keep.length === 0) {
+      console.log("Nothing to move.");
+      return;
+    }
+    if (!values.yes) {
+      if (!process.stdin.isTTY) throw new Error("Run import in a terminal to confirm, or pass --yes");
+      const answer = prompt(`Move ${keep.length} key(s) into the vault and leave placeholders in their place? [y/N]`);
+      if (!/^y(es)?$/i.test(answer?.trim() ?? "")) {
+        console.log("Nothing changed.");
+        return;
+      }
+    }
+    for (const m of keep) {
+      if ((await vault.get(m.secret)) === null) await vault.add(m.secret, m.token, "api_key", validatePins([{ host: m.host }]));
+      // the plaintext is only removed from the file once the vault holds it
+      if ((await vault.get(m.secret)) !== m.token) throw new Error(`could not store ${m.secret}, so no file was rewritten`);
+    }
+    rewriteEnvFiles(keep);
+
+    for (const m of keep) {
+      try {
+        linkVar(dirname(m.file), m.varName, m.secret);
+      } catch (err) {
+        console.log(`  note  ${m.varName} keeps its placeholder in ${show(m.file)} but was not linked: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    console.log(`Moved ${keep.length} key(s). The files now hold placeholders the proxy swaps for the real values.`);
+    const project = resolveProject(dirname(keep[0]!.file));
+    if (project.manifest && !project.trusted) console.log(`Review ${project.manifest}, then run: agentpass allow`);
+    for (const file of new Set(keep.map((m) => m.file))) {
+      if (isTracked(file)) console.log(`Warning: ${show(file)} is tracked in git, so the old values remain in its history. Rotate those keys.`);
+    }
+  } finally {
+    vault.close();
+  }
 }
 
 async function handleAudit(args: string[]) {
