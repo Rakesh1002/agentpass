@@ -4,6 +4,7 @@ import { vault } from "./vault";
 import { proxy, ProxyServer } from "./proxy";
 import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
+import { runScan } from "./scan";
 import { certificateAuthority } from "./ca";
 import { loadRoutingConfig, writeDefaultConfig } from "./router";
 import { spawn } from "child_process";
@@ -98,6 +99,8 @@ async function main() {
       case "routing":
         await handleRouting(args.slice(1));
         break;
+      case "scan":
+        process.exit(runScan(args.slice(1)));
       case "help":
       case "--help":
       case "-h":
@@ -139,12 +142,14 @@ Commands:
   ca path               Print local CA certificate path
   status                Show vault and proxy status
   import-claude         Import existing Anthropic key from Claude Code config
+  scan [--root <dir>]   Find plaintext secrets your AI agents can read (--json)
   routing init          Generate default routing config
   routing show          Display current routing config
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
 
 Examples:
+  agentpass scan
   agentpass init
   agentpass add openai
   agentpass add anthropic
