@@ -53,7 +53,7 @@ export async function POST(request: Request) {
     }
 
     await db
-      .prepare(`INSERT INTO waitlist (email, created_at, ip_hash, referrer) VALUES (?, ?, ?, ?)`)
+      .prepare(`INSERT OR IGNORE INTO waitlist (email, created_at, ip_hash, referrer) VALUES (?, ?, ?, ?)`)
       .bind(email, new Date().toISOString(), ipHash, request.headers.get("referer") || null)
       .run();
 
