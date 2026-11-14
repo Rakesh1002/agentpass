@@ -667,7 +667,22 @@ export class ProxyServer {
       const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
         const startedReq = Date.now();
         try {
-          const egress = await this.enforceEgress(req, res, hostname, port, "https", req.url || "/", startedReq);
+          const path = originFormTarget(req.url || "/", hostname, port);
+          if (path === null) {
+            appendAudit({
+              method: req.method || "GET",
+              destination: `${hostname}:${port}`,
+              secretNames: placeholderNames(req.headers),
+              statusCode: 403,
+              durationMs: Date.now() - startedReq,
+              error: "egress_blocked",
+            });
+            res.writeHead(403, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "egress_blocked", authority: `${hostname}:${port}` }));
+            return;
+          }
+
+          const egress = await this.enforceEgress(req, res, hostname, port, "https", path, startedReq);
           if (!egress) return;
           const { wildcard } = egress;
 
@@ -692,7 +707,7 @@ export class ProxyServer {
             {
               hostname: unbracket(hostname),
               port,
-              path: req.url || "/",
+              path,
               method: req.method,
               headers: substitution.headers,
               rejectUnauthorized: this.config.rejectUnauthorized,
@@ -919,6 +934,18 @@ async function replacePlaceholders(
   }
 
   return { value: output, found, missing };
+}
+
+// RFC 9112 3.2.2: a server routes on an absolute-form authority, so inside a tunnel it must be the tunnel's own
+function originFormTarget(target: string, host: string, port: number): string | null {
+  if (target.startsWith("/") || target === "*") return target;
+  try {
+    const url = new URL(target);
+    const urlPort = Number(url.port) || { "http:": 80, "https:": 443 }[url.protocol];
+    return url.hostname === host && urlPort === port ? url.pathname + url.search : null;
+  } catch {
+    return null;
+  }
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;

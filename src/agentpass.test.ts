@@ -441,6 +441,55 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("refuses an absolute-form target inside a tunnel that names another authority", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc-never-fronted", "api_key", [{ host: `localhost:${target.port}` }]);
+    const proxy = await startProxy();
+    const ca = readFileSync(caCertFile());
+
+    for (const path of ["https://evil.example:443/a", `https://localhost:${target.port + 1}/a`, "http://localhost/a"]) {
+      const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+        auth: "Bearer {{secret:svc}}",
+        path,
+      });
+      expect(response).toContain("403");
+      expect(response).toContain('"error":"egress_blocked"');
+      expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "egress_blocked" });
+    }
+    expect(target.requests).toHaveLength(0);
+
+    const same = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+      auth: "Bearer {{secret:svc}}",
+      path: `https://LOCALHOST:${target.port}/a?b=1`,
+    });
+    expect(same).toContain("200 OK");
+    expect(target.urls).toEqual(["/a?b=1"]);
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc-never-fronted");
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk-svc-never-fronted");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("sends the origin-form target upstream on the forward path", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:svc}}",
+      path: "/v1/x?y=1",
+    });
+
+    expect(response.status).toBe(200);
+    expect(target.urls).toEqual(["/v1/x?y=1"]);
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("blocks placeholders inside CONNECT tunnels when pins do not match", async () => {
     await sharedVault.init("correct-password");
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
