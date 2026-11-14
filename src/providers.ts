@@ -50,6 +50,22 @@ export const PROVIDERS: Provider[] = [
   },
 ];
 
+export const KNOWN_SERVICES: Record<string, string> = {
+  ...Object.fromEntries(PROVIDERS.map((p) => [p.name, p.upstream.host])),
+  stripe: "api.stripe.com",
+  github: "api.github.com",
+  gemini: "generativelanguage.googleapis.com",
+  google: "generativelanguage.googleapis.com",
+  mistral: "api.mistral.ai",
+  deepseek: "api.deepseek.com",
+  xai: "api.x.ai",
+  perplexity: "api.perplexity.ai",
+  together: "api.together.xyz",
+  cloudflare: "api.cloudflare.com",
+  resend: "api.resend.com",
+  twilio: "api.twilio.com",
+};
+
 export function matchProvider(reqPath: string): { provider: Provider; rest: string } | null {
   for (const p of PROVIDERS) {
     if (reqPath === p.pathPrefix || reqPath.startsWith(p.pathPrefix + "/")) {

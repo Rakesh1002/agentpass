@@ -1,8 +1,12 @@
 import { Database } from "bun:sqlite";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { agentPassDir, saltFile, vaultFile } from "./paths";
+import { effectivePins, parseStoredPins, validatePins, type Pin } from "./egress";
 
 const VERIFIER_PREFIX = "agentpass-verifier:";
+const SCHEMA_VERSION = "2";
+// other processes (agentpass add/pins) write the same file, so cached hosts expire quickly
+const PINNED_HOSTS_TTL_MS = 5000;
 
 interface Secret {
   id: string;
@@ -18,8 +22,10 @@ export class Vault {
   private db: Database | null = null;
   private encryptionKey: CryptoKey | null = null;
   private isInitialized = false;
+  private hostCache: { hosts: Set<string>; at: number } | null = null;
 
   async init(masterPassword: string): Promise<void> {
+    this.hostCache = null;
     const vaultDir = agentPassDir();
     mkdirSync(vaultDir, { recursive: true });
 
@@ -38,11 +44,12 @@ export class Vault {
           value TEXT NOT NULL,
           created INTEGER NOT NULL,
           updated INTEGER NOT NULL,
-          lastUsed INTEGER
+          lastUsed INTEGER,
+          pins TEXT
         )
       `);
       this.db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
-      this.db.run(`INSERT INTO meta (key, value) VALUES ('version', '1')`);
+      this.db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
     } else {
       this.db = new Database(vaultFile());
       this.db.run(`PRAGMA journal_mode = WAL`);
@@ -51,7 +58,17 @@ export class Vault {
     }
 
     await this.verifyPasswordOrUpgrade(isNewVault);
+    this.migrate();
     this.isInitialized = true;
+  }
+
+  private migrate(): void {
+    if (!this.db) throw new Error("Vault not initialized");
+    const columns = this.db.query(`PRAGMA table_info(secrets)`).all() as { name: string }[];
+    if (!columns.some((c) => c.name === "pins")) {
+      this.db.run(`ALTER TABLE secrets ADD COLUMN pins TEXT`);
+    }
+    this.db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
   }
 
   private async deriveKey(password: string): Promise<CryptoKey> {
@@ -164,27 +181,67 @@ export class Vault {
     await this.writeVerifier();
   }
 
-  async add(name: string, value: string, type: string = "api_key"): Promise<void> {
+  async add(name: string, value: string, type: string = "api_key", pins?: Pin[] | null): Promise<void> {
     if (!this.db) throw new Error("Vault not initialized");
 
     const id = crypto.randomUUID();
     const now = Date.now();
+    // re-adding a secret (key rotation) keeps its pins unless new ones are given
+    const storedPins = pins === undefined ? this.storedPins(name) : serializePins(pins);
     const encrypted = await this.encrypt(value);
 
     this.db.run(
-      `INSERT OR REPLACE INTO secrets (id, name, type, value, created, updated) VALUES (?, ?, ?, ?, ?, ?)`,
-      [id, name, type, encrypted, now, now]
+      `INSERT OR REPLACE INTO secrets (id, name, type, value, created, updated, pins) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, type, encrypted, now, now, storedPins]
     );
+    this.hostCache = null;
   }
 
-  async list(): Promise<{ name: string; type: string; updated: number }[]> {
+  async setPins(name: string, pins: Pin[] | null): Promise<boolean> {
+    if (!this.db) throw new Error("Vault not initialized");
+
+    const result = this.db.run(
+      `UPDATE secrets SET pins = ?, updated = ? WHERE name = ?`,
+      [serializePins(pins), Date.now(), name]
+    );
+    this.hostCache = null;
+    return result.changes > 0;
+  }
+
+  async getPins(name: string): Promise<Pin[] | null> {
+    return parseStoredPins(this.storedPins(name));
+  }
+
+  private storedPins(name: string): string | null {
+    if (!this.db) throw new Error("Vault not initialized");
+    const row = this.db.query(`SELECT pins FROM secrets WHERE name = ?`).get(name) as
+      | { pins: string | null }
+      | undefined;
+    return row?.pins ?? null;
+  }
+
+  async pinnedHosts(): Promise<Set<string>> {
+    if (!this.db) throw new Error("Vault not initialized");
+    if (this.hostCache && Date.now() - this.hostCache.at < PINNED_HOSTS_TTL_MS) {
+      return this.hostCache.hosts;
+    }
+
+    const rows = this.db.query(`SELECT name, pins FROM secrets`).all() as { name: string; pins: string | null }[];
+    const hosts = new Set(
+      rows.flatMap((row) => effectivePins(row.name, parseStoredPins(row.pins)).map((pin) => pin.host))
+    );
+    this.hostCache = { hosts, at: Date.now() };
+    return hosts;
+  }
+
+  async list(): Promise<{ name: string; type: string; updated: number; pins: Pin[] | null }[]> {
     if (!this.db) throw new Error("Vault not initialized");
 
     const rows = this.db.query(
-      `SELECT name, type, updated FROM secrets ORDER BY name`
-    ).all() as { name: string; type: string; updated: number }[];
+      `SELECT name, type, updated, pins FROM secrets ORDER BY name`
+    ).all() as { name: string; type: string; updated: number; pins: string | null }[];
 
-    return rows;
+    return rows.map((row) => ({ ...row, pins: parseStoredPins(row.pins) }));
   }
 
   async get(name: string): Promise<string | null> {
@@ -208,6 +265,7 @@ export class Vault {
     if (!this.db) throw new Error("Vault not initialized");
 
     const result = this.db.run(`DELETE FROM secrets WHERE name = ?`, [name]);
+    this.hostCache = null;
     return result.changes > 0;
   }
 
@@ -218,16 +276,16 @@ export class Vault {
     return !!row;
   }
 
-  async getPool(provider: string): Promise<{ name: string; value: string }[]> {
+  async getPool(provider: string): Promise<{ name: string; value: string; pins: Pin[] | null }[]> {
     if (!this.db) throw new Error("Vault not initialized");
 
     const rows = this.db.query(
-      `SELECT name, value FROM secrets WHERE name = ? OR name LIKE ? ORDER BY name`
-    ).all(provider, `${provider}-%`) as { name: string; value: string }[];
+      `SELECT name, value, pins FROM secrets WHERE name = ? OR name LIKE ? ESCAPE '\\' ORDER BY name`
+    ).all(provider, `${provider.replace(/[\\%_]/g, "\\$&")}-%`) as { name: string; value: string; pins: string | null }[];
 
-    const out: { name: string; value: string }[] = [];
+    const out: { name: string; value: string; pins: Pin[] | null }[] = [];
     for (const row of rows) {
-      out.push({ name: row.name, value: await this.decrypt(row.value) });
+      out.push({ name: row.name, value: await this.decrypt(row.value), pins: parseStoredPins(row.pins) });
     }
     return out;
   }
@@ -241,8 +299,14 @@ export class Vault {
       this.db.close();
       this.db = null;
     }
+    this.hostCache = null;
     this.isInitialized = false;
   }
+}
+
+function serializePins(pins: Pin[] | null): string | null {
+  if (!pins || pins.length === 0) return null;
+  return JSON.stringify(validatePins(pins));
 }
 
 export const vault = new Vault();
