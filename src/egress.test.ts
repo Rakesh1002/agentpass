@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectivePins, egressVerdict, parseStoredPins, validatePins } from "./egress";
+import { effectivePins, egressVerdict, isLoopbackHost, parseStoredPins, validatePins } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 
 describe("egress pins", () => {
@@ -27,6 +27,21 @@ describe("egress pins", () => {
     expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "/v1/charges/%2e%2e/customers")).toBe("deny");
     expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "/v1/charges\\..\\customers")).toBe("deny");
     expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "https://evil.example/v1/charges")).toBe("deny");
+  });
+
+  test("denies encoded separators and NUL in the path under a path pin", () => {
+    const pins = [{ host: "api.stripe.com", pathPrefix: "/v1/charges" }];
+    for (const path of [
+      "/v1/charges/..%2fcustomers",
+      "/v1/charges/..%2Fcustomers",
+      "/v1/charges/..%5ccustomers",
+      "/v1/charges/..%5Ccustomers",
+      "/v1/charges/ch_1%00",
+    ]) {
+      expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", path)).toBe("deny");
+    }
+    expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "/v1/charges/ch_1?next=%2Fdone")).toBe("allow");
+    expect(egressVerdict("stripe", [{ host: "api.stripe.com" }], "api.stripe.com", "GET", "/v1/a%2Fb")).toBe("allow");
   });
 
   test("denies by default when a secret has no pins", () => {
@@ -74,6 +89,15 @@ describe("egress pins", () => {
     expect(parseStoredPins("not json")).toEqual([]);
     expect(parseStoredPins(JSON.stringify([{ host: "https://x" }]))).toEqual([]);
     expect(egressVerdict("openai", parseStoredPins("not json"), "api.openai.com", "GET", "/")).toBe("deny");
+  });
+
+  test("recognizes only loopback hosts as safe for cleartext", () => {
+    for (const host of ["127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"]) {
+      expect(isLoopbackHost(host)).toBe(true);
+    }
+    for (const host of ["128.0.0.1", "10.0.0.1", "api.stripe.com", "localhost.evil.example", "127.0.0.1.evil.example", "::2"]) {
+      expect(isLoopbackHost(host)).toBe(false);
+    }
   });
 
   test("exports well-known service hosts", () => {
