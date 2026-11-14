@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "child_process";
+import http from "http";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
@@ -8,7 +9,7 @@ import { certificateAuthority } from "./ca";
 import { installService, removeService } from "./daemon";
 import type { Runner } from "./keychain";
 import { proxyReachable } from "./shellenv";
-import { sandbox, type Sandbox } from "./testing";
+import { freePort, sandbox, selfProxyEnv, type Sandbox } from "./testing";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
 const PW = "test-password";
@@ -144,8 +145,8 @@ describe("daemon", () => {
 
   const daemonJson = () => join(box.agentpassHome, "daemon.json");
 
-  function startDaemon(extra: Record<string, string> = {}) {
-    const child = spawn(process.execPath, [CLI, "daemon", "--port", "0"], { cwd: box.root, env: { ...box.env, ...extra } });
+  function startDaemon(extra: Record<string, string> = {}, port = 0) {
+    const child = spawn(process.execPath, [CLI, "daemon", "--port", String(port)], { cwd: box.root, env: { ...box.env, ...extra } });
     let output = "";
     child.stdout.on("data", (c) => (output += c));
     child.stderr.on("data", (c) => (output += c));
@@ -187,6 +188,46 @@ describe("daemon", () => {
       expect(box.cli(["status"]).out).toContain("Daemon: not running");
     } finally {
       daemon.child.kill("SIGKILL");
+    }
+  });
+
+  test("ignores proxy env pointing at itself, so a forwarded request reaches upstream exactly once", async () => {
+    let hits = 0;
+    const upstream = http.createServer((_req, res) => {
+      hits++;
+      res.writeHead(200).end("ok");
+    });
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
+    const port = await freePort();
+    expect(box.cli(["init"]).code).toBe(0);
+    const daemon = startDaemon(selfProxyEnv(`http://127.0.0.1:${port}`), port);
+    try {
+      await waitFor(() => existsSync(daemonJson()), "daemon.json");
+      const status = await new Promise<string>((done) => {
+        const target = `http://127.0.0.1:${(upstream.address() as { port: number }).port}/ping`;
+        const req = http.request({ host: "127.0.0.1", port, path: target, timeout: 4000 }, (res) => {
+          res.resume();
+          done(String(res.statusCode));
+        });
+        req.on("timeout", () => {
+          req.destroy();
+          done("timeout");
+        });
+        req.on("error", (err) => done(err.message));
+        req.end();
+      });
+      expect(status).toBe("200");
+      await Bun.sleep(200);
+      expect(hits).toBe(1);
+
+      const servingPid = JSON.parse(readFileSync(daemonJson(), "utf-8")).pid;
+      daemon.child.kill("SIGTERM");
+      expect(await daemon.exited).toBe(0);
+      expect(existsSync(daemonJson())).toBe(false);
+      expect(() => process.kill(servingPid, 0)).toThrow();
+    } finally {
+      daemon.child.kill("SIGKILL");
+      upstream.close();
     }
   });
 

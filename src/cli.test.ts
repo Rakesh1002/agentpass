@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { certificateAuthority } from "./ca";
+import { freePort, selfProxyEnv } from "./testing";
 import { Vault } from "./vault";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
@@ -32,6 +33,25 @@ function cliAsync(args: string[], extra: Record<string, string> = {}): Promise<{
     child.on("exit", (code) => done({ out, code }));
   });
 }
+
+// Child-side check: print the proxy it was given, that proxy's health, and an upstream request through it.
+const PROBE = `
+const http = require("http");
+const proxy = new URL(process.env.HTTPS_PROXY);
+const get = (path) => new Promise((done) => {
+  const req = http.request({ host: proxy.hostname, port: proxy.port, path, timeout: 4000 }, (res) => { res.resume(); done(String(res.statusCode)); });
+  req.on("timeout", () => { req.destroy(); done("timeout"); });
+  req.on("error", () => done("error"));
+  req.end();
+});
+(async () => {
+  const parts = [process.env.HTTPS_PROXY, await get("/_/health")];
+  if (process.env.UPSTREAM) parts.push(await get(process.env.UPSTREAM));
+  console.log(parts.join(" "));
+})();
+`;
+
+const probeLine = (out: string) => out.split("\n").find((line) => line.startsWith("http://")) ?? out;
 
 beforeAll(async () => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "agentpass-cli-")));
@@ -114,6 +134,30 @@ describe("cli", () => {
       expect((await cliAsync(["run", "--", "sh", "-c", "kill -KILL $$"])).code).toBe(137);
     } finally {
       server.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
+  test("run's in-process proxy ignores proxy env pointing at itself, and the child still gets it", async () => {
+    let hits = 0;
+    const upstream = http.createServer((_req, res) => {
+      hits++;
+      res.writeHead(200).end("ok");
+    });
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
+    const port = await freePort();
+    const self = `http://127.0.0.1:${port}`;
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
+    try {
+      const r = await cliAsync(["run", "--", process.execPath, "-e", PROBE], {
+        AGENTPASS_PASSWORD: "test-password",
+        UPSTREAM: `http://127.0.0.1:${(upstream.address() as { port: number }).port}/ping`,
+        ...selfProxyEnv(self),
+      });
+      expect(probeLine(r.out)).toBe(`${self} 200 200`);
+      expect(hits).toBe(1);
+    } finally {
+      upstream.close();
       rmSync(join(home, "daemon.json"));
     }
   });

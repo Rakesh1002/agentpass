@@ -1,4 +1,5 @@
 import { spawnSync } from "child_process";
+import http from "http";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
@@ -28,6 +29,19 @@ case "$tool $1" in
   *) exit 1 ;;
 esac
 `;
+
+// What a hooked shell hands the proxy when the proxy is started from it.
+export function selfProxyEnv(url: string): Record<string, string> {
+  return { HTTP_PROXY: url, HTTPS_PROXY: url, http_proxy: url, https_proxy: url, ALL_PROXY: url, NODE_USE_ENV_PROXY: "1" };
+}
+
+export async function freePort(): Promise<number> {
+  const probe = http.createServer();
+  await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+  const port = (probe.address() as { port: number }).port;
+  await new Promise<void>((r) => probe.close(() => r()));
+  return port;
+}
 
 export interface Sandbox {
   root: string;

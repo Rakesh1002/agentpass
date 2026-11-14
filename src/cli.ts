@@ -492,6 +492,7 @@ async function handleProxy(args: string[]) {
   const action = args[0];
 
   if (action === "start") {
+    if (rerunWithoutProxyEnv()) return;
     await ensureVaultFile();
     await unlock();
     await proxy.start();
@@ -516,6 +517,7 @@ async function handleRun(args: string[]) {
   let port = proxyPort();
   let local: ProxyServer | null = null;
   if (!(await proxyReachable(port))) {
+    if (rerunWithoutProxyEnv()) return;
     await ensureVaultFile();
     await unlock();
     local = new ProxyServer({ port });
@@ -546,11 +548,28 @@ function exitStatus(code: number | null, signal: NodeJS.Signals | null): number 
   return code ?? 128 + (signal ? constants.signals[signal] : 0);
 }
 
+const PROXY_ENV = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NODE_USE_ENV_PROXY"];
+
+// A proxy started from a hooked shell inherits HTTPS_PROXY pointing at itself and loops its own upstream
+// requests. Bun reads proxy env once at startup, so deleting it from process.env does nothing: rerun this
+// command in a clean env instead. Returns true when it did.
+function rerunWithoutProxyEnv(): boolean {
+  if (!PROXY_ENV.some((name) => process.env[name])) return false;
+  const env: Record<string, string | undefined> = { ...process.env, NO_PROXY: "*", no_proxy: "*" };
+  for (const name of PROXY_ENV) delete env[name];
+  const [exe, ...self] = selfCommand();
+  const child = spawn(exe!, [...self, ...process.argv.slice(2)], { env, stdio: "inherit" });
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, () => child.kill(signal));
+  child.on("exit", (code, signal) => process.exit(exitStatus(code, signal)));
+  return true;
+}
+
 async function handleDaemon(args: string[]) {
   const { values } = parseArgs({ args, options: { port: { type: "string" } }, allowPositionals: true, strict: false });
   const raw = values.port ?? "8888";
   const port = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : NaN;
   if (!(port >= 0 && port < 65536)) throw new Error("Usage: agentpass daemon [--port <port>]");
+  if (rerunWithoutProxyEnv()) return;
   await ensureVaultFile();
 
   const existing = await daemonState();
