@@ -99,13 +99,16 @@ afterAll(async () => {
   process.env.HOME = ORIG_HOME;
 });
 
-async function get(url: string, opts?: http.RequestOptions): Promise<{ status: number; body: string }> {
+async function get(
+  url: string,
+  opts?: http.RequestOptions
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(url, opts || {}, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () =>
-        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") })
+        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8"), headers: res.headers })
       );
     });
     req.on("error", reject);
@@ -275,6 +278,42 @@ describe("ProxyServer (provider-routed)", () => {
     expect(Number(res.headers["retry-after"])).toBeLessThanOrEqual(60);
 
     await proxy.stop();
+  });
+
+  test("cools a key for at least a second on Retry-After: 0 and answers 429", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "always-429";
+    retryAfterByAuth = { "Bearer sk-key-A": "0", "Bearer sk-key-B": "0" };
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+
+    const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+    expect(res.status).toBe(429);
+    expect(res.headers["retry-after"]).toBe("1");
+    expect(JSON.parse(res.body)).toMatchObject({ error: "all_keys_cooling" });
+
+    await proxy.stop();
+  });
+
+  test("falls back to the 60s cooldown on a negative, malformed or past Retry-After", async () => {
+    mockBehavior = "always-429";
+    for (const value of ["-5", "soon", "1.5", new Date(Date.now() - 60_000).toUTCString()]) {
+      upstreamHits = [];
+      callCount = 0;
+      retryAfterByAuth = { "Bearer sk-key-A": value, "Bearer sk-key-B": value };
+
+      const proxy = new ProxyServer({ port: 0 });
+      await proxy.start();
+
+      const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+      expect(res.status).toBe(429);
+      expect(Number(res.headers["retry-after"])).toBeGreaterThanOrEqual(59);
+      expect(Number(res.headers["retry-after"])).toBeLessThanOrEqual(60);
+
+      await proxy.stop();
+    }
   });
 
   test("returns 404 for unknown provider prefix", async () => {
