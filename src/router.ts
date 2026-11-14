@@ -73,7 +73,7 @@ export function nextTier(current: TaskTier): TaskTier | null {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CONFIG: RoutingConfig = {
-  enabled: true,
+  enabled: false,
   routing_table: {
     trivial: { provider: "groq", model: "llama3-8b" },
     moderate: { provider: "openai", model: "gpt-4o-mini" },
@@ -92,7 +92,7 @@ export function loadRoutingConfig(): RoutingConfig | null {
   try {
     const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<RoutingConfig>;
     return {
-      enabled: raw.enabled ?? true,
+      enabled: raw.enabled ?? false,
       routing_table: raw.routing_table ?? DEFAULT_CONFIG.routing_table,
       escalation: raw.escalation ?? DEFAULT_CONFIG.escalation,
       override_header: raw.override_header ?? DEFAULT_CONFIG.override_header,

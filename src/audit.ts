@@ -15,6 +15,7 @@ export interface AuditRecord {
   error?: string;
   routedTier?: string;
   escalated?: boolean;
+  wildcard?: string[];
 }
 
 export interface StoredAuditRecord extends AuditRecord {
@@ -42,9 +43,14 @@ function openAuditDb(): Database {
       bytes_out INTEGER NOT NULL DEFAULT 0,
       error TEXT,
       routed_tier TEXT,
-      escalated INTEGER NOT NULL DEFAULT 0
+      escalated INTEGER NOT NULL DEFAULT 0,
+      wildcard_secrets TEXT
     )
   `);
+  const columns = db.query(`PRAGMA table_info(audit_events)`).all() as { name: string }[];
+  if (!columns.some((c) => c.name === "wildcard_secrets")) {
+    db.run(`ALTER TABLE audit_events ADD COLUMN wildcard_secrets TEXT`);
+  }
   return db;
 }
 
@@ -54,8 +60,8 @@ export function appendAudit(record: AuditRecord): void {
     db.run(
       `INSERT INTO audit_events (
         timestamp, method, destination, secret_names, status_code,
-        duration_ms, bytes_in, bytes_out, error, routed_tier, escalated
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        duration_ms, bytes_in, bytes_out, error, routed_tier, escalated, wildcard_secrets
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.timestamp || Date.now(),
         record.method,
@@ -68,6 +74,7 @@ export function appendAudit(record: AuditRecord): void {
         record.error ?? null,
         record.routedTier ?? null,
         record.escalated ? 1 : 0,
+        record.wildcard?.length ? JSON.stringify(record.wildcard) : null,
       ]
     );
   } finally {
@@ -83,17 +90,24 @@ export function listAudit(limit = 20): StoredAuditRecord[] {
         `SELECT id, timestamp, method, destination, secret_names as secretNames,
                 status_code as statusCode, duration_ms as durationMs,
                 bytes_in as bytesIn, bytes_out as bytesOut, error,
-                routed_tier as routedTier, escalated
+                routed_tier as routedTier, escalated, wildcard_secrets as wildcard
          FROM audit_events
          ORDER BY timestamp DESC, id DESC
          LIMIT ?`
       )
-      .all(limit) as Array<Omit<StoredAuditRecord, "secretNames" | "escalated"> & { secretNames: string; escalated: number }>;
+      .all(limit) as Array<
+        Omit<StoredAuditRecord, "secretNames" | "escalated" | "wildcard"> & {
+          secretNames: string;
+          escalated: number;
+          wildcard: string | null;
+        }
+      >;
 
     return rows.map((row) => ({
       ...row,
       secretNames: JSON.parse(row.secretNames) as string[],
       escalated: row.escalated === 1,
+      wildcard: row.wildcard ? (JSON.parse(row.wildcard) as string[]) : undefined,
     }));
   } finally {
     db.close();
