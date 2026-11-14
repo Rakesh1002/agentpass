@@ -35,10 +35,6 @@ export default function Footer() {
             </a>
           </div>
         </div>
-
-        <div className="mt-8 text-center text-xs text-muted/60">
-          Built with Bun + Next.js + OpenNext. Deployed on Cloudflare Workers.
-        </div>
       </div>
     </footer>
   );
