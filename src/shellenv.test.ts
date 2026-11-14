@@ -190,11 +190,32 @@ describe("formatEnv", () => {
       });
       expect(r.stdout).toBe(`${env.A}\n${env.B}\nA B\n1\n`);
     });
+
+    test(`${shell} restore puts back prior values, keeping unset apart from empty, even after a re-eval`, () => {
+      const bin = shell === "bash" ? ["bash", "--norc", "--noprofile", "-c"] : ["zsh", "-fc"];
+      const script = `export A="it's \\$x" B=; unset C
+eval "$OUT"; eval "$OUT"; printf '%s|' "$A" "$B" "$C"; echo
+eval "$_AGENTPASS_RESTORE"
+printf '%s|' "$A" "\${B-unset}" "\${C-unset}" "\${_AGENTPASS_RESTORE-gone}"; env | grep -c '^[AB]='
+set | grep -c '^__AGENTPASS_SAVED'`;
+      const r = spawnSync(bin[0]!, [...bin.slice(1), script], {
+        encoding: "utf-8",
+        env: { PATH: process.env.PATH, OUT: formatEnv({ A: "a", B: "b", C: "c" }, shell) },
+      });
+      expect(r.stdout).toBe(`a|b|c|\nit's $x||unset|gone|2\n0\n`);
+    });
   }
 
-  test("fish output escapes quotes and backslashes", () => {
+  test("fish output escapes quotes and backslashes and saves prior values", () => {
     expect(formatEnv({ A: "it's \\" }, "fish")).toBe(
-      "set -gx A 'it\\'s \\\\';\nset -g AGENTPASS_EXPORTED 'A';\n"
+      [
+        "if set -q _AGENTPASS_RESTORE; eval $_AGENTPASS_RESTORE; end;",
+        "set -q A; and set -g __AGENTPASS_SAVED_A $A;",
+        "set -gx A 'it\\'s \\\\';",
+        "set -g AGENTPASS_EXPORTED 'A';",
+        "set -g _AGENTPASS_RESTORE 'if set -q __AGENTPASS_SAVED_A; set -gx A $__AGENTPASS_SAVED_A; set -e __AGENTPASS_SAVED_A; else; set -e A; end; set -e AGENTPASS_EXPORTED; set -e _AGENTPASS_RESTORE;';",
+        "",
+      ].join("\n")
     );
   });
 });
@@ -247,6 +268,35 @@ env | grep -c '^STRIPE_SECRET_KEY=' || true`
         ].join("\n")
       );
       expect(r.calls).toBe(2);
+    });
+
+    test(`${shell}: restores the values a project overwrote, across project hops`, () => {
+      const p = "http://127.0.0.1:8888";
+      const r = runHook(
+        shell,
+        `export HTTPS_PROXY=http://corp:3128 OPENAI_API_KEY=sk-mine ANTHROPIC_API_KEY=
+unset NODE_EXTRA_CA_CERTS
+cd "${proj}"; TICK; show proj
+cd "${other}"; TICK; show other
+cd "${proj}/sub"; TICK; show back
+cd "${root}"; TICK; show out
+echo "\${NODE_EXTRA_CA_CERTS-unset}:\${ANTHROPIC_API_KEY+set}"
+env | grep -E '^(HTTPS_PROXY|OPENAI_API_KEY|ANTHROPIC_API_KEY)=' | sort`
+      );
+      expect(r.err).toBe("");
+      expect(r.out).toBe(
+        [
+          `proj:{{secret:openai-work}}::${p}`,
+          `other:sk-mine:{{secret:anthropic}}:${p}`,
+          `back:{{secret:openai-work}}::${p}`,
+          "out:sk-mine::http://corp:3128",
+          "unset:set",
+          "ANTHROPIC_API_KEY=",
+          "HTTPS_PROXY=http://corp:3128",
+          "OPENAI_API_KEY=sk-mine",
+          "",
+        ].join("\n")
+      );
     });
 
     test(`${shell}: an edited manifest waits for allow, and a bad one warns once`, () => {

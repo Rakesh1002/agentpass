@@ -105,13 +105,37 @@ function fishQuote(value: string): string {
 
 export function formatEnv(env: Record<string, string>, format: EnvFormat): string {
   if (format === "json") return JSON.stringify(env, null, 2) + "\n";
-  const names = Object.keys(env).join(" ");
+  const names = Object.keys(env);
+  // Each prior value is saved (an unset var stays unset) and _AGENTPASS_RESTORE puts it back; evaluating
+  // the output again restores first, so a second eval never saves agentpass's own values.
   if (format === "fish") {
-    const lines = Object.entries(env).map(([k, v]) => `set -gx ${k} ${fishQuote(v)};`);
-    return [...lines, `set -g AGENTPASS_EXPORTED ${fishQuote(names)};`].join("\n") + "\n";
+    const restore = names.map(
+      (k) =>
+        `if set -q __AGENTPASS_SAVED_${k}; set -gx ${k} $__AGENTPASS_SAVED_${k}; set -e __AGENTPASS_SAVED_${k}; else; set -e ${k}; end;`
+    );
+    return (
+      [
+        "if set -q _AGENTPASS_RESTORE; eval $_AGENTPASS_RESTORE; end;",
+        ...names.map((k) => `set -q ${k}; and set -g __AGENTPASS_SAVED_${k} $${k};`),
+        ...Object.entries(env).map(([k, v]) => `set -gx ${k} ${fishQuote(v)};`),
+        `set -g AGENTPASS_EXPORTED ${fishQuote(names.join(" "))};`,
+        `set -g _AGENTPASS_RESTORE ${fishQuote([...restore, "set -e AGENTPASS_EXPORTED; set -e _AGENTPASS_RESTORE;"].join(" "))};`,
+      ].join("\n") + "\n"
+    );
   }
-  const lines = Object.entries(env).map(([k, v]) => `export ${k}=${shQuote(v)};`);
-  return [...lines, `AGENTPASS_EXPORTED=${shQuote(names)};`].join("\n") + "\n";
+  const restore = names.map(
+    (k) =>
+      `if [[ -n \${__AGENTPASS_SAVED_${k}+x} ]]; then export ${k}="$__AGENTPASS_SAVED_${k}"; unset __AGENTPASS_SAVED_${k}; else unset ${k}; fi;`
+  );
+  return (
+    [
+      'eval "${_AGENTPASS_RESTORE-}";',
+      ...names.map((k) => `[[ -n \${${k}+x} ]] && __AGENTPASS_SAVED_${k}="$${k}";`),
+      ...Object.entries(env).map(([k, v]) => `export ${k}=${shQuote(v)};`),
+      `AGENTPASS_EXPORTED=${shQuote(names.join(" "))};`,
+      `_AGENTPASS_RESTORE=${shQuote([...restore, "unset AGENTPASS_EXPORTED _AGENTPASS_RESTORE;"].join(" "))};`,
+    ].join("\n") + "\n"
+  );
 }
 
 export function hookScript(shell: Shell, cmd: string[]): string {
@@ -147,10 +171,9 @@ export function hookScript(shell: Shell, cmd: string[]): string {
     end
     test "$key" = "$__agentpass_key"; and return
     set -g __agentpass_key $key
-    for v in (string split -n ' ' -- "$AGENTPASS_EXPORTED")
-        set -e $v
+    if set -q _AGENTPASS_RESTORE
+        eval $_AGENTPASS_RESTORE
     end
-    set -e AGENTPASS_EXPORTED
     if test -n "$m"
         ${run} env --hook --shell fish --dir (string replace -r '[^/]*$' '' -- $m) | source
     end
@@ -159,10 +182,9 @@ __agentpass_hook
 `;
   }
 
-  const split = shell === "zsh" ? "${=AGENTPASS_EXPORTED}" : "${AGENTPASS_EXPORTED-}";
   const inHome = home ? `[[ "$d/" == ${quote(prefix)}* ]]` : "false";
   const fn = `_agentpass_hook() {
-  local d="${shell === "zsh" ? "${PWD:A}" : "$(pwd -P)"}" m="" key="" out v
+  local d="${shell === "zsh" ? "${PWD:A}" : "$(pwd -P)"}" m="" key="" out
   if ${inHome}; then
     while :; do
       if [[ -f "$d/${MANIFEST_NAME}" ]]; then m="$d/${MANIFEST_NAME}"; break; fi
@@ -173,8 +195,7 @@ __agentpass_hook
   [[ -n "$m" ]] && key="$m $(command stat ${statFmt} "$m" ${watched} 2>/dev/null)"
   [[ "$key" == "\${_AGENTPASS_KEY-}" ]] && return 0
   _AGENTPASS_KEY="$key"
-  for v in ${split}; do unset "$v"; done
-  unset AGENTPASS_EXPORTED
+  eval "\${_AGENTPASS_RESTORE-}"
   [[ -z "$m" ]] && return 0
   out="$(${run} env --hook --shell ${shell} --dir "\${m%/*}/")" && eval "$out"
 }
