@@ -59,6 +59,14 @@ describe("vault", () => {
     expect(await reopened.get("stripe")).toBe("sk_live_legacy");
     expect(await reopened.getPins("stripe")).toEqual([{ host: "api.stripe.com" }]);
     reopened.close();
+
+    const db = new Database(vaultFile());
+    db.run(`UPDATE meta SET value = '3' WHERE key = 'version'`);
+    db.close();
+    const newer = new Vault();
+    await newer.init("correct-password");
+    newer.close();
+    expect(vaultSchema().version).toBe("3");
   });
 
   test("stores, preserves on rotation, replaces and clears pins", async () => {

@@ -68,7 +68,12 @@ export class Vault {
     if (!columns.some((c) => c.name === "pins")) {
       this.db.run(`ALTER TABLE secrets ADD COLUMN pins TEXT`);
     }
-    this.db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
+    this.db.run(`INSERT OR IGNORE INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
+    // never mark a newer vault as older
+    this.db.run(
+      `UPDATE meta SET value = ? WHERE key = 'version' AND CAST(value AS INTEGER) < ?`,
+      [SCHEMA_VERSION, Number(SCHEMA_VERSION)]
+    );
   }
 
   private async deriveKey(password: string): Promise<CryptoKey> {

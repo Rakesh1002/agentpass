@@ -988,7 +988,11 @@ function sendUpstream(
         headers: opts.headers,
         rejectUnauthorized: opts.rejectUnauthorized,
       },
-      (res) => resolve({ status: res.statusCode ?? 502, headers: res.headers, body: res })
+      (res) => {
+        // consumers add their own handler; this keeps a reset on a discarded failover body from crashing
+        res.on("error", () => {});
+        resolve({ status: res.statusCode ?? 502, headers: res.headers, body: res });
+      }
     );
     req.on("error", (err) => resolve({ error: err.message }));
     if (opts.body.length > 0) req.write(opts.body);
