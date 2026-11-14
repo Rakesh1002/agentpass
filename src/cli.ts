@@ -156,7 +156,7 @@ Commands:
   unlink <VAR>          Remove a mapping from .agentpass.json
   allow [dir]           Trust this .agentpass.json as it is now (any edit needs a new allow)
   deny [dir]            Revoke trust in this .agentpass.json
-  project              Show the resolved mapping (-p to check the vault)
+  project               Show the resolved mapping (-p to check the vault)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
   status                Show vault and proxy status
