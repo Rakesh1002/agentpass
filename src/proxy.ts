@@ -7,7 +7,7 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict, isLoopbackHost, type Pin } from "./egress";
+import { egressVerdict, isLoopbackHost, pinHostMatches, type Pin, type Scheme } from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -145,7 +145,8 @@ export class ProxyServer {
     const url = new URL(targetUrl);
     const isHttps = url.protocol === "https:";
     const client = isHttps ? https : http;
-    const destination = `${url.hostname}:${url.port || (isHttps ? 443 : 80)}`;
+    const port = Number(url.port) || (isHttps ? 443 : 80);
+    const destination = `${url.hostname}:${port}`;
 
     const names = placeholderNames(req.headers);
     // a secret in cleartext is readable by anyone on the path, whatever its pins say
@@ -163,7 +164,7 @@ export class ProxyServer {
       return;
     }
 
-    const egress = await this.enforceEgress(req, res, url.hostname, url.pathname, destination, started);
+    const egress = await this.enforceEgress(req, res, url.hostname, port, isHttps ? "https" : "http", url.pathname, started);
     if (!egress) return;
     const { wildcard } = egress;
 
@@ -188,7 +189,7 @@ export class ProxyServer {
     const proxyReq = client.request(
       {
         hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
+        port,
         path: url.pathname + url.search,
         method: req.method,
         headers: substitution.headers,
@@ -231,18 +232,20 @@ export class ProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     host: string,
+    port: number,
+    scheme: Scheme,
     path: string,
-    destination: string,
     started: number
   ): Promise<{ resolve: (name: string) => Promise<string | null>; wildcard: string[] } | null> {
     const method = req.method || "GET";
+    const destination = `${host}:${port}`;
     const names = placeholderNames(req.headers);
     const allowed = new Set<string>();
     const wildcard: string[] = [];
 
     for (const name of names) {
       if (!(await vault.has(name))) continue;
-      const verdict = egressVerdict(name, await vault.getPins(name), host, method, path);
+      const verdict = egressVerdict(name, await vault.getPins(name), destination, method, path, scheme);
       if (verdict === "wildcard") wildcard.push(name);
       if (verdict !== "deny") {
         allowed.add(name);
@@ -514,9 +517,12 @@ export class ProxyServer {
       return null;
     }
 
+    const upstreamPort =
+      provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
+    const authority = `${provider.upstream.host}:${upstreamPort}`;
     const poolNames = pool.map((key) => key.name);
     pool = pool.filter(
-      (key) => egressVerdict(key.name, key.pins, provider.upstream.host, method, upstreamPath) !== "deny"
+      (key) => egressVerdict(key.name, key.pins, authority, method, upstreamPath, provider.upstream.protocol) !== "deny"
     );
     if (pool.length === 0) {
       appendAudit({
@@ -539,8 +545,6 @@ export class ProxyServer {
     }
 
     const client = provider.upstream.protocol === "https" ? https : http;
-    const upstreamPort =
-      provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
 
     let lastStatus = 502;
 
@@ -650,7 +654,7 @@ export class ProxyServer {
     try {
       if (head.length > 0) clientSocket.unshift(head);
 
-      if (!(await this.shouldIntercept(hostname))) {
+      if (!(await this.shouldIntercept(hostname, port))) {
         this.tunnel(clientSocket, hostname, port, started);
         return;
       }
@@ -662,7 +666,7 @@ export class ProxyServer {
       const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
         const startedReq = Date.now();
         try {
-          const egress = await this.enforceEgress(req, res, hostname, req.url || "/", `${hostname}:${port}`, startedReq);
+          const egress = await this.enforceEgress(req, res, hostname, port, "https", req.url || "/", startedReq);
           if (!egress) return;
           const { wildcard } = egress;
 
@@ -810,10 +814,10 @@ export class ProxyServer {
     }
   }
 
-  private async shouldIntercept(hostname: string): Promise<boolean> {
+  private async shouldIntercept(hostname: string, port: number): Promise<boolean> {
     try {
       const hosts = await vault.pinnedHosts();
-      return hosts.has("*") || hosts.has(hostname.toLowerCase());
+      return [...hosts].some((pinHost) => pinHostMatches(pinHost, hostname.toLowerCase(), port, 443));
     } catch {
       // locked vault: nothing can be substituted, so there is no reason to break TLS
       return false;

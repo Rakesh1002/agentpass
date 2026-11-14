@@ -159,8 +159,8 @@ describe("audit log", () => {
 describe("HTTPS proxy", () => {
   test("substitutes credential placeholders for direct proxy requests", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("openai", "sk-test", "api_key", [{ host: "127.0.0.1" }]);
     const target = await startTarget();
+    await sharedVault.add("openai", "sk-test", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port);
@@ -176,8 +176,8 @@ describe("HTTPS proxy", () => {
 
   test("substitutes credential placeholders over HTTPS CONNECT tunnels", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("openai", "sk-test", "api_key", [{ host: "localhost" }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("openai", "sk-test", "api_key", [{ host: `localhost:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
@@ -208,7 +208,7 @@ describe("HTTPS proxy", () => {
     expect(tunneled).toContain("200 OK");
     expect(target.requests[0]?.authorization).toBe("Bearer {{secret:openai}}");
 
-    await sharedVault.setPins("openai", [{ host: "localhost" }]);
+    await sharedVault.setPins("openai", [{ host: `localhost:${target.port}` }]);
     const intercepted = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca);
     expect(intercepted).toContain("200 OK");
     expect(target.requests[1]?.authorization).toBe("Bearer sk-test");
@@ -217,9 +217,9 @@ describe("HTTPS proxy", () => {
     await target.close();
   });
 
-  test("intercepts every CONNECT host when a wildcard pin exists", async () => {
+  test("intercepts every CONNECT host and port when a *:* pin exists", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*" }]);
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*:*" }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
     const proxy = await startProxy();
 
@@ -256,10 +256,56 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("a pin without a port never releases the secret to another local port", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("loop", "sk-loop-never-leaks", "api_key", [{ host: "localhost" }]);
+    const target = await startTarget();
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:loop}}",
+      origin: `http://localhost:${target.port}`,
+      path: "/steal",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toEqual({ error: "egress_blocked", secret: "loop", host: "localhost" });
+    expect(target.requests).toHaveLength(0);
+
+    await sharedVault.setPins("loop", [{ host: `localhost:${target.port}` }]);
+    const pinned = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:loop}}",
+      origin: `http://localhost:${target.port}`,
+    });
+    expect(pinned.status).toBe(200);
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-loop-never-leaks");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("a CONNECT to an unpinned port of a pinned host is tunneled, never substituted", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("loop", "sk-loop-never-leaks", "api_key", [{ host: "localhost" }]);
+    const target = await startTarget(certificateAuthority.getHostCertificate("agentpass-target.test"));
+    const proxy = await startProxy();
+
+    const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:loop}}",
+      servername: "agentpass-target.test",
+    });
+
+    expect(response).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer {{secret:loop}}");
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("enforces pinned methods and path prefixes", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1", methods: ["POST"], pathPrefix: "/v1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}`, methods: ["POST"], pathPrefix: "/v1" }]);
     const proxy = await startProxy();
     const auth = "Bearer {{secret:svc}}";
 
@@ -276,8 +322,8 @@ describe("egress lock", () => {
 
   test("blocks encoded path separators under a path pin", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1", pathPrefix: "/v1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}`, pathPrefix: "/v1" }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
@@ -316,7 +362,7 @@ describe("egress lock", () => {
 
   test("allows any host with an explicit wildcard pin and records it in the audit", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*" }]);
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*:*" }]);
     const target = await startTarget();
     const proxy = await startProxy();
 
@@ -350,8 +396,8 @@ describe("egress lock", () => {
 
   test("allows substitution over cleartext HTTP to a loopback host", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1" }]);
     const target = await startTarget();
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
     const proxy = await startProxy();
 
     const response = await requestThroughDirectProxy(proxy.getPort(), target.port, { auth: "Bearer {{secret:svc}}" });
@@ -365,8 +411,8 @@ describe("egress lock", () => {
 
   test("blocks placeholders inside CONNECT tunnels when pins do not match", async () => {
     await sharedVault.init("correct-password");
-    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "localhost", methods: ["POST"] }]);
     const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: `localhost:${target.port}`, methods: ["POST"] }]);
     const proxy = await startProxy();
 
     const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {

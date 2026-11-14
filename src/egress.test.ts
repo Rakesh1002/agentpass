@@ -69,13 +69,65 @@ describe("egress pins", () => {
     expect(egressVerdict("stripe", pins, "anything.example", "GET", "/")).toBe("wildcard");
   });
 
+  test("a pin without a port matches only the scheme's default port", () => {
+    const pins = [{ host: "localhost" }];
+    expect(egressVerdict("loop", pins, "localhost", "GET", "/")).toBe("allow");
+    expect(egressVerdict("loop", pins, "localhost:443", "GET", "/")).toBe("allow");
+    expect(egressVerdict("loop", pins, "localhost:80", "GET", "/", "http")).toBe("allow");
+    expect(egressVerdict("loop", pins, "localhost:19999", "GET", "/steal", "http")).toBe("deny");
+    expect(egressVerdict("loop", pins, "localhost:19999", "GET", "/steal")).toBe("deny");
+    expect(egressVerdict("loop", pins, "localhost:443", "GET", "/", "http")).toBe("deny");
+    expect(egressVerdict("loop", pins, "localhost:80", "GET", "/")).toBe("deny");
+  });
+
+  test("a pin with an explicit port matches only that port", () => {
+    const pins = validatePins([{ host: "127.0.0.1:8080" }, { host: "[::1]:18443" }]);
+    expect(egressVerdict("svc", pins, "127.0.0.1:8080", "GET", "/", "http")).toBe("allow");
+    expect(egressVerdict("svc", pins, "127.0.0.1:8081", "GET", "/", "http")).toBe("deny");
+    expect(egressVerdict("svc", pins, "127.0.0.1", "GET", "/")).toBe("deny");
+    expect(egressVerdict("svc", pins, "[::1]:18443", "GET", "/")).toBe("allow");
+    expect(egressVerdict("svc", pins, "[0:0::1]:18443", "GET", "/")).toBe("allow");
+    expect(egressVerdict("svc", pins, "[::1]:443", "GET", "/")).toBe("deny");
+  });
+
+  test("implicit provider pins allow port 443 only", () => {
+    expect(egressVerdict("openai", null, "api.openai.com", "POST", "/v1")).toBe("allow");
+    expect(egressVerdict("openai", null, "api.openai.com:443", "POST", "/v1")).toBe("allow");
+    expect(egressVerdict("openai", null, "api.openai.com:8443", "POST", "/v1")).toBe("deny");
+    expect(egressVerdict("openai", null, "api.openai.com:80", "POST", "/v1", "http")).toBe("deny");
+  });
+
+  test("a wildcard host matches default ports only unless written *:*", () => {
+    expect(egressVerdict("svc", [{ host: "*" }], "a.example", "GET", "/")).toBe("wildcard");
+    expect(egressVerdict("svc", [{ host: "*" }], "a.example:80", "GET", "/", "http")).toBe("wildcard");
+    expect(egressVerdict("svc", [{ host: "*" }], "a.example:8443", "GET", "/")).toBe("deny");
+    expect(egressVerdict("svc", [{ host: "*:*" }], "a.example:8443", "GET", "/")).toBe("wildcard");
+    expect(egressVerdict("svc", [{ host: "*:8443" }], "a.example:8443", "GET", "/")).toBe("wildcard");
+    expect(egressVerdict("svc", [{ host: "*:8443" }], "a.example", "GET", "/")).toBe("deny");
+  });
+
+  test("validates and normalizes pin ports and IPv6 literals", () => {
+    expect(validatePins([{ host: "LOCALHOST:08080" }, { host: "[0:0:0:0:0:0:0:1]" }, { host: "*:*" }])).toEqual([
+      { host: "localhost:8080" },
+      { host: "[::1]" },
+      { host: "*:*" },
+    ]);
+    expect(validatePins([{ host: "[::1]:18443" }, { host: "api.stripe.com:443" }])).toEqual([
+      { host: "[::1]:18443" },
+      { host: "api.stripe.com:443" },
+    ]);
+    for (const host of ["localhost:0", "localhost:65536", "localhost:", "localhost:*", "a.com:80:80", "*:x", "::1", "[::1", "[zz]:1", "[::1]x"]) {
+      expect(() => validatePins([{ host }])).toThrow("Invalid pin host");
+    }
+  });
+
   test("validates and normalizes pins", () => {
     expect(validatePins([{ host: " API.Stripe.com ", methods: ["get"], pathPrefix: "/v1" }])).toEqual([
       { host: "api.stripe.com", methods: ["GET"], pathPrefix: "/v1" },
     ]);
     expect(() => validatePins([{ host: "https://api.stripe.com" }])).toThrow();
     expect(() => validatePins([{ host: "*.stripe.com" }])).toThrow();
-    expect(() => validatePins([{ host: "api.stripe.com:443" }])).toThrow();
+    expect(() => validatePins([{ host: "user@api.stripe.com" }])).toThrow();
     expect(() => validatePins([{ host: "" }])).toThrow();
     expect(() => validatePins([{ host: "a.com", methods: ["GET POST"] }])).toThrow();
     expect(() => validatePins([{ host: "a.com", methods: [] }])).toThrow();
