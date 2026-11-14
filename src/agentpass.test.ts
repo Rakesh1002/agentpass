@@ -12,6 +12,7 @@ import { appendAudit, listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { agentPassDir, caCertFile, saltFile, vaultFile } from "./paths";
 import { ProxyServer, substitutePlaceholders } from "./proxy";
+import { makePlaceholder } from "./placeholder";
 
 let testHome: string;
 
@@ -441,6 +442,71 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("format-preserving placeholders get the same pin, scheme, wildcard and missing checks", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget();
+    await sharedVault.add("svc", "sk-real-svc", "api_key", [{ host: `127.0.0.1:${target.port}` }]);
+    await sharedVault.add("stripe", "sk_live_never_leaks", "api_key", [{ host: "api.stripe.com" }, { host: "api.stripe.test" }]);
+    await sharedVault.add("any", "sk-any", "api_key", [{ host: "*:*" }]);
+    const proxy = await startProxy();
+    const port = proxy.getPort();
+
+    const ok = await requestThroughDirectProxy(port, target.port, {
+      auth: `Bearer ${makePlaceholder("svc", "sk-proj-")}`,
+      headers: { "x-api-key": makePlaceholder("svc", "sk-ant-api03-"), "api-key": makePlaceholder("svc") },
+    });
+    expect(ok.status).toBe(200);
+    expect(target.requests[0]).toMatchObject({ authorization: "Bearer sk-real-svc", "x-api-key": "sk-real-svc", "api-key": "sk-real-svc" });
+
+    const pinned = await requestThroughDirectProxy(port, target.port, { auth: `token ${makePlaceholder("stripe", "sk_live_")}` });
+    expect(pinned.status).toBe(403);
+    expect(JSON.parse(pinned.body)).toEqual({ error: "egress_blocked", secret: "stripe", host: "127.0.0.1" });
+
+    const cleartext = await requestThroughDirectProxy(port, 0, {
+      auth: `Basic ${makePlaceholder("stripe", "sk_live_")}`,
+      origin: "http://api.stripe.test",
+    });
+    expect(cleartext.status).toBe(403);
+    expect(JSON.parse(cleartext.body).error).toBe("insecure_scheme");
+
+    const wildcard = await requestThroughDirectProxy(port, target.port, { auth: `Bearer ${makePlaceholder("any", "ghp_")}` });
+    expect(wildcard.status).toBe(200);
+    expect(listAudit(1)[0]).toMatchObject({ secretNames: ["any"], wildcard: ["any"] });
+
+    const missing = await requestThroughDirectProxy(port, target.port, { auth: `Bearer ${makePlaceholder("nope", "sk-")}` });
+    expect(missing.status).toBe(400);
+    expect(missing.body).toBe("Missing secret: nope");
+    const garbled = await requestThroughDirectProxy(port, target.port, { auth: "Bearer sk-AGENTPASSv1xffx" });
+    expect(garbled.status).toBe(400);
+    expect(target.requests).toHaveLength(2);
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk_live_never_leaks");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("format-preserving placeholders are substituted and pin-checked inside CONNECT tunnels", async () => {
+    await sharedVault.init("correct-password");
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    await sharedVault.add("gh", "ghp_real", "api_key", [{ host: `localhost:${target.port}`, methods: ["GET"] }]);
+    const proxy = await startProxy();
+    const ca = readFileSync(caCertFile());
+
+    const ok = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, { auth: `token ${makePlaceholder("gh", "ghp_")}` });
+    expect(ok).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("token ghp_real");
+
+    const blocked = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+      auth: `token ${makePlaceholder("gh", "ghp_")}`,
+      method: "POST",
+    });
+    expect(blocked).toContain('"error":"egress_blocked"');
+    expect(target.requests).toHaveLength(1);
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("refuses forward and CONNECT requests aimed back at the proxy itself", async () => {
     await sharedVault.init("correct-password");
     await sharedVault.add("svc", "sk-svc-no-loop", "api_key", [{ host: "*:*" }]);
@@ -576,6 +642,7 @@ interface ProxiedRequest {
   origin?: string;
   authority?: string;
   ip?: string;
+  headers?: Record<string, string>;
 }
 
 // Built by hand from the v1 schema so the test does not depend on the current Vault code.
@@ -641,6 +708,7 @@ async function requestThroughDirectProxy(
     path = "/models",
     auth = "Bearer {{secret:openai}}",
     origin = `http://127.0.0.1:${targetPort}`,
+    headers = {},
   }: ProxiedRequest = {}
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -653,6 +721,7 @@ async function requestThroughDirectProxy(
         headers: {
           authorization: auth,
           connection: "close",
+          ...headers,
         },
       },
       (res) => {

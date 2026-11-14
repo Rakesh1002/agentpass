@@ -4,6 +4,7 @@ import https from "https";
 import { ProxyServer } from "./proxy";
 import { vault } from "./vault";
 import { listAudit } from "./audit";
+import { makePlaceholder } from "./placeholder";
 import { rmSync, existsSync } from "fs";
 import { resolve } from "path";
 
@@ -346,6 +347,11 @@ describe("ProxyServer (provider-routed)", () => {
     });
     expect(JSON.parse(viaApiKey.body).xkey).toBe("sk-ant-clienta");
 
+    const formatPreserving = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
+      headers: { "x-api-key": makePlaceholder("anthropic-clienta", "sk-ant-api03-") },
+    });
+    expect(JSON.parse(formatPreserving.body).xkey).toBe("sk-ant-clienta");
+
     await proxy.stop();
   });
 
@@ -366,6 +372,12 @@ describe("ProxyServer (provider-routed)", () => {
     const toAnthropic = await get(`${base}/anthropic/v1/messages`, { headers: { "x-api-key": "{{secret:openai-2}}" } });
     expect(toAnthropic.status).toBe(403);
     expect(JSON.parse(toAnthropic.body).secret).toBe("openai-2");
+
+    const formatPreserving = await get(`${base}/openai/v1/models`, {
+      headers: { authorization: `Bearer ${makePlaceholder("anthropic", "sk-ant-api03-")}` },
+    });
+    expect(formatPreserving.status).toBe(403);
+    expect(JSON.parse(formatPreserving.body).secret).toBe("anthropic");
     expect(upstreamHits).toHaveLength(0);
 
     await proxy.stop();

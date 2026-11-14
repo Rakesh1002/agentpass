@@ -6,6 +6,7 @@ import { certificateAuthority } from "./ca";
 import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
+import { findPlaceholders, replacePlaceholders } from "./placeholder";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
 import {
   egressVerdict,
@@ -64,7 +65,6 @@ interface SubstitutionResult {
 }
 
 const SCANNED_HEADERS = new Set(["authorization", "x-api-key", "api-key"]);
-const PLACEHOLDER_RE = /\{\{secret:([A-Za-z0-9_.-]+)\}\}/g;
 
 export class ProxyServer {
   private server: http.Server | null = null;
@@ -978,32 +978,6 @@ export class ProxyServer {
 
 export const proxy = new ProxyServer();
 
-async function replacePlaceholders(
-  value: string,
-  resolver: (name: string) => Promise<string | null>
-): Promise<{ value: string; found: string[]; missing: string[] }> {
-  const found: string[] = [];
-  const missing: string[] = [];
-  let output = value;
-  const matches = [...value.matchAll(PLACEHOLDER_RE)];
-
-  for (const match of matches) {
-    const placeholder = match[0];
-    const name = match[1];
-    if (!name) continue;
-
-    found.push(name);
-    const secret = await resolver(name);
-    if (!secret) {
-      missing.push(name);
-      continue;
-    }
-    output = output.split(placeholder).join(secret);
-  }
-
-  return { value: output, found, missing };
-}
-
 // RFC 9112 3.2.2: a server routes on an absolute-form authority, so inside a tunnel it must be the tunnel's own
 function originFormTarget(target: string, host: string, port: number): string | null {
   if (target.startsWith("/") || target === "*") return target;
@@ -1032,9 +1006,7 @@ function placeholderNames(headers: http.IncomingHttpHeaders): string[] {
   const names = new Set<string>();
   for (const [headerName, headerValue] of Object.entries(headers)) {
     if (!SCANNED_HEADERS.has(headerName.toLowerCase()) || typeof headerValue !== "string") continue;
-    for (const match of headerValue.matchAll(PLACEHOLDER_RE)) {
-      if (match[1]) names.add(match[1]);
-    }
+    for (const { name } of findPlaceholders(headerValue)) names.add(name);
   }
   return [...names];
 }
