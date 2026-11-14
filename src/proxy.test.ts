@@ -69,6 +69,8 @@ beforeAll(async () => {
   await vault.add("openai", "sk-key-A", "api_key");
   await vault.add("openai-2", "sk-key-B", "api_key");
   await vault.add("anthropic", "sk-ant-X", "api_key");
+  await vault.add("anthropic-clienta", "sk-ant-clienta", "api_key");
+  await vault.add("groq", "gsk-post-only", "api_key", [{ host: "api.groq.com", methods: ["POST"] }]);
 });
 
 afterAll(async () => {
@@ -180,6 +182,52 @@ describe("ProxyServer (provider-routed)", () => {
 
     const res = await get(`http://127.0.0.1:18806/unknown/foo`);
     expect(res.status).toBe(404);
+
+    await proxy.stop();
+  });
+
+  test("uses the pool named by a provider placeholder and strips client auth", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 18808 });
+    await proxy.start();
+
+    const viaBearer = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
+      headers: { authorization: "Bearer {{secret:anthropic-clienta}}" },
+    });
+    expect(JSON.parse(viaBearer.body)).toEqual({ ok: true, xkey: "sk-ant-clienta" });
+
+    const viaApiKey = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
+      headers: { "x-api-key": "{{secret:anthropic-clienta}}" },
+    });
+    expect(JSON.parse(viaApiKey.body).xkey).toBe("sk-ant-clienta");
+
+    const otherProvider = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
+      headers: { "x-api-key": "{{secret:openai-2}}" },
+    });
+    expect(JSON.parse(otherProvider.body).xkey).toBe("sk-ant-X");
+
+    await proxy.stop();
+  });
+
+  test("skips pool keys whose pins reject the request", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 18809 });
+    await proxy.start();
+
+    const blocked = await get(`http://127.0.0.1:18809/groq/v1/models`);
+    expect(blocked.status).toBe(403);
+    expect(JSON.parse(blocked.body)).toEqual({ error: "egress_blocked", secret: "groq", host: "api.groq.com" });
+    expect(upstreamHits).toHaveLength(0);
+
+    const allowed = await get(`http://127.0.0.1:18809/groq/v1/chat/completions`, { method: "POST" });
+    expect(allowed.status).toBe(200);
+    expect(JSON.parse(allowed.body).auth).toBe("Bearer gsk-post-only");
 
     await proxy.stop();
   });

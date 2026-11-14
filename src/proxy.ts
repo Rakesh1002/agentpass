@@ -7,7 +7,7 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict } from "./egress";
+import { egressVerdict, type Pin } from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -464,9 +464,10 @@ export class ProxyServer {
   ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer } | null> {
     const destination = `${provider.upstream.host}${upstreamPath}`;
 
-    let pool: { name: string; value: string }[];
+    const method = req.method || "GET";
+    let pool: { name: string; value: string; pins: Pin[] | null }[];
     try {
-      pool = await vault.getPool(provider.name);
+      pool = await vault.getPool(placeholderPool(req.headers, provider.name));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[AgentPass] Vault unavailable for ${provider.name}: ${message}`);
@@ -485,6 +486,30 @@ export class ProxyServer {
         escalated,
       });
       return null;
+    }
+
+    const poolNames = pool.map((key) => key.name);
+    pool = pool.filter(
+      (key) => egressVerdict(key.name, key.pins, provider.upstream.host, method, upstreamPath) !== "deny"
+    );
+    if (pool.length === 0) {
+      appendAudit({
+        method,
+        destination,
+        secretNames: poolNames,
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "egress_blocked",
+        routedTier,
+        escalated,
+      });
+      return {
+        status: 403,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(
+          JSON.stringify({ error: "egress_blocked", secret: poolNames[0], host: provider.upstream.host })
+        ),
+      };
     }
 
     const client = provider.upstream.protocol === "https" ? https : http;
@@ -865,6 +890,11 @@ function placeholderNames(headers: http.IncomingHttpHeaders): string[] {
   return [...names];
 }
 
+// A placeholder naming one of this provider's keys (e.g. anthropic-clienta) selects that key's pool.
+function placeholderPool(headers: http.IncomingHttpHeaders, provider: string): string {
+  return placeholderNames(headers).find((name) => name === provider || name.startsWith(`${provider}-`)) ?? provider;
+}
+
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -882,6 +912,8 @@ function sanitizeRequestHeaders(
   for (const [key, value] of Object.entries(headers)) {
     if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
     if (key.toLowerCase() === "host") continue;
+    // client credentials, real or placeholder, never reach the provider; applyAuth sets the pool key
+    if (SCANNED_HEADERS.has(key.toLowerCase())) continue;
     if (value !== undefined) out[key] = value as string | string[];
   }
   out["host"] = upstreamHost;
