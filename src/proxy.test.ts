@@ -3,6 +3,7 @@ import http from "http";
 import https from "https";
 import { ProxyServer } from "./proxy";
 import { vault } from "./vault";
+import { listAudit } from "./audit";
 import { rmSync, existsSync } from "fs";
 import { resolve } from "path";
 
@@ -89,6 +90,7 @@ beforeAll(async () => {
   await vault.add("anthropic", "sk-ant-X", "api_key");
   await vault.add("anthropic-clienta", "sk-ant-clienta", "api_key");
   await vault.add("groq", "gsk-post-only", "api_key", [{ host: "api.groq.com", methods: ["POST"] }]);
+  await vault.add("openrouter", "sk-or-anywhere", "api_key", [{ host: "*" }]);
 });
 
 afterAll(async () => {
@@ -368,6 +370,25 @@ describe("ProxyServer (provider-routed)", () => {
     const allowed = await get(`http://127.0.0.1:18809/groq/v1/chat/completions`, { method: "POST" });
     expect(allowed.status).toBe(200);
     expect(JSON.parse(allowed.body).auth).toBe("Bearer gsk-post-only");
+
+    await proxy.stop();
+  });
+
+  test("records a wildcard-pinned pool key in the audit", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+
+    const res = await get(`http://127.0.0.1:${proxy.getPort()}/openrouter/api/v1/models`);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).auth).toBe("Bearer sk-or-anywhere");
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 200, secretNames: ["openrouter"], wildcard: ["openrouter"] });
+
+    await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+    expect(listAudit(1)[0]?.wildcard).toBeUndefined();
 
     await proxy.stop();
   });

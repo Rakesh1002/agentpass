@@ -544,9 +544,13 @@ export class ProxyServer {
       provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
     const authority = `${provider.upstream.host}:${upstreamPort}`;
     const poolNames = pool.map((key) => key.name);
-    pool = pool.filter(
-      (key) => egressVerdict(key.name, key.pins, authority, method, upstreamPath, provider.upstream.protocol) !== "deny"
-    );
+    const wildcardNames = new Set<string>();
+    pool = pool.filter((key) => {
+      const verdict = egressVerdict(key.name, key.pins, authority, method, upstreamPath, provider.upstream.protocol);
+      if (verdict === "wildcard") wildcardNames.add(key.name);
+      return verdict !== "deny";
+    });
+    const wildcardOf = (names: string[]) => names.filter((name) => wildcardNames.has(name));
     if (pool.length === 0) {
       appendAudit({
         method,
@@ -597,6 +601,7 @@ export class ProxyServer {
           error: result.error,
           routedTier,
           escalated,
+          wildcard: wildcardOf([name]),
         });
         lastStatus = 502;
         continue;
@@ -610,6 +615,7 @@ export class ProxyServer {
         durationMs: Date.now() - started,
         routedTier,
         escalated,
+        wildcard: wildcardOf([name]),
       });
 
       lastStatus = result.status;
@@ -643,6 +649,7 @@ export class ProxyServer {
       error,
       routedTier,
       escalated,
+      wildcard: wildcardOf(pool.map((key) => key.name)),
     });
 
     if (cooling) {
