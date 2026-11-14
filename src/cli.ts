@@ -146,11 +146,12 @@ Commands:
   unlock-mode keychain|passphrase
                         Re-encrypt the vault for the other unlock mode (backs up first)
   add <name>            Add a secret
-      --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name)
+      --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name;
+                          host forms below)
       --path <prefix>     Only for paths under this prefix
       --method GET,POST   Only for these methods
   pins <name>           Show a secret's pins
-      --set <h>[,<h>]     Replace pins (with --path / --method)
+      --set <h>[,<h>]     Replace pins (with --path / --method; host forms below)
       --clear             Remove explicit pins
   list                  List all secrets
   get <name>            Get a secret value
@@ -176,6 +177,14 @@ Commands:
   routing show          Display current routing config
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
+
+Pin hosts (--host, --set):
+  api.example.com       that host on the default port (443 for https, 80 for http)
+  host:port             that host on that port only, e.g. localhost:8080
+  [::1]:port            an IPv6 address, bracketed, with or without :port
+  *                     any host, default port only
+  *:N                   any host on port N
+  *:*                   any host on any port
 
 Passphrase-mode vaults read AGENTPASS_PASSWORD, or prompt on a TTY.
 
@@ -729,8 +738,9 @@ async function handleAudit(args: string[]) {
     const secrets = row.secretNames.length > 0 ? row.secretNames.join(",") : "-";
     const error = row.error ? ` error="${row.error}"` : "";
     const wildcard = row.wildcard ? ` wildcard=${row.wildcard.join(",")}` : "";
+    const session = row.sessionTag ? ` session=${row.sessionTag}` : "";
     console.log(
-      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}${wildcard}`
+      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}${wildcard}${session}`
     );
   }
 }

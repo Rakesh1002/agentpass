@@ -4,6 +4,7 @@ import http from "http";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
+import { appendAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { freePort, selfProxyEnv } from "./testing";
 import { Vault } from "./vault";
@@ -108,6 +109,24 @@ describe("cli", () => {
     expect(r.code).toBe(1);
     expect(r.out).toBe("");
     expect(r.err).toContain("invalid JSON");
+  });
+
+  test("audit shows the session tag after the wildcard marker", () => {
+    process.env.AGENTPASS_HOME = home;
+    try {
+      appendAudit({ method: "GET", destination: "tagged.example:443", secretNames: ["svc"], statusCode: 200, durationMs: 3, wildcard: ["svc"], sessionTag: "agent-7" });
+      appendAudit({ method: "GET", destination: "untagged.example:443", secretNames: [], statusCode: 200, durationMs: 1 });
+    } finally {
+      delete process.env.AGENTPASS_HOME;
+    }
+    const lines = cli(["audit"]).out.split("\n");
+    expect(lines.find((line) => line.includes(" tagged.example"))).toEndWith(" wildcard=svc session=agent-7");
+    expect(lines.find((line) => line.includes(" untagged.example"))).not.toContain("session=");
+  });
+
+  test("help documents every pin host form", () => {
+    const help = cli(["help"]).out;
+    for (const form of ["host:port", "[::1]:port", "*:*", "*:N", "default port"]) expect(help).toContain(form);
   });
 
   test("run uses a reachable proxy without the vault and passes the exit code", async () => {
