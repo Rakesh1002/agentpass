@@ -228,3 +228,62 @@ describe("scan locations", () => {
     });
   });
 });
+
+describe("scan command", () => {
+  const cli = join(import.meta.dir, "cli.ts");
+
+  function run(...args: string[]) {
+    const r = Bun.spawnSync(["bun", "run", cli, "scan", ...args], {
+      env: { ...process.env, HOME: home, AGENTPASS_HOME: join(home, ".agentpass") },
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+  }
+
+  test("exits 0 with nothing found", () => {
+    put(join(root, "clean/.git/HEAD"), "");
+    put(join(root, "clean/.env"), "PORT=3000\nAPI_KEY={{secret:openai}}\n");
+    const r = run("--root", root);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("No plaintext secrets found");
+    const j = run("--json");
+    expect(j.code).toBe(0);
+    expect(JSON.parse(j.out)).toEqual({ findings: [], secrets: 0, files: 0 });
+  });
+
+  test("reports grouped, masked findings and never prints raw values", () => {
+    const repo = join(root, "app");
+    mkdirSync(repo);
+    git(repo, "init", "-q");
+    put(join(repo, ".env"), `OPENAI_API_KEY=${T.openaiProj}\nDB_PASSWORD=${T.generic}\n`);
+    git(repo, "add", "-f", ".env");
+    git(repo, "commit", "-qm", "oops");
+    put(join(home, ".zshrc"), `export ANTHROPIC_API_KEY=${T.anthropic}\n`);
+    put(join(home, ".claude.json"), JSON.stringify({ mcpServers: { gh: { env: { GITHUB_TOKEN: T.github } } } }));
+    const other = join(home, "other");
+    put(join(other, ".env"), `GROQ_API_KEY=${T.groq}\n`);
+
+    const human = run("--root", root, "--root", other);
+    expect(human.code).toBe(1);
+    expect(human.out).toContain("Found 5 plaintext secrets in 4 files that your AI agents can read.");
+    expect(human.out).toContain("sk-p…Ya");
+    const order = ["tracked in git", "agent config", "shell rc", "untracked .env"].map((label) => human.out.indexOf(label));
+    expect(order.every((i, n) => i >= 0 && (n === 0 || i > order[n - 1]!))).toBe(true);
+
+    const json = run("--json", "--root", root, "--root", other);
+    expect(json.code).toBe(1);
+    const parsed = JSON.parse(json.out);
+    expect(parsed.secrets).toBe(5);
+    expect(parsed.files).toBe(4);
+    expect(parsed.findings[0]).toMatchObject({ severity: "tracked", tracked: true });
+
+    for (const r of [human, json]) {
+      for (const raw of [...Object.values(T), BODY.slice(2, 14)]) {
+        expect(r.out).not.toContain(raw);
+        expect(r.err).not.toContain(raw);
+      }
+    }
+  });
+});
