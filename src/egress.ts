@@ -87,7 +87,7 @@ export function parseStoredPins(raw: string | null): Pin[] | null {
   }
 }
 
-function providerForSecret(name: string) {
+export function providerForSecret(name: string) {
   return PROVIDERS.find((p) => name === p.name || name.startsWith(`${p.name}-`));
 }
 

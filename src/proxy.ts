@@ -13,6 +13,7 @@ import {
   isLoopbackHost,
   parseAuthority,
   pinHostMatches,
+  providerForSecret,
   unbracket,
   type Pin,
   type Scheme,
@@ -301,6 +302,25 @@ export class ProxyServer {
   ): Promise<void> {
     const started = Date.now();
     const body = await readBody(req);
+
+    // the route picks the provider pool, so a placeholder naming another provider's key cannot be honored
+    const foreign = placeholderNames(req.headers).find((name) => {
+      const owner = providerForSecret(name);
+      return owner !== undefined && owner.name !== provider.name;
+    });
+    if (foreign) {
+      appendAudit({
+        method: req.method || "GET",
+        destination: `${provider.upstream.host}${upstreamPath}`,
+        secretNames: [foreign],
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "egress_blocked",
+      });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "egress_blocked", secret: foreign, host: provider.upstream.host }));
+      return;
+    }
 
     // --- Cost-Aware Routing (Section 3.4) ---
     const routingConfig = loadRoutingConfig();

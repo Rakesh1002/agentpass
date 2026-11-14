@@ -346,10 +346,27 @@ describe("ProxyServer (provider-routed)", () => {
     });
     expect(JSON.parse(viaApiKey.body).xkey).toBe("sk-ant-clienta");
 
-    const otherProvider = await get(`http://127.0.0.1:18808/anthropic/v1/messages`, {
-      headers: { "x-api-key": "{{secret:openai-2}}" },
-    });
-    expect(JSON.parse(otherProvider.body).xkey).toBe("sk-ant-X");
+    await proxy.stop();
+  });
+
+  test("refuses a placeholder naming another provider's key on a reverse route", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+    const base = `http://127.0.0.1:${proxy.getPort()}`;
+
+    const toOpenai = await get(`${base}/openai/v1/models`, { headers: { authorization: "Bearer {{secret:anthropic}}" } });
+    expect(toOpenai.status).toBe(403);
+    expect(JSON.parse(toOpenai.body)).toEqual({ error: "egress_blocked", secret: "anthropic", host: "api.openai.com" });
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "egress_blocked", secretNames: ["anthropic"] });
+
+    const toAnthropic = await get(`${base}/anthropic/v1/messages`, { headers: { "x-api-key": "{{secret:openai-2}}" } });
+    expect(toAnthropic.status).toBe(403);
+    expect(JSON.parse(toAnthropic.body).secret).toBe("openai-2");
+    expect(upstreamHits).toHaveLength(0);
 
     await proxy.stop();
   });
