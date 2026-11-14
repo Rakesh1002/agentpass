@@ -1,137 +1,245 @@
 # AgentPass
 
-A local-first credential broker for AI agents. Stores API keys in an encrypted
-vault on your machine and brokers them to agents (Claude Code, Cursor,
-OpenClaw, Codex) through a local HTTP proxy.
+A local credential firewall for AI coding agents. Add a key once; every agent
+and worktree uses it through placeholders, and the real value only goes to the
+hosts you pin it to.
 
-> **Status: production-ready core.** Vault encryption, provider-routed
-> reverse proxy with multi-key fallback, placeholder substitution, full
-> HTTPS MITM interception (TLS CONNECT tunneling with per-host certificate
-> minting), and audit logging are all working and covered by tests. The
-> forward-proxy mode rewrites encrypted headers over both HTTP and HTTPS.
-> See [SPEC.md](./SPEC.md) for the acceptance criteria.
+> **Status: alpha.** It works and is covered by tests, but commands and file
+> formats may still change. macOS and Linux only.
 
-## What it does
+## How it works
 
-- **Encrypted vault** — secrets stored at rest with AES-256-GCM; master
-  password derived with PBKDF2 (100k iterations).
-- **Provider-routed reverse proxy with multi-key pool** — point your agent at
-  `http://localhost:8888/openai/...`, `/anthropic/...`, `/groq/...`, or
-  `/openrouter/...` and the proxy makes the HTTPS call to the real upstream
-  with the right auth header attached from the vault. Add `openai`,
-  `openai-2`, `openai-3` and the proxy falls over to the next key when one
-  returns `429` (rate limited) or `401` (rotated), inside a single request,
-  with the same secret never re-tried.
-- **Placeholder substitution (forward-proxy mode)** — for clients that set
-  `HTTP_PROXY=http://localhost:8888` and send absolute URLs, any
-  `Authorization` / `x-api-key` / `api-key` header containing
-  `{{secret:name}}` is substituted with the real value from the vault.
-- **HTTPS MITM interception (forward-proxy mode)** — for clients in
-  `CONNECT` tunnel mode, the proxy terminates TLS using a per-host
-  certificate signed by the local CA, rewrites `Authorization` /
-  `x-api-key` / `api-key` headers via `{{secret:name}}` substitution,
-  then re-encrypts and forwards to the real upstream. Both HTTP and HTTPS
-  forward-proxy traffic is fully intercepted and rewritten.
-- **`/_/health`** — returns `{ "ok": true }` so process supervisors and the
-  CLI can probe the proxy.
-- **Local audit log** — every proxied request appends `method`, `destination`,
-  `status`, `duration`, and the secret *names* that were used. Raw secret
-  values are never logged.
-
-## Repository layout
-
-```
-.
-├── src/                  # CLI + proxy + vault (Bun + TypeScript)
-│   ├── cli.ts            # Command dispatcher
-│   ├── vault.ts          # SQLite-backed encrypted store
-│   ├── proxy.ts          # HTTP/HTTPS proxy
-│   ├── providers.ts      # Upstream provider map (OpenAI, Anthropic, …)
-│   ├── ca.ts             # Local CA + per-host cert minting (for MITM engine)
-│   ├── audit.ts          # Append-only audit log
-│   ├── claude.ts         # Claude Code config importer
-│   ├── paths.ts          # Path resolution (~/.agentpass)
-│   ├── agentpass.test.ts # Vault, substitution, CONNECT, CA tests
-│   └── proxy.test.ts     # Provider-routing tests
-├── apps/web/             # Marketing site (Next.js → Cloudflare Workers)
-├── public/               # Static landing page assets
-├── SPEC.md               # MVP specification
-├── CONTRIBUTING.md       # Onboarding + dev workflow
-└── package.json
-```
+1. Keys live in an encrypted vault in `~/.agentpass`, unlocked from your OS
+   keychain (or a passphrase).
+2. A project's `.agentpass.json` maps env var names to vault secrets. Agents
+   get placeholders such as `STRIPE_SECRET_KEY={{secret:stripe}}`, never the
+   value.
+3. Agents run with `HTTPS_PROXY` pointing at a local proxy. When a request to
+   a pinned host carries a placeholder in its `Authorization`, `x-api-key` or
+   `api-key` header, the proxy swaps in the real value. A placeholder sent to
+   any other host, port, method or path is refused with `egress_blocked`.
+4. Every proxied request is written to a local audit log with the secret
+   names used (never the values) and a session tag for the repo, branch and
+   agent.
 
 ## Quick start
+
+Requires [Bun](https://bun.sh) 1.3 or newer.
 
 ```bash
 git clone https://github.com/Rakesh1002/agentpass.git
 cd agentpass
 bun install
+alias agentpass="bun run $PWD/src/cli.ts"
 
-# Initialize the vault (creates ~/.agentpass/vault.db)
-bun run src/cli.ts init
+agentpass scan                                  # find plaintext keys your agents can read
+agentpass init                                  # vault unlocks from the OS keychain
+agentpass add stripe --host api.stripe.com      # value from a hidden prompt
+agentpass add anthropic                         # provider names are pinned to their API host
+agentpass up                                    # background proxy, now and at login
 
-# Add a primary key plus a pool of fallbacks
-bun run src/cli.ts add openai
-bun run src/cli.ts add openai-2
-bun run src/cli.ts add openai-3
+cd ~/code/my-app
+agentpass link STRIPE_SECRET_KEY stripe         # writes .agentpass.json
+agentpass run -- claude                         # placeholders + proxy env for this project
+```
 
-# Start the proxy
-bun run src/cli.ts proxy start
+To pipe a value instead of typing it: `printf %s "$VALUE" | agentpass add <name>`.
+Values are never accepted as command-line arguments, because other processes can
+read those.
 
-# In another shell, hit the provider-routed endpoint directly
-curl http://localhost:8888/openai/v1/models
+Instead of `agentpass run`, you can add the shell hook to your rc file, so every
+shell in a project gets its placeholders and proxy env as you `cd` in and out:
 
-# Or point an agent through forward-proxy mode
-bun run src/cli.ts run curl https://api.openai.com/v1/models
+```bash
+eval "$(agentpass hook zsh)"    # or bash, fish
 ```
 
 ## Commands
 
-| Command                         | What it does                                    |
-| ------------------------------- | ----------------------------------------------- |
-| `agentpass init`                | Initialize the vault with a master password     |
-| `agentpass add <name>`          | Add a secret                                    |
-| `agentpass list`                | List secret names                               |
-| `agentpass get <name>`          | Show a secret (masked)                          |
-| `agentpass delete <name>`       | Delete a secret                                 |
-| `agentpass proxy start`         | Start the proxy on `:8888`                      |
-| `agentpass proxy stop`          | Stop the proxy                                  |
-| `agentpass run <cmd>`           | Run `<cmd>` with `HTTP(S)_PROXY` set            |
-| `agentpass audit`               | Show recent proxy audit events                  |
-| `agentpass ca path`             | Print the local CA certificate path             |
-| `agentpass import-claude`       | Import an Anthropic key from Claude Code config |
-| `agentpass status`              | Show vault + proxy state                        |
+| Command | What it does |
+| --- | --- |
+| `agentpass init [--passphrase] [--force]` | Create the vault. It unlocks from the OS keychain unless `--passphrase` (or `AGENTPASS_PASSWORD`) is given |
+| `agentpass unlock-mode keychain\|passphrase` | Re-encrypt the vault for the other unlock mode (backs it up first) |
+| `agentpass add <name> [--host h[,h]] [--path prefix] [--method GET,POST]` | Add a secret with its pins. The value comes from a hidden prompt, or stdin when piped |
+| `agentpass pins <name> [--set h[,h] [--path prefix] [--method M] \| --clear]` | Show, replace or remove a secret's pins |
+| `agentpass list` | List secrets and their pins |
+| `agentpass get <name>` | Show a secret, masked |
+| `agentpass delete <name>` | Delete a secret (alias `rm`) |
+| `agentpass link <VAR> <secret>` | Map an env var to a secret in `.agentpass.json` |
+| `agentpass unlink <VAR>` | Remove a mapping from `.agentpass.json` |
+| `agentpass allow [dir]` | Trust this `.agentpass.json` as it is now |
+| `agentpass deny [dir]` | Revoke trust in this `.agentpass.json` |
+| `agentpass project` | Show the resolved mapping for the current directory |
+| `agentpass env [--shell zsh\|bash\|fish\|json] [--dir DIR]` | Print the placeholder env for a directory (no vault needed) |
+| `agentpass hook zsh\|bash\|fish` | Print the shell hook |
+| `agentpass run -- <cmd> [args]` | Run a command with this project's placeholders and proxy env, starting a proxy for it if none is running |
+| `agentpass up` | Start the proxy in the background, now and at login (keychain mode only) |
+| `agentpass down` | Stop the background proxy and remove it from login |
+| `agentpass status` | Show vault mode, lock state, background proxy, port and CA path |
+| `agentpass proxy start` / `proxy stop` | Run the proxy in the foreground on port 8888 |
+| `agentpass daemon [--port N]` | Run the proxy in the foreground (what the background service runs) |
+| `agentpass audit [-n N]` | Show the last N proxied requests (default 20) |
+| `agentpass scan [--root DIR]... [--json]` | Find plaintext secrets your AI agents can read |
+| `agentpass ca path` | Print the local CA certificate path |
+| `agentpass import-claude` | Import the Anthropic key from your Claude Code config |
+| `agentpass routing init\|show\|enable\|disable` | Manage the optional cost-aware model routing config |
 
-## Architecture
+`agentpass help` prints the same list.
+
+## Projects: `.agentpass.json` and `allow`
+
+`agentpass link` updates the nearest manifest, or creates one at the git root
+of the current directory:
+
+```json
+{
+  "env": {
+    "STRIPE_SECRET_KEY": "stripe"
+  }
+}
+```
+
+It holds names only, so it is safe to commit. Every worktree and clone of the
+repo then gets the same placeholders from the same vault. Only names that look
+like credentials (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, `_URL`, ...) can
+be mapped, and names a shell or toolchain reads (`PATH`, `NODE_OPTIONS`,
+`GIT_*`, `*_PROXY` and similar) are refused.
+
+A manifest you did not write yourself, for example one in a repo you just
+cloned, does nothing until you review it and run `agentpass allow`. Trust is
+recorded by the file's content hash, so any edit needs a new `allow`, and an
+identical manifest in another worktree is already trusted. `agentpass run` and
+`agentpass env` refuse to run against an unreviewed manifest; the shell hook
+warns and exports nothing from it.
+
+Defaults that apply everywhere go in `~/.agentpass/config.json` in the same
+format.
+
+## Pins
+
+Each secret carries pins: the hosts, and optionally methods and a path
+prefix, it may be sent to. A secret with no pins is never substituted.
+
+| Host form | Matches |
+| --- | --- |
+| `api.example.com` | that host on the default port (443 for HTTPS, 80 for HTTP) |
+| `host:port` | that host on that port only, e.g. `localhost:8080` |
+| `[::1]:port` | an IPv6 address, bracketed, with or without `:port` |
+| `*` | any host, default port only |
+| `*:N` | any host on port N |
+| `*:*` | any host on any port |
+
+```bash
+agentpass add stripe-test --host api.stripe.com --method GET,POST --path /v1
+agentpass pins stripe-test --set api.stripe.com,localhost:12111
+agentpass pins stripe-test --clear
+```
+
+- `--method` and `--path` apply to every host given with them. A path prefix
+  matches whole segments (`/v1` matches `/v1/charges`, not `/v1beta`), and
+  paths with dot segments or encoded slashes are refused.
+- Secrets named after a built-in provider (`openai`, `anthropic`, `groq`,
+  `openrouter`, or `openai-2` and so on) are pinned to that provider's API host
+  on port 443 when you give no `--host`.
+- Values only travel over HTTPS. A placeholder in a plain-HTTP request is
+  refused (`insecure_scheme`) unless the host is loopback.
+- Wildcard pins work, and every request that relies on one is flagged with
+  `wildcard=` in the audit log.
+
+The proxy only terminates TLS for hosts that some secret is pinned to. Other
+traffic is tunnelled untouched, so an unpinned host receives the literal
+placeholder text, never the value.
+
+## The background proxy
+
+```bash
+agentpass up        # install a launchd (macOS) or systemd --user (Linux) service and start it
+agentpass status    # Vault: keychain mode, unlockable / Daemon: running (pid ..., port 8888, ...)
+agentpass down      # stop it and remove it from login
+```
+
+The service unlocks the vault from the OS keychain, so `up` needs a vault in
+keychain mode (`agentpass unlock-mode keychain` to switch). Logs go to
+`~/.agentpass/daemon.log`. Without it, `agentpass run` starts a proxy for the
+lifetime of the command it runs.
+
+The proxy env includes `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE`, pointing at the local AgentPass CA (plus your system
+roots), so Node, Python and curl-based tools accept the proxy's certificates
+without changes to your system trust store. For a secret named after a
+built-in provider it also sets that SDK's base URL (`ANTHROPIC_BASE_URL`,
+`OPENAI_BASE_URL`, `GROQ_BASE_URL`, `OPENROUTER_BASE_URL`) to a local route.
+On that route, if you have several keys for the provider (`openai`,
+`openai-2`, ...), a `429` or `401` from one key fails over to the next within
+the same request.
+
+## `scan`
+
+```bash
+agentpass scan               # current directory plus your home config files
+agentpass scan --root ~/code --json
+```
+
+Looks for plaintext keys in the places agents read: shell rc files,
+`~/.claude.json` and Claude settings, `~/.codex/config.toml`,
+`~/.gemini/settings.json`, `~/.cursor/mcp.json`, and `.env`, `.mcp.json` and
+`.claude/settings*.json` files in the scanned roots. Findings are masked and grouped by how exposed they are
+(tracked in git first). It exits 1 when it finds something, so it can run in a
+hook or CI.
+
+## Audit and session tags
 
 ```
-┌─────────────┐    ┌───────────────┐    ┌───────────┐
-│ AI Agent    │───▶│ AgentPass     │───▶│ Upstream  │
-│ (Claude,    │    │ Proxy :8888   │    │ Provider  │
-│  Cursor, …) │    │               │    │ (OpenAI,  │
-└─────────────┘    └───────┬───────┘    │  …)       │
-                           │            └───────────┘
-                    ┌──────▼──────┐
-                    │ Vault       │
-                    │ (SQLite,    │
-                    │  encrypted) │
-                    └─────────────┘
+$ agentpass audit -n 2
+2026-11-14T08:58:09.903Z GET api.stripe.com:443 status=200 secrets=stripe duration=348ms session=my-app@main+claude
+2026-11-14T08:58:09.537Z GET api.openai.com:443 status=403 secrets=stripe duration=1ms error="egress_blocked" session=my-app@main+claude
 ```
 
-## Security
+Each request is tagged `<repo>@<branch>`, plus `+<agent>` when started with
+`agentpass run`, so you can tell which worktree and agent used which key. The
+log lives in `~/.agentpass/audit.db` and never contains secret values.
 
-- Secrets are encrypted at rest with AES-256-GCM under a PBKDF2-derived key.
-- The vault file (`~/.agentpass/vault.db`) is unreadable without the master
-  password. Wrong passwords are rejected before any secret is decrypted.
-- The local CA (`~/.agentpass/ca.crt` / `ca.key`) is generated on demand
-  and used actively by the HTTPS MITM engine. Install it in your OS/browser
-  trust store so the proxy's per-host certificates are accepted by TLS
-  clients without warnings (`agentpass ca path` prints the file location).
-- The audit log records secret *names* only. Raw values are never persisted.
+## What it protects against
+
+- No plaintext keys in `.env`, shell rc or agent config files.
+- Real values never enter the agent's environment, transcripts or commits.
+  The agent only ever sees `{{secret:name}}`.
+- Values are only sent over HTTPS to the hosts, ports, methods and paths each
+  key is pinned to. Everything else is refused and logged.
+- Manifests from cloned repos need your explicit approval before they map
+  anything.
+
+## What it doesn't
+
+AgentPass keeps keys out of what an agent sees and limits where they can be
+sent. It is not a sandbox. A process running as your user can still read
+AgentPass's files, use your keychain, or change its configuration if it sets
+out to. If you run an agent you don't trust, run it in its own sandbox or
+container as well.
+
+## Security details
+
+- Values are encrypted at rest with AES-256-GCM. Each value is bound to its
+  name and pins, so a row edited outside AgentPass fails with
+  `integrity_failed` instead of being sent.
+- In keychain mode the vault key is a random secret in the macOS Keychain or
+  Linux Secret Service. In passphrase mode it is derived with PBKDF2 (100k
+  iterations) and read from `AGENTPASS_PASSWORD` or a TTY prompt.
+- The local CA (`agentpass ca path`) is generated on first use and only signs
+  certificates for pinned hosts.
+
+## Repository layout
+
+```
+src/        CLI, proxy, vault, manifests, scan (Bun + TypeScript, tests alongside)
+apps/web/   Marketing site (Next.js on Cloudflare Workers via OpenNext)
+docs/       Design notes and ADRs
+SPEC.md     Original MVP specification
+```
 
 ## Contributing
 
-New here? Start with [CONTRIBUTING.md](./CONTRIBUTING.md) — it covers dev
+New here? Start with [CONTRIBUTING.md](./CONTRIBUTING.md). It covers dev
 setup, the test workflow, code style, and how to open your first PR.
 
 ## License
