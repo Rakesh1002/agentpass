@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { routingConfigFile } from "./paths";
 import {
+  loadRoutingConfig,
+  writeDefaultConfig,
   classifyRequest,
   classify,
   extractFeatures,
@@ -216,5 +222,27 @@ describe("router — duplicate retry detection", () => {
     const second = isDuplicateRetry(body);
     expect(first).toBe(false); // First time is not a duplicate
     expect(second).toBe(true); // Second time within window IS a duplicate
+  });
+});
+
+describe("router — config defaults", () => {
+  test("routing stays off unless the user opts in", () => {
+    const previous = process.env.AGENTPASS_HOME;
+    const home = mkdtempSync(join(tmpdir(), "agentpass-router-"));
+    process.env.AGENTPASS_HOME = home;
+    try {
+      writeDefaultConfig();
+      expect(loadRoutingConfig()?.enabled).toBe(false);
+
+      writeFileSync(routingConfigFile(), "{}");
+      expect(loadRoutingConfig()?.enabled).toBe(false);
+
+      writeFileSync(routingConfigFile(), JSON.stringify({ enabled: true }));
+      expect(loadRoutingConfig()?.enabled).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.AGENTPASS_HOME;
+      else process.env.AGENTPASS_HOME = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

@@ -422,6 +422,7 @@ async function handleRouting(args: string[]) {
     const path = writeDefaultConfig();
     console.log(`Routing config created at ${path}`);
     console.log("Edit the file to configure tier→provider/model mappings.");
+    console.log("Routing is off until you run: agentpass routing enable");
     return;
   }
 
