@@ -12,8 +12,10 @@ const ORIG_HOME = process.env.HOME;
 let mockUpstream: http.Server;
 let mockPort: number;
 let upstreamHits: { headers: http.IncomingHttpHeaders; path: string }[] = [];
-let mockBehavior: "ok" | "rate-limit-once" | "always-401" | "401-then-ok" = "ok";
+let mockBehavior: "ok" | "rate-limit-once" | "always-401" | "401-then-ok" | "sse" = "ok";
 let callCount = 0;
+let streamGate: Promise<void> = Promise.resolve();
+let upstreamFinished = false;
 
 const originalRequest = https.request;
 
@@ -40,6 +42,15 @@ function startMockUpstream(): Promise<void> {
       if (mockBehavior === "401-then-ok" && callCount === 1) {
         res.writeHead(401);
         res.end(JSON.stringify({ error: "rotated" }));
+        return;
+      }
+      if (mockBehavior === "sse") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: one\n\n");
+        streamGate.then(() => {
+          upstreamFinished = true;
+          res.end("data: two\n\n");
+        });
         return;
       }
 
@@ -228,6 +239,47 @@ describe("ProxyServer (provider-routed)", () => {
     const allowed = await get(`http://127.0.0.1:18809/groq/v1/chat/completions`, { method: "POST" });
     expect(allowed.status).toBe(200);
     expect(JSON.parse(allowed.body).auth).toBe("Bearer gsk-post-only");
+
+    await proxy.stop();
+  });
+
+  test("streams upstream bytes to the client before upstream finishes", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "sse";
+    upstreamFinished = false;
+    let release = () => {};
+    // a buffering proxy only delivers after the fallback timer ends the upstream response
+    streamGate = new Promise<void>((resolve) => {
+      release = resolve;
+      setTimeout(resolve, 1500);
+    });
+
+    const proxy = new ProxyServer({ port: 18810 });
+    await proxy.start();
+
+    const result = await new Promise<{ firstBeforeEnd: boolean; body: string; type?: string }>((resolve, reject) => {
+      http
+        .get(`http://127.0.0.1:18810/anthropic/v1/messages`, (res) => {
+          let body = "";
+          let firstBeforeEnd: boolean | null = null;
+          res.on("data", (chunk: Buffer) => {
+            if (firstBeforeEnd === null) {
+              firstBeforeEnd = !upstreamFinished;
+              release();
+            }
+            body += chunk.toString("utf8");
+          });
+          res.on("end", () =>
+            resolve({ firstBeforeEnd: firstBeforeEnd === true, body, type: res.headers["content-type"] })
+          );
+        })
+        .on("error", reject);
+    });
+
+    expect(result.firstBeforeEnd).toBe(true);
+    expect(result.body).toBe("data: one\n\ndata: two\n\n");
+    expect(result.type).toBe("text/event-stream");
 
     await proxy.stop();
   });

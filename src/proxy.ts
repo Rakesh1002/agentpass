@@ -339,7 +339,7 @@ export class ProxyServer {
     }
 
     // --- Execute the request against the effective provider ---
-    const responseResult = await this.executeProviderRequest(
+    const result = await this.executeProviderRequest(
       req,
       effectiveProvider,
       effectivePath,
@@ -349,11 +349,18 @@ export class ProxyServer {
       escalated
     );
 
-    if (!responseResult) {
+    if (!result) {
       res.writeHead(503, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "no_keys", provider: effectiveProvider.name }));
       return;
     }
+
+    // escalation and translation need the whole body; every other response streams (SSE)
+    if (!routedTier) {
+      sendProviderResponse(res, result);
+      return;
+    }
+    const responseResult = await bufferProviderResponse(result);
 
     // --- Escalation check (Section 3.4) ---
     if (
@@ -412,7 +419,7 @@ export class ProxyServer {
               escalationBody = Buffer.from(JSON.stringify(parsedBody), "utf-8");
             }
 
-            const escalationResult = await this.executeProviderRequest(
+            const escalation = await this.executeProviderRequest(
               req,
               escalationProvider,
               escalationPath,
@@ -421,6 +428,7 @@ export class ProxyServer {
               escalatedTier,
               true
             );
+            const escalationResult = escalation && (await bufferProviderResponse(escalation));
 
             if (escalationResult && escalationResult.status >= 200 && escalationResult.status < 300) {
               let finalBody = escalationResult.body;
@@ -461,7 +469,7 @@ export class ProxyServer {
     started: number,
     routedTier?: TaskTier,
     escalated?: boolean
-  ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer } | null> {
+  ): Promise<ProviderResponse | null> {
     const destination = `${provider.upstream.host}${upstreamPath}`;
 
     const method = req.method || "GET";
@@ -517,8 +525,6 @@ export class ProxyServer {
       provider.upstream.port || (provider.upstream.protocol === "https" ? 443 : 80);
 
     let lastStatus = 502;
-    let lastHeaders: http.IncomingHttpHeaders | null = null;
-    let lastBody: Buffer | null = null;
 
     // Bounded iteration: max attempts = pool size (Section 4.1)
     let attempts = 0;
@@ -551,8 +557,6 @@ export class ProxyServer {
           escalated,
         });
         lastStatus = 502;
-        lastHeaders = null;
-        lastBody = Buffer.from(result.error);
         continue;
       }
 
@@ -567,24 +571,20 @@ export class ProxyServer {
       });
 
       lastStatus = result.status;
-      lastHeaders = result.headers;
-      lastBody = result.body;
 
       if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
         if (attempts >= maxAttempts) {
           console.warn(
             `[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error (${result.status}).`
           );
-          return { status: result.status, headers: result.headers, body: result.body };
+          return result;
         }
+        // nothing has been sent to the client yet, so drop this body and fail over
+        result.body.resume();
         continue;
       }
 
-      return { status: result.status, headers: result.headers, body: result.body };
-    }
-
-    if (lastHeaders) {
-      return { status: lastStatus, headers: lastHeaders, body: lastBody ?? Buffer.alloc(0) };
+      return result;
     }
 
     return { status: lastStatus || 503, headers: {}, body: Buffer.from(
@@ -923,7 +923,13 @@ function sanitizeRequestHeaders(
 interface UpstreamSuccess {
   status: number;
   headers: http.IncomingHttpHeaders;
-  body: Buffer;
+  body: http.IncomingMessage;
+}
+
+interface ProviderResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer | http.IncomingMessage;
 }
 interface UpstreamError {
   error: string;
@@ -951,23 +957,22 @@ function sendUpstream(
         headers: opts.headers,
         rejectUnauthorized: opts.rejectUnauthorized,
       },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () =>
-          resolve({
-            status: res.statusCode ?? 502,
-            headers: res.headers,
-            body: Buffer.concat(chunks),
-          })
-        );
-        res.on("error", (err) => resolve({ error: err.message }));
-      }
+      (res) => resolve({ status: res.statusCode ?? 502, headers: res.headers, body: res })
     );
     req.on("error", (err) => resolve({ error: err.message }));
     if (opts.body.length > 0) req.write(opts.body);
     req.end();
   });
+}
+
+function responseHeaders(headers: http.IncomingHttpHeaders): http.OutgoingHttpHeaders {
+  const out: http.OutgoingHttpHeaders = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    if (key.toLowerCase() === "content-length") continue;
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
 }
 
 function writeUpstreamResponse(
@@ -976,15 +981,24 @@ function writeUpstreamResponse(
   headers: http.IncomingHttpHeaders,
   body: Buffer
 ): void {
-  const responseHeaders: http.OutgoingHttpHeaders = {};
-  for (const [key, value] of Object.entries(headers)) {
-    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
-    if (key.toLowerCase() === "content-length") continue;
-    if (value !== undefined) responseHeaders[key] = value;
-  }
-  responseHeaders["content-length"] = body.length;
-  res.writeHead(status, responseHeaders);
+  res.writeHead(status, { ...responseHeaders(headers), "content-length": body.length });
   res.end(body);
+}
+
+function sendProviderResponse(res: http.ServerResponse, result: ProviderResponse): void {
+  if (Buffer.isBuffer(result.body)) {
+    writeUpstreamResponse(res, result.status, result.headers, result.body);
+    return;
+  }
+  const upstream = result.body;
+  res.writeHead(result.status, responseHeaders(result.headers));
+  upstream.on("error", () => res.destroy());
+  res.on("close", () => upstream.destroy());
+  upstream.pipe(res);
+}
+
+async function bufferProviderResponse(result: ProviderResponse): Promise<ProviderResponse & { body: Buffer }> {
+  return { ...result, body: Buffer.isBuffer(result.body) ? result.body : await readBody(result.body) };
 }
 
 export async function substitutePlaceholders(
