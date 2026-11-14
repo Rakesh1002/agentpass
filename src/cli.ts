@@ -13,8 +13,8 @@ import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { vaultFile, routingConfigFile } from "./paths";
-import { linkVar, resolveProject, unlinkVar } from "./project";
-import { buildEnv, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
+import { allowManifest, assertTrusted, denyManifest, linkVar, resolveProject, unlinkVar, UntrustedError } from "./project";
+import { buildEnv, envOutput, hookScript, proxyPort, proxyReachable } from "./shellenv";
 
 const VAULT_FILE = vaultFile();
 
@@ -86,6 +86,12 @@ async function main() {
       case "unlink":
         handleUnlink(args.slice(1));
         break;
+      case "allow":
+        console.log(`Allowed ${allowManifest(args[1] ?? process.cwd())}`);
+        break;
+      case "deny":
+        console.log(`Denied ${denyManifest(args[1] ?? process.cwd())}`);
+        break;
       case "project":
         await handleProject();
         break;
@@ -118,7 +124,7 @@ async function main() {
     }
   } catch (err) {
     console.error("Error:", err instanceof Error ? err.message : err);
-    process.exit(1);
+    process.exit(err instanceof UntrustedError ? 2 : 1);
   }
 }
 
@@ -148,7 +154,9 @@ Commands:
   hook zsh|bash|fish    Print a shell hook: eval "$(agentpass hook zsh)"
   link <VAR> <secret>   Map an env var to a vault secret in .agentpass.json
   unlink <VAR>          Remove a mapping from .agentpass.json
-  project               Show the resolved mapping (-p to check the vault)
+  allow [dir]           Trust this .agentpass.json as it is now (any edit needs a new allow)
+  deny [dir]            Revoke trust in this .agentpass.json
+  project              Show the resolved mapping (-p to check the vault)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
   status                Show vault and proxy status
@@ -435,6 +443,7 @@ async function handleRun(args: string[]) {
   const argv = sep >= 0 ? args.slice(sep + 1) : args;
   const cmd = argv[0];
   if (!cmd) throw new Error("Usage: agentpass run -- <command> [args...]");
+  assertTrusted(process.cwd());
 
   let port = proxyPort();
   let local: ProxyServer | null = null;
@@ -471,6 +480,7 @@ function handleEnv(args: string[]) {
     options: {
       shell: { type: "string", default: "zsh" },
       dir: { type: "string" },
+      hook: { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: false,
@@ -480,7 +490,7 @@ function handleEnv(args: string[]) {
     throw new Error("Usage: agentpass env [--shell zsh|bash|fish|json] [--dir DIR]");
   }
   const dir = typeof values.dir === "string" ? values.dir : process.cwd();
-  process.stdout.write(formatEnv(buildEnv(dir), format));
+  process.stdout.write(envOutput(dir, format, values.hook === true));
 }
 
 function handleHook(args: string[]) {

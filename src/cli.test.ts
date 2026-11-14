@@ -16,7 +16,7 @@ function cli(args: string[], cwd = proj) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: "utf-8",
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+    env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept" },
   });
   return { out: r.stdout, err: r.stderr, code: r.status };
 }
@@ -25,7 +25,7 @@ function cliAsync(args: string[]): Promise<{ out: string; code: number | null }>
   return new Promise((done) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd: proj,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+      env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept" },
     });
     let out = "";
     child.stdout.on("data", (c) => (out += c));
@@ -83,11 +83,28 @@ describe("cli", () => {
 
     const bad = join(root, "bad");
     mkdirSync(bad);
-    writeFileSync(join(bad, ".agentpass.json"), "{");
+    writeFileSync(join(bad, ".agentpass.json"), '{"env": {"OPENAI_API_KEY": sk_live_PLANTED}}');
+    const untrusted = cli(["env", "--dir", bad]);
+    expect(untrusted.code).toBe(2);
+    expect(untrusted.out).toBe("");
+    expect(untrusted.err).toContain("Review it, then run: agentpass allow");
+
+    expect(cli(["allow", bad]).out).toBe(`Allowed ${join(bad, ".agentpass.json")}\n`);
     const r = cli(["env", "--dir", bad]);
     expect(r.code).toBe(1);
     expect(r.out).toBe("");
     expect(r.err).toContain("invalid JSON");
+    expect(r.out + r.err).not.toContain("sk_live_PLANTED");
+  });
+
+  test("deny revokes a manifest and run refuses it with exit 2 before asking for the vault", async () => {
+    expect(cli(["deny"]).out).toBe(`Denied ${join(proj, ".agentpass.json")}\n`);
+    expect(cli(["env"]).code).toBe(2);
+    const r = await cliAsync(["run", "--", "sh", "-c", "echo ran"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toBe("");
+    expect(cli(["allow"]).code).toBe(0);
+    expect(cli(["env"]).code).toBe(0);
   });
 
   test("run uses a reachable proxy without the vault and passes the exit code", async () => {

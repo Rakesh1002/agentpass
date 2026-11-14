@@ -15,44 +15,55 @@ import { join, resolve } from "path";
 import { certificateAuthority } from "./ca";
 import { matchProvider } from "./providers";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { forbiddenVar } from "./project";
+import { allowManifest, forbiddenVar } from "./project";
 import { buildEnv, ensureCaBundle, formatEnv, hookScript, proxyPort } from "./shellenv";
+import { allow } from "./trust";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
+const USER_HOME = process.env.HOME;
 
 function git(cwd: string, ...args: string[]) {
   const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
   if (r.status !== 0) throw new Error(r.stderr);
 }
+
+process.umask(0o022);
 let root: string;
 let home: string;
+let user: string;
 let proj: string;
 let other: string;
 
 beforeAll(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "agentpass-env-")));
   home = join(root, "home");
+  user = join(root, "user");
   process.env.AGENTPASS_HOME = home;
+  process.env.HOME = user;
   certificateAuthority.ensureCa();
 
-  proj = join(root, "proj");
+  proj = join(user, "proj");
   mkdirSync(join(proj, "sub"), { recursive: true });
   writeFileSync(
     join(proj, ".agentpass.json"),
     JSON.stringify({ env: { STRIPE_SECRET_KEY: "stripe-test", OPENAI_API_KEY: "openai-work" } })
   );
-  other = join(root, "other");
+  allowManifest(proj);
+  other = join(user, "other");
   mkdirSync(other);
   writeFileSync(join(other, ".agentpass.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "anthropic" } }));
+  allowManifest(other);
 });
 
 afterAll(() => {
   delete process.env.AGENTPASS_HOME;
+  process.env.HOME = USER_HOME;
   rmSync(root, { recursive: true, force: true });
 });
 
 beforeEach(() => {
   process.env.AGENTPASS_HOME = home;
+  process.env.HOME = user;
   rmSync(daemonFile(), { force: true });
   rmSync(globalConfigFile(), { force: true });
 });
@@ -198,11 +209,14 @@ describe("hook", () => {
     const bin = shell === "bash" ? ["bash", "--norc", "--noprofile", "-c"] : ["zsh", "-fc"];
     // Simulate a prompt: non-interactive shells never run precmd / PROMPT_COMMAND themselves.
     const tick = shell === "bash" ? 'eval "$PROMPT_COMMAND"' : 'for f in $precmd_functions; do $f; done';
-    const script = `eval "$HOOK"\nshow() { echo "$1:\${OPENAI_API_KEY-unset}:\${ANTHROPIC_API_KEY-unset}:\${HTTPS_PROXY-unset}"; }\n${body.replaceAll("TICK", tick)}`;
+    const script = `eval "$HOOK"
+show() { echo "$1:\${OPENAI_API_KEY-unset}:\${ANTHROPIC_API_KEY-unset}:\${HTTPS_PROXY-unset}"; }
+ap() { "${process.execPath}" "${CLI}" "$@"; }
+${body.replaceAll("TICK", tick)}`;
     const r = spawnSync(bin[0]!, [...bin.slice(1), script], {
       encoding: "utf-8",
       cwd: root,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, HOOK: hook, CALL_LOG: log },
+      env: { PATH: process.env.PATH, HOME: user, AGENTPASS_HOME: home, HOOK: hook, CALL_LOG: log },
     });
     const calls = existsSync(log) ? readFileSync(log, "utf-8").split("\n").filter(Boolean).length : 0;
     return { out: r.stdout, err: r.stderr, calls };
@@ -235,48 +249,103 @@ env | grep -c '^STRIPE_SECRET_KEY=' || true`
       expect(r.calls).toBe(2);
     });
 
-    test(`${shell}: reruns on manifest change and warns once for a bad manifest`, () => {
-      const bad = join(root, `bad-${shell}`);
+    test(`${shell}: an edited manifest waits for allow, and a bad one warns once`, () => {
+      const p = "http://127.0.0.1:8888";
+      const bad = join(user, `bad-${shell}`);
       mkdirSync(bad, { recursive: true });
       writeFileSync(join(bad, ".agentpass.json"), "{oops");
+      allowManifest(bad);
       const r = runHook(
         shell,
         `cd "${proj}"; TICK; show a
-printf '%s' '{"env":{"ANTHROPIC_API_KEY":"anthropic"}}' > "${join(root, "edit.json")}"
+printf '%s' '{"env":{"ANTHROPIC_API_KEY":"anthropic-${shell}"}}' > "${join(root, "edit.json")}"
 cp "${join(proj, ".agentpass.json")}" "${join(root, "orig.json")}"
-cp "${join(root, "edit.json")}" "${join(proj, ".agentpass.json")}"; TICK; show b
+cp "${join(root, "edit.json")}" "${join(proj, ".agentpass.json")}"; TICK; TICK; show b
+ap allow >/dev/null; TICK; show c
 cp "${join(root, "orig.json")}" "${join(proj, ".agentpass.json")}"
 cd "${bad}"; TICK; TICK; TICK; show bad`
       );
       expect(r.out).toBe(
         [
-          "a:{{secret:openai-work}}:unset:http://127.0.0.1:8888",
-          "b:unset:{{secret:anthropic}}:http://127.0.0.1:8888",
+          `a:{{secret:openai-work}}:unset:${p}`,
+          `b:unset:unset:${p}`,
+          `c:unset:{{secret:anthropic-${shell}}}:${p}`,
           "bad:unset:unset:unset",
           "",
         ].join("\n")
       );
+      expect(r.err.match(/is not allowed yet/g)?.length).toBe(1);
+      expect(r.err).toContain("Review it, then run: agentpass allow");
       expect(r.err.match(/invalid JSON/g)?.length).toBe(1);
-      expect(r.calls).toBe(3);
+      expect(r.calls).toBe(4);
+    });
+
+    test(`${shell}: a repo cannot run code through GIT_CONFIG_GLOBAL or BASH_ENV, allowed or not`, () => {
+      const evil = join(user, `evil-${shell}`);
+      mkdirSync(evil);
+      git(evil, "init", "-q", "-b", "main");
+      writeFileSync(
+        join(evil, ".agentpass.json"),
+        JSON.stringify({ env: { GIT_CONFIG_GLOBAL: "g", BASH_ENV: "b" }, shell })
+      );
+      writeFileSync(join(evil, "{{secret:g}}"), '[core]\n\tfsmonitor = "touch pwned-git; false"\n');
+      writeFileSync(join(evil, "{{secret:b}}"), "touch pwned-bash\n");
+      git(evil, "add", "-A");
+      git(evil, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+
+      const r = runHook(
+        shell,
+        `probe() { git status >/dev/null 2>&1; bash -c true; echo "$1:\${GIT_CONFIG_GLOBAL-unset}:\${BASH_ENV-unset}"; }
+cd "${evil}"; TICK; probe untrusted
+ap allow >/dev/null; TICK; probe allowed`
+      );
+      expect([existsSync(join(evil, "pwned-git")), existsSync(join(evil, "pwned-bash"))]).toEqual([false, false]);
+      expect(r.out).toBe("untrusted:unset:unset\nallowed:unset:unset\n");
+      expect(r.err).toContain("is not allowed yet");
+      expect(r.err).toContain("skipping GIT_CONFIG_GLOBAL: reserved");
+      expect(r.err).toContain("skipping BASH_ENV: reserved");
+    });
+
+    test(`${shell}: never applies a manifest above HOME or above the git toplevel`, () => {
+      const planted = join(root, ".agentpass.json");
+      const bytes = JSON.stringify({ env: { OPENAI_API_KEY: "planted" } });
+      writeFileSync(planted, bytes);
+      allow(planted, Buffer.from(bytes));
+      const top = join(user, ".agentpass.json");
+      writeFileSync(top, JSON.stringify({ env: { OPENAI_API_KEY: "home" } }));
+      allowManifest(user);
+      mkdirSync(join(user, "repo", ".git"), { recursive: true });
+      mkdirSync(join(user, "plain"), { recursive: true });
+      try {
+        const r = runHook(
+          shell,
+          `cd "${root}"; TICK; show root
+cd "${user}/plain"; TICK; show plain
+cd "${user}/repo"; TICK; show repo`
+        );
+        expect(r.out).toBe(
+          ["root:unset:unset:unset", "plain:{{secret:home}}:unset:http://127.0.0.1:8888", "repo:unset:unset:unset", ""].join(
+            "\n"
+          )
+        );
+      } finally {
+        rmSync(planted);
+        rmSync(top);
+      }
     });
   }
 
-  test("a repo cannot run code through GIT_CONFIG_GLOBAL or BASH_ENV", () => {
-    const evil = join(root, "evil");
-    mkdirSync(evil);
-    git(evil, "init", "-q", "-b", "main");
-    writeFileSync(join(evil, ".agentpass.json"), JSON.stringify({ env: { GIT_CONFIG_GLOBAL: "g", BASH_ENV: "b" } }));
-    writeFileSync(join(evil, "{{secret:g}}"), '[core]\n\tfsmonitor = "touch pwned-git; false"\n');
-    writeFileSync(join(evil, "{{secret:b}}"), "touch pwned-bash\n");
-    git(evil, "add", "-A");
-    git(evil, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
-
-    const r = runHook(
-      "zsh",
-      `cd "${evil}"; TICK; git status >/dev/null 2>&1; bash -c true; echo "\${GIT_CONFIG_GLOBAL-unset}:\${BASH_ENV-unset}"`
+  test("an untrusted manifest exports only global defaults and warns once for the directory", () => {
+    const fresh = join(user, "fresh");
+    mkdirSync(join(fresh, "sub"), { recursive: true });
+    writeFileSync(join(fresh, ".agentpass.json"), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { ANTHROPIC_API_KEY: "anthropic" } }));
+    const r = runHook("zsh", `cd "${fresh}"; TICK; cd sub; TICK; TICK; show fresh`);
+    expect(r.out).toBe("fresh:unset:{{secret:anthropic}}:http://127.0.0.1:8888\n");
+    expect(r.err).toBe(
+      `agentpass: ${join(fresh, ".agentpass.json")} is not allowed yet, so nothing from it is exported.` +
+        " Review it, then run: agentpass allow\n"
     );
-    expect([existsSync(join(evil, "pwned-git")), existsSync(join(evil, "pwned-bash"))]).toEqual([false, false]);
-    expect(r.out).toBe("unset:unset\n");
   });
 
   test("bash hook keeps an existing PROMPT_COMMAND and installs once", () => {
@@ -292,6 +361,6 @@ cd "${bad}"; TICK; TICK; TICK; show bad`
   test("fish hook registers on PWD changes", () => {
     const hook = hookScript("fish", ["agentpass", "it's"]);
     expect(hook).toContain("--on-variable PWD");
-    expect(hook).toContain("agentpass 'it\\'s' env --shell fish");
+    expect(hook).toContain("agentpass 'it\\'s' env --hook --shell fish");
   });
 });

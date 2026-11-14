@@ -1,7 +1,8 @@
-import { spawnSync } from "child_process";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { dirname, join, resolve } from "path";
 import { globalConfigFile } from "./paths";
+import { allow, disallow, isAllowed, readOwnedFile } from "./trust";
 
 export const MANIFEST_NAME = ".agentpass.json";
 
@@ -43,8 +44,15 @@ export interface Mapping {
 
 export interface ResolvedProject {
   manifest: string | null;
+  trusted: boolean;
   env: Record<string, Mapping>;
   warnings: string[];
+}
+
+export class UntrustedError extends Error {
+  constructor(manifest: string) {
+    super(`${manifest} is not allowed yet, so nothing from it is exported. Review it, then run: agentpass allow`);
+  }
 }
 
 export function checkVar(file: string, name: string): void {
@@ -57,11 +65,10 @@ export function checkSecret(file: string, name: string, secret: unknown): void {
   }
 }
 
-function readConfig(file: string): Record<string, unknown> {
-  if (!existsSync(file)) return {};
+function parseConfig(file: string, text: string): Record<string, unknown> {
   let data: unknown;
   try {
-    data = JSON.parse(readFileSync(file, "utf-8"));
+    data = JSON.parse(text);
   } catch {
     // The parser's message quotes the offending token, which may be a pasted secret.
     throw new Error(`${file}: invalid JSON`);
@@ -82,54 +89,130 @@ function readConfig(file: string): Record<string, unknown> {
   return data as Record<string, unknown>;
 }
 
-function envOf(file: string): Record<string, string> {
-  return (readConfig(file).env as Record<string, string> | undefined) ?? {};
+function envOf(data: Record<string, unknown>): Record<string, string> {
+  return (data.env as Record<string, string> | undefined) ?? {};
 }
 
-export function findManifest(dir: string): string | null {
-  let d = resolve(dir);
-  while (true) {
-    const candidate = join(d, MANIFEST_NAME);
-    if (existsSync(candidate)) return candidate;
-    const parent = dirname(d);
-    if (parent === d) return null;
-    d = parent;
+export function homeDir(): string | null {
+  try {
+    return realpathSync(process.env.HOME || homedir());
+  } catch {
+    return null;
   }
 }
 
+function within(path: string, root: string): boolean {
+  return path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`);
+}
+
+export function gitRoot(dir: string): string | null {
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    if (existsSync(join(d, ".git"))) return d;
+    if (dirname(d) === d) return null;
+  }
+}
+
+interface Manifest {
+  path: string;
+  bytes: Buffer;
+}
+
+// The shell hook walks the same way: nearest manifest, stopping at the git toplevel or HOME, never above HOME.
+function locate(dir: string, warnings: string[]): Manifest | null {
+  const home = homeDir();
+  let d: string;
+  try {
+    d = realpathSync(dir);
+  } catch {
+    return null;
+  }
+  if (!home || !within(d, home)) return null;
+  for (; ; d = dirname(d)) {
+    const candidate = join(d, MANIFEST_NAME);
+    if (existsSync(candidate)) {
+      try {
+        const path = realpathSync(candidate);
+        if (!within(path, home)) throw new Error("it resolves outside your home directory");
+        return { path, bytes: readOwnedFile(path) };
+      } catch (err) {
+        warnings.push(`ignoring ${candidate}: ${err instanceof Error ? err.message : err}`);
+        return null;
+      }
+    }
+    if (d === home || existsSync(join(d, ".git"))) return null;
+  }
+}
+
+export function findManifest(dir: string): string | null {
+  return locate(dir, [])?.path ?? null;
+}
+
 export function resolveProject(dir: string): ResolvedProject {
-  const manifest = findManifest(dir);
-  const env: Record<string, Mapping> = {};
   const warnings: string[] = [];
-  const add = (file: string, source: Mapping["source"]) => {
-    for (const [name, secret] of Object.entries(envOf(file))) {
+  const manifest = locate(dir, warnings);
+  const trusted = manifest !== null && isAllowed(manifest.bytes);
+  const env: Record<string, Mapping> = {};
+  const add = (file: string, data: Record<string, unknown>, source: Mapping["source"]) => {
+    for (const [name, secret] of Object.entries(envOf(data))) {
       const why = forbiddenVar(name);
       if (why) warnings.push(`${file}: skipping ${name}: ${why}`);
       else env[name] = { secret, source };
     }
   };
-  add(globalConfigFile(), "global");
-  if (manifest) add(manifest, "project");
+  const global = globalConfigFile();
+  add(global, existsSync(global) ? parseConfig(global, readFileSync(global, "utf-8")) : {}, "global");
+  if (manifest && trusted) add(manifest.path, parseConfig(manifest.path, manifest.bytes.toString("utf-8")), "project");
   const sorted: Record<string, Mapping> = {};
   for (const name of Object.keys(env).sort()) sorted[name] = env[name]!;
-  return { manifest, env: sorted, warnings };
+  return { manifest: manifest?.path ?? null, trusted, env: sorted, warnings };
 }
 
-function gitToplevel(dir: string): string | null {
-  const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf-8" });
-  return r.status === 0 ? r.stdout.trim() : null;
+export function assertTrusted(dir: string): void {
+  const manifest = locate(dir, []);
+  if (manifest && !isAllowed(manifest.bytes)) throw new UntrustedError(manifest.path);
+}
+
+function mustLocate(dir: string): Manifest {
+  const warnings: string[] = [];
+  const manifest = locate(dir, warnings);
+  if (!manifest) throw new Error(warnings[0] ?? `no ${MANIFEST_NAME} in ${resolve(dir)} or above it within HOME`);
+  return manifest;
+}
+
+export function allowManifest(dir: string): string {
+  const { path, bytes } = mustLocate(dir);
+  allow(path, bytes);
+  return path;
+}
+
+export function denyManifest(dir: string): string {
+  const { path, bytes } = mustLocate(dir);
+  disallow(path, bytes);
+  return path;
 }
 
 function editManifest(dir: string, edit: (env: Record<string, string>) => void): string {
-  const file = findManifest(dir) ?? join(gitToplevel(dir) ?? resolve(dir), MANIFEST_NAME);
-  const data = readConfig(file);
-  const env = { ...((data.env as Record<string, string> | undefined) ?? {}) };
+  const warnings: string[] = [];
+  const manifest = locate(dir, warnings);
+  if (warnings.length > 0) throw new Error(warnings[0]);
+  const home = homeDir();
+  const real = realpathSync(dir);
+  if (!manifest && (!home || !within(real, home))) {
+    throw new Error(`refusing to create ${MANIFEST_NAME} here: it only applies under your home directory`);
+  }
+  const top = gitRoot(real);
+  const file = manifest?.path ?? join(top && home && within(top, home) ? top : real, MANIFEST_NAME);
+  const data = manifest ? parseConfig(file, manifest.bytes.toString("utf-8")) : {};
+  const env = { ...envOf(data) };
   edit(env);
   const sorted: Record<string, string> = {};
   for (const name of Object.keys(env).sort()) sorted[name] = env[name]!;
+  const text = JSON.stringify({ ...data, env: sorted }, null, 2) + "\n";
   const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ ...data, env: sorted }, null, 2) + "\n");
+  writeFileSync(tmp, text, { mode: 0o644 });
   renameSync(tmp, file);
+  // The user made this edit; a manifest nobody reviewed stays unreviewed.
+  if (!manifest || isAllowed(manifest.bytes)) allow(file, Buffer.from(text));
   return file;
 }
 

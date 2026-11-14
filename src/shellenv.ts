@@ -3,8 +3,9 @@ import http from "http";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { certificateAuthority } from "./ca";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { BASE_URLS, MANIFEST_NAME, resolveProject } from "./project";
+import { BASE_URLS, MANIFEST_NAME, UntrustedError, homeDir, resolveProject } from "./project";
 import { PROVIDERS } from "./providers";
+import { allowedFile } from "./trust";
 
 export type Shell = "bash" | "zsh" | "fish";
 export type EnvFormat = Shell | "json";
@@ -58,10 +59,16 @@ export function proxyReachable(port: number): Promise<boolean> {
   });
 }
 
-export function buildEnv(dir: string, port = proxyPort()): Record<string, string> {
+// The hook warns about an unreviewed manifest and still applies global defaults; env and run refuse it.
+export function buildEnv(dir: string, port = proxyPort(), { hook = false } = {}): Record<string, string> {
   const proxyUrl = `http://127.0.0.1:${port}`;
   const env: Record<string, string> = {};
   const project = resolveProject(dir);
+  if (project.manifest && !project.trusted) {
+    const untrusted = new UntrustedError(project.manifest);
+    if (!hook) throw untrusted;
+    project.warnings.push(untrusted.message);
+  }
   for (const warning of project.warnings) console.error(`agentpass: ${warning}`);
   for (const [name, { secret }] of Object.entries(project.env)) {
     env[name] = `{{secret:${secret}}}`;
@@ -82,6 +89,10 @@ export function buildEnv(dir: string, port = proxyPort()): Record<string, string
   const bundle = ensureCaBundle();
   if (bundle) Object.assign(env, { SSL_CERT_FILE: bundle, REQUESTS_CA_BUNDLE: bundle });
   return env;
+}
+
+export function envOutput(dir: string, format: EnvFormat, hook = false): string {
+  return formatEnv(buildEnv(dir, undefined, { hook }), format);
 }
 
 export function shQuote(value: string): string {
@@ -108,21 +119,27 @@ export function hookScript(shell: Shell, cmd: string[]): string {
   const run = cmd.map((s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : quote(s))).join(" ");
   // mtime + size so a same-second edit still changes the key.
   const statFmt = process.platform === "linux" ? "-c '%Y %s'" : "-f '%m %z'";
-  const watched = [globalConfigFile(), daemonFile()].map(quote).join(" ");
+  const watched = [globalConfigFile(), daemonFile(), allowedFile()].map(quote).join(" ");
+  // Same walk as project.ts over physical paths: stop at the git toplevel or HOME, never look above HOME.
+  const home = homeDir();
+  const prefix = home === "/" ? "/" : `${home}/`;
 
   if (shell === "fish") {
+    const inHome = home ? `test (string sub -l ${[...prefix].length} -- "$d/") = ${quote(prefix)}` : "false";
     return `function __agentpass_hook --on-variable PWD --on-event fish_prompt
-    set -l d $PWD
+    set -l d (pwd -P)
     set -l m ''
-    while true
-        if test -f "$d/${MANIFEST_NAME}"
-            set m "$d/${MANIFEST_NAME}"
-            break
+    if ${inHome}
+        while true
+            if test -f "$d/${MANIFEST_NAME}"
+                set m "$d/${MANIFEST_NAME}"
+                break
+            end
+            if test -e "$d/.git" -o "$d" = ${quote(home ?? "")} -o -z "$d"
+                break
+            end
+            set d (string replace -r '/[^/]*$' '' -- $d)
         end
-        if test -z "$d" -o "$d" = /
-            break
-        end
-        set d (string replace -r '/[^/]*$' '' -- $d)
     end
     set -l key ''
     if test -n "$m"
@@ -135,7 +152,7 @@ export function hookScript(shell: Shell, cmd: string[]): string {
     end
     set -e AGENTPASS_EXPORTED
     if test -n "$m"
-        ${run} env --shell fish --dir (string replace -r '[^/]*$' '' -- $m) | source
+        ${run} env --hook --shell fish --dir (string replace -r '[^/]*$' '' -- $m) | source
     end
 end
 __agentpass_hook
@@ -143,20 +160,23 @@ __agentpass_hook
   }
 
   const split = shell === "zsh" ? "${=AGENTPASS_EXPORTED}" : "${AGENTPASS_EXPORTED-}";
+  const inHome = home ? `[[ "$d/" == ${quote(prefix)}* ]]` : "false";
   const fn = `_agentpass_hook() {
-  local d="$PWD" m="" key="" out v
-  while :; do
-    if [[ -f "$d/${MANIFEST_NAME}" ]]; then m="$d/${MANIFEST_NAME}"; break; fi
-    [[ -z "$d" || "$d" == / ]] && break
-    d="\${d%/*}"
-  done
+  local d="${shell === "zsh" ? "${PWD:A}" : "$(pwd -P)"}" m="" key="" out v
+  if ${inHome}; then
+    while :; do
+      if [[ -f "$d/${MANIFEST_NAME}" ]]; then m="$d/${MANIFEST_NAME}"; break; fi
+      [[ -e "$d/.git" || "$d" == ${quote(home ?? "")} || -z "$d" ]] && break
+      d="\${d%/*}"
+    done
+  fi
   [[ -n "$m" ]] && key="$m $(command stat ${statFmt} "$m" ${watched} 2>/dev/null)"
   [[ "$key" == "\${_AGENTPASS_KEY-}" ]] && return 0
   _AGENTPASS_KEY="$key"
   for v in ${split}; do unset "$v"; done
   unset AGENTPASS_EXPORTED
   [[ -z "$m" ]] && return 0
-  out="$(${run} env --shell ${shell} --dir "\${m%/*}/")" && eval "$out"
+  out="$(${run} env --hook --shell ${shell} --dir "\${m%/*}/")" && eval "$out"
 }
 `;
   if (shell === "zsh") {
