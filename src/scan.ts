@@ -51,6 +51,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 // ~/.claude.json grows with project history; per-string caps keep large JSON linear.
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_STRING = 16 * 1024;
+const MAX_JSON_DEPTH = 64;
 
 function entropy(s: string): number {
   const counts = new Map<string, number>();
@@ -151,6 +152,8 @@ function scanJson(file: string, text: string): Scanned {
     if (typeof v === "string") {
       if (v.length > MAX_STRING) oversized = true;
       else for (const hit of scanString(name, v)) raws.push({ file, path, ...hit });
+    } else if (path.length >= MAX_JSON_DEPTH) {
+      oversized = true;
     } else if (Array.isArray(v)) {
       v.forEach((x, i) => walk(x, [...path, i], name));
     } else if (v && typeof v === "object") {
@@ -264,26 +267,45 @@ export function scan(opts: { home: string; roots: string[] }): { findings: Findi
     } catch {
       continue;
     }
-    const { raws, oversized } = file.endsWith(".json") ? scanJson(file, text) : scanLines(file, text, file.endsWith(".toml"));
-    if (oversized) skipped.push(file);
-    if (raws.length === 0) continue;
-    const tracked = isTracked(file);
-    for (const { token, path, ...rest } of raws) {
-      findings.push({
-        ...rest,
-        ...(path ? { path: path.map((k) => (typeof k === "string" && secretish(k) ? mask(k) : k)) } : {}),
-        preview: mask(token),
-        severity: tracked ? "tracked" : kind,
-        tracked,
-      });
+    try {
+      const { raws, oversized } = file.endsWith(".json") ? scanJson(file, text) : scanLines(file, text, file.endsWith(".toml"));
+      if (oversized) skipped.push(file);
+      if (raws.length === 0) continue;
+      const tracked = isTracked(file);
+      findings.push(
+        ...raws.map(({ token, path, ...rest }): Finding => ({
+          ...rest,
+          ...(path ? { path: path.map((k) => (typeof k === "string" && secretish(k) ? mask(k) : k)) } : {}),
+          preview: mask(token),
+          severity: tracked ? "tracked" : kind,
+          tracked,
+        }))
+      );
+    } catch {
+      if (!skipped.includes(file)) skipped.push(file);
     }
   }
   findings.sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
   return { findings, skipped };
 }
 
+const PUBLIC_PREFIXES = ["sk-ant-", "sk-proj-", "sk-or-", "sk-", "ghp_", "gho_", "github_pat_", "sk_live_", "sk_test_", "rk_live_", "gsk_", "hf_", "xoxb-", "AIza", "glpat-", "npm_"];
+
 export function mask(value: string): string {
-  return value.length < 12 ? "…" : `${value.slice(0, 4)}…${value.slice(-2)}`;
+  if (value.length < 16) return "…";
+  const budget = Math.min(6, Math.floor(value.length * 0.25));
+  const prefix = PUBLIC_PREFIXES.find((p) => value.startsWith(p)) ?? "";
+  return `${value.slice(0, Math.min(4, prefix.length, budget - 2))}…${value.slice(-2)}`;
+}
+
+function maskFile(file: string): string {
+  return file
+    .split("/")
+    .map((seg) => {
+      const hit = detect("", seg);
+      return hit ? seg.replace(hit.token, mask(hit.token)) : seg;
+    })
+    .join("/");
 }
 
 function where(f: Finding): string {
@@ -332,11 +354,12 @@ function report(roots: string[], json: boolean): number {
   const code = findings.length > 0 ? 1 : 0;
 
   if (json) {
-    console.log(JSON.stringify({ findings, secrets: findings.length, files: files.length, skipped }, null, 2));
+    const out = findings.map((f) => ({ ...f, file: maskFile(f.file) }));
+    console.log(JSON.stringify({ findings: out, secrets: findings.length, files: files.length, skipped: skipped.map(maskFile) }, null, 2));
     return code;
   }
 
-  const display = (file: string) => (file.startsWith(home + "/") ? "~" + file.slice(home.length) : file);
+  const display = (file: string) => maskFile(file.startsWith(home + "/") ? "~" + file.slice(home.length) : file);
   for (const file of files) {
     const group = findings.filter((f) => f.file === file);
     console.log(`\n[${SEVERITY_LABEL[group[0]!.severity]}] ${display(file)}`);

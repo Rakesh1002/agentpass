@@ -401,3 +401,40 @@ describe("scan hardening", () => {
     ]);
   });
 });
+
+describe("scan robustness", () => {
+  test("masks short values fully and reveals at most a public prefix plus two chars", () => {
+    expect(mask("Q7mZ4kR9vT2wX8n")).toBe("…");
+    expect(mask("ghp" + "_Q7mZ4kR9vT2w")).toBe("gh…2w");
+    expect(mask(T.anthropic)).toBe("sk-a…Ya");
+    expect(mask(T.openaiProj)).toBe("sk-p…Ya");
+    expect(mask(T.hf)).toBe("hf_…Ya");
+    expect(mask(T.groq)).toBe("gsk_…Ya");
+    expect(mask(T.generic)).toBe("…wE");
+    expect(mask(T.aws)).toBe("…NB");
+  });
+
+  test("a deeply nested hostile JSON file is skipped without aborting the scan", () => {
+    put(join(home, ".zshrc"), `export OPENAI_API_KEY=${T.openaiProj}\n`);
+    put(join(root, "app/.mcp.json"), "[".repeat(200_000) + "]".repeat(200_000));
+
+    const result = scan({ home, roots: [root] });
+    expect(summary(result.findings)).toEqual(["~/.zshrc|OPENAI_API_KEY|OpenAI"]);
+    expect(result.skipped).toEqual([join(root, "app/.mcp.json")]);
+
+    const r = run(["--root", root]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("Found 1 plaintext secret in 1 file");
+  });
+
+  test("masks secret-looking segments of file paths", () => {
+    const fileSecret = "sk-" + "proj-" + "Lm8Nb2Vc5XzQ7mZ4kR9vT2wX8nB5cL3pH6j";
+    put(join(root, "app", `.env.${fileSecret}`), `GITHUB_TOKEN=${T.github}\n`);
+    for (const args of [["--root", root], ["--json", "--root", root]]) {
+      const r = run(args);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain(".env.sk-p…6j");
+      expect(leaks(r.out + r.err, [fileSecret, ...Object.values(T)])).toEqual([]);
+    }
+  });
+});
