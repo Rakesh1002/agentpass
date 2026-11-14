@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
-import { detect, scan, type Finding } from "./scan";
+import { detect, mask, scan, type Finding } from "./scan";
 
 // Built by concatenation so the repo itself never contains a scanner-shaped literal.
 const BODY = "Q7mZ4kR9vT2wX8nB5cL3pH6jF1dS0gYa";
@@ -43,6 +43,26 @@ function put(path: string, content: string) {
 function git(cwd: string, ...args: string[]) {
   const r = Bun.spawnSync(["git", "-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
   if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
+}
+
+const cli = join(import.meta.dir, "cli.ts");
+
+function run(args: string[], env: Record<string, string> = {}) {
+  const r = Bun.spawnSync([process.execPath, "run", cli, "scan", ...args], {
+    env: { ...process.env, HOME: home, AGENTPASS_HOME: join(home, ".agentpass"), ...env },
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+}
+
+function leaks(text: string, secrets: string[]) {
+  const found: string[] = [];
+  for (const s of secrets) {
+    for (let i = 0; i + 8 <= s.length; i++) if (text.includes(s.slice(i, i + 8))) found.push(s.slice(i, i + 8));
+  }
+  return found;
 }
 
 function summary(findings: Finding[]) {
@@ -151,7 +171,7 @@ describe("scan locations", () => {
     symlinkSync(outside, join(root, "linked"));
 
     try {
-      expect(summary(scan({ home, roots: [root] }))).toEqual(
+      expect(summary(scan({ home, roots: [root] }).findings)).toEqual(
         [
           "~/.zshrc|OPENAI_API_KEY|OpenAI",
           "~/.zshrc|OLD_TOKEN|GitHub",
@@ -185,7 +205,7 @@ describe("scan locations", () => {
     put(join(home, ".codex/config.toml"), `[mcp_servers.gh.env]\n\nGITHUB_TOKEN = "${T.github}"\n`);
     put(join(home, ".claude/settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls)", `Bash(curl -H 'Authorization: Bearer ${T.github}')`] } }));
 
-    const findings = scan({ home, roots: [] });
+    const findings = scan({ home, roots: [] }).findings;
     const byFile = (suffix: string) => findings.find((f) => f.file.endsWith(suffix))!;
 
     expect(byFile(".zshrc")).toMatchObject({ line: 2, name: "OPENAI_API_KEY", service: "OpenAI", preview: "sk-p…Ya", severity: "shell-rc", tracked: false });
@@ -202,7 +222,7 @@ describe("scan locations", () => {
     put(join(home, ".claude.json"), `{ "env": { "GITHUB_TOKEN": "${T.github}" `);
     chmodSync(join(home, ".zshrc"), 0o000);
     try {
-      const findings = scan({ home, roots: [join(root, "does-not-exist")] });
+      const findings = scan({ home, roots: [join(root, "does-not-exist")] }).findings;
       expect(summary(findings)).toEqual(["~/.claude.json|GITHUB_TOKEN|GitHub"]);
     } finally {
       chmodSync(join(home, ".zshrc"), 0o600);
@@ -219,7 +239,7 @@ describe("scan locations", () => {
     git(repo, "add", ".env.production", ".mcp.json");
     git(repo, "commit", "-qm", "init");
 
-    const findings = scan({ home, roots: [root] });
+    const findings = scan({ home, roots: [root] }).findings;
     const sev = Object.fromEntries(findings.map((f) => [f.file.slice(repo.length + 1), [f.severity, f.tracked]]));
     expect(sev).toEqual({
       ".env.production": ["tracked", true],
@@ -230,27 +250,15 @@ describe("scan locations", () => {
 });
 
 describe("scan command", () => {
-  const cli = join(import.meta.dir, "cli.ts");
-
-  function run(...args: string[]) {
-    const r = Bun.spawnSync(["bun", "run", cli, "scan", ...args], {
-      env: { ...process.env, HOME: home, AGENTPASS_HOME: join(home, ".agentpass") },
-      cwd: root,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
-  }
-
   test("exits 0 with nothing found", () => {
     put(join(root, "clean/.git/HEAD"), "");
     put(join(root, "clean/.env"), "PORT=3000\nAPI_KEY={{secret:openai}}\n");
-    const r = run("--root", root);
+    const r = run(["--root", root]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("No plaintext secrets found");
-    const j = run("--json");
+    const j = run(["--json"]);
     expect(j.code).toBe(0);
-    expect(JSON.parse(j.out)).toEqual({ findings: [], secrets: 0, files: 0 });
+    expect(JSON.parse(j.out)).toEqual({ findings: [], secrets: 0, files: 0, skipped: [] });
   });
 
   test("reports grouped, masked findings and never prints raw values", () => {
@@ -265,25 +273,124 @@ describe("scan command", () => {
     const other = join(home, "other");
     put(join(other, ".env"), `GROQ_API_KEY=${T.groq}\n`);
 
-    const human = run("--root", root, "--root", other);
+    const human = run(["--root", root, "--root", other]);
     expect(human.code).toBe(1);
     expect(human.out).toContain("Found 5 plaintext secrets in 4 files that your AI agents can read.");
     expect(human.out).toContain("sk-p…Ya");
     const order = ["tracked in git", "agent config", "shell rc", "untracked .env"].map((label) => human.out.indexOf(label));
     expect(order.every((i, n) => i >= 0 && (n === 0 || i > order[n - 1]!))).toBe(true);
 
-    const json = run("--json", "--root", root, "--root", other);
+    const json = run(["--json", "--root", root, "--root", other]);
     expect(json.code).toBe(1);
     const parsed = JSON.parse(json.out);
     expect(parsed.secrets).toBe(5);
     expect(parsed.files).toBe(4);
     expect(parsed.findings[0]).toMatchObject({ severity: "tracked", tracked: true });
 
-    for (const r of [human, json]) {
-      for (const raw of [...Object.values(T), BODY.slice(2, 14)]) {
-        expect(r.out).not.toContain(raw);
-        expect(r.err).not.toContain(raw);
-      }
+    for (const r of [human, json]) expect(leaks(r.out + r.err, Object.values(T))).toEqual([]);
+  });
+
+  test("rejects --root without a value as a usage error", () => {
+    for (const args of [["--root"], ["--root", "--json"], ["--bogus"]]) {
+      const r = run(args);
+      expect([args, r.code]).toEqual([args, 2]);
+      expect(r.out).toBe("");
+      expect(r.err).toContain("Usage");
     }
+  });
+
+  test("keeps going without git on PATH", () => {
+    const empty = join(root, "nobin");
+    mkdirSync(empty);
+    put(join(home, ".zshrc"), `export OPENAI_API_KEY=${T.openaiProj}\n`);
+    const r = run(["--json", "--root", root], { PATH: empty });
+    expect(r.code).toBe(1);
+    expect(JSON.parse(r.out).findings).toMatchObject([{ name: "OPENAI_API_KEY", tracked: false }]);
+  });
+});
+
+describe("scan hardening", () => {
+  test("never leaks secret fragments through names or paths", () => {
+    const left = "x9" + "KEY" + "Q7mZ4kR9vT2w";
+    const right = "pH6jF1dS0gYaUe3Lm8Nb2Vc5Xz";
+    const left2 = "Zq8" + "KEYabc4521mnB";
+    const keySecret = "ghp" + "_" + "Lm8Nb2Vc5XzQ7mZ4kR9vT2wX8nB5cL3pH6j";
+    const tableSecret = "Wq8" + "Lm8Nb2Vc5XzQ7mZ4kR9vT2wX8nB5c";
+    put(
+      join(home, ".claude/settings.json"),
+      JSON.stringify({
+        env: { API_TOKEN: `${left}:${right}`, OTHER: `${left2}=${T.github}` },
+        tokens: { [keySecret]: { auth: `Bearer ${T.anthropic}` } },
+      })
+    );
+    put(join(home, ".codex/config.toml"), `[mcp_servers."${tableSecret}"]\nenv = { OPENAI_API_KEY = "${T.openaiProj}" }\n`);
+
+    const findings = scan({ home, roots: [] }).findings;
+    expect(findings.length).toBe(4);
+    expect(findings.find((f) => f.service === "Anthropic")?.path).toEqual(["tokens", mask(keySecret), "auth"]);
+    expect(findings.find((f) => f.file.endsWith(".toml"))?.path).toEqual(["mcp_servers", mask(tableSecret), "OPENAI_API_KEY"]);
+    const secrets = [left, right, left2, keySecret, tableSecret, ...Object.values(T)];
+    expect(leaks(JSON.stringify(findings), secrets)).toEqual([]);
+    for (const args of [["--root", root], ["--json", "--root", root]]) {
+      const r = run(args);
+      expect(r.code).toBe(1);
+      expect(leaks(r.out + r.err, secrets)).toEqual([]);
+    }
+  });
+
+  test("does not run repo-configured fsmonitor hooks", () => {
+    const repo = join(root, "evil");
+    mkdirSync(repo);
+    git(repo, "init", "-q");
+    put(join(repo, ".env"), `OPENAI_API_KEY=${T.openaiProj}\n`);
+    git(repo, "add", "-f", ".env");
+    git(repo, "commit", "-qm", "x");
+    const marker = join(root, "PWNED");
+    put(join(root, "hook.sh"), `#!/bin/sh\ntouch "${marker}"\nexit 1\n`);
+    chmodSync(join(root, "hook.sh"), 0o755);
+    git(repo, "config", "core.fsmonitor", join(root, "hook.sh"));
+
+    const findings = scan({ home, roots: [repo] }).findings;
+    expect(existsSync(marker)).toBe(false);
+    expect(findings).toMatchObject([{ tracked: true }]);
+  });
+
+  test("reports a symlinked dotfile tracked in its real repo", () => {
+    const dotfiles = join(root, "dotfiles");
+    mkdirSync(dotfiles);
+    git(dotfiles, "init", "-q");
+    put(join(dotfiles, "zshrc"), `export OPENAI_API_KEY=${T.openaiProj}\n`);
+    git(dotfiles, "add", "zshrc");
+    git(dotfiles, "commit", "-qm", "x");
+    symlinkSync(join(dotfiles, "zshrc"), join(home, ".zshrc"));
+
+    expect(scan({ home, roots: [] }).findings).toMatchObject([{ severity: "tracked", tracked: true }]);
+  });
+
+  test("skips oversized files and lines quickly and says so", () => {
+    put(join(home, ".zshrc"), `export A=${"a".repeat(80_000)}\nexport OPENAI_API_KEY=${T.openaiProj}\n`);
+    put(join(home, ".claude.json"), JSON.stringify({ env: { GITHUB_TOKEN: T.github }, pad: "b".repeat(1_100_000) }));
+
+    const start = performance.now();
+    const result = scan({ home, roots: [] });
+    expect(performance.now() - start).toBeLessThan(200);
+    expect(summary(result.findings)).toEqual(["~/.zshrc|OPENAI_API_KEY|OpenAI"]);
+    expect(result.skipped.sort()).toEqual([join(home, ".claude.json"), join(home, ".zshrc")].sort());
+
+    expect(run(["--root", root]).out).toContain("Skipped oversized content in 2 files");
+    rmSync(join(home, ".zshrc"));
+    const clean = run(["--root", root]);
+    expect(clean.code).toBe(0);
+    expect(clean.out).not.toContain("No plaintext secrets found");
+    expect(clean.out).toContain("Skipped oversized content in 1 file");
+  });
+
+  test("scans every settings*.json under .claude", () => {
+    put(join(root, "app/.claude/settings.team.json"), JSON.stringify({ env: { GITHUB_TOKEN: T.github } }));
+    put(join(home, ".claude/settings.work.json"), JSON.stringify({ env: { GROQ_API_KEY: T.groq } }));
+    expect(summary(scan({ home, roots: [root] }).findings)).toEqual([
+      "@/app/.claude/settings.team.json|GITHUB_TOKEN|GitHub",
+      "~/.claude/settings.work.json|GROQ_API_KEY|Groq",
+    ]);
   });
 });

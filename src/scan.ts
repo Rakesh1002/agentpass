@@ -1,5 +1,4 @@
-import { parseArgs } from "util";
-import { readdirSync, readFileSync, statSync } from "fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join, resolve } from "path";
 
@@ -44,8 +43,12 @@ const PATTERNS: [string, RegExp][] = [
 
 const SECRET_NAME = /KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION|(?:^|[_-])PAT(?:$|[_-])/i;
 const PUBLIC_NAME = /PUBLIC|PUBLISHABLE/i;
-const PLACEHOLDER = /\{\{secret:|\$\{|^\$|your[-_ ]|x{4,}|^x+$|change[-_]?me|example|placeholder|dummy|redacted|replace[-_]?me|<[^>]*>|\*{3,}/i;
-const ASSIGN = /["']?([A-Za-z_][\w.-]*)["']?\s*[=:]\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`,;)}\]]+))/g;
+const PLACEHOLDER = /\{\{secret:|\$\{|^\$|your[-_ ]|x{4,}|^x+$|change[-_]?me|example|placeholder|dummy|redacted|replace[-_]?me|<[^<>]*>|\*{3,}/i;
+// Names start only at a token boundary so a long run cannot backtrack quadratically.
+const ASSIGN = /(?:["']([A-Za-z_]\w{0,63})["']\s*:|(?<![\w.])([A-Za-z_]\w{0,63})\s*=)\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`,;)}\]]+))/g;
+const DISPLAY_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_STRING = 16 * 1024;
 
 function entropy(s: string): number {
   const counts = new Map<string, number>();
@@ -80,6 +83,16 @@ export function detect(name: string, value: string): { service: string; token: s
   return null;
 }
 
+function secretish(s: string): boolean {
+  if (detect("", s)) return true;
+  const mixes = s.match(/[A-Za-z]\d|\d[A-Za-z]/g)?.length ?? 0;
+  return s.length >= 8 && mixes >= 2 && !/^[~.]?\//.test(s) && entropy(s) >= 3;
+}
+
+function safeName(n: string): string {
+  return DISPLAY_NAME.test(n) && !secretish(n) ? n : "";
+}
+
 interface Hit {
   name: string;
   service: string;
@@ -89,21 +102,27 @@ interface Hit {
 function scanString(name: string, value: string): Hit[] {
   const hits: Hit[] = [];
   for (const m of value.matchAll(ASSIGN)) {
-    const key = m[1]!;
-    const hit = detect(key, m[2] ?? m[3] ?? m[4] ?? "");
-    if (hit) hits.push({ name: key, ...hit });
+    const key = (m[1] ?? m[2])!;
+    const hit = detect(key, m[3] ?? m[4] ?? m[5] ?? "");
+    if (hit) hits.push({ ...hit, name: safeName(key) || safeName(name) });
   }
   if (hits.length > 0) return hits;
   const hit = detect(name, value);
-  return hit ? [{ name, ...hit }] : [];
+  return hit ? [{ ...hit, name: safeName(name) }] : [];
 }
 
 type Raw = Omit<Finding, "severity" | "tracked" | "preview"> & { token: string };
+type Scanned = { raws: Raw[]; oversized: boolean };
 
-function scanLines(file: string, text: string, toml: boolean): Raw[] {
-  const out: Raw[] = [];
+function scanLines(file: string, text: string, toml: boolean): Scanned {
+  const raws: Raw[] = [];
+  let oversized = false;
   let table: string[] = [];
   text.split("\n").forEach((rawLine, i) => {
+    if (rawLine.length > MAX_STRING) {
+      oversized = true;
+      return;
+    }
     const header = toml ? rawLine.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/) : null;
     if (header) {
       table = header[1]!.split(".").map((k) => k.trim().replace(/^["']|["']$/g, ""));
@@ -111,23 +130,25 @@ function scanLines(file: string, text: string, toml: boolean): Raw[] {
     }
     const line = rawLine.replace(/^\s*set\s+(?:-\w+\s+)+([A-Za-z_]\w*)\s+/, "$1=");
     for (const hit of scanString("", line)) {
-      out.push({ file, line: i + 1, ...(toml ? { path: [...table, hit.name] } : {}), ...hit });
+      raws.push({ file, line: i + 1, ...(toml ? { path: [...table, hit.name] } : {}), ...hit });
     }
   });
-  return out;
+  return { raws, oversized };
 }
 
-function scanJson(file: string, text: string): Raw[] {
+function scanJson(file: string, text: string): Scanned {
   let data: unknown;
   try {
     data = JSON.parse(text);
   } catch {
     return scanLines(file, text, false);
   }
-  const out: Raw[] = [];
+  const raws: Raw[] = [];
+  let oversized = false;
   const walk = (v: unknown, path: (string | number)[], name: string) => {
     if (typeof v === "string") {
-      for (const hit of scanString(name, v)) out.push({ file, path, ...hit });
+      if (v.length > MAX_STRING) oversized = true;
+      else for (const hit of scanString(name, v)) raws.push({ file, path, ...hit });
     } else if (Array.isArray(v)) {
       v.forEach((x, i) => walk(x, [...path, i], name));
     } else if (v && typeof v === "object") {
@@ -135,20 +156,56 @@ function scanJson(file: string, text: string): Raw[] {
     }
   };
   walk(data, [], "");
-  return out;
+  return { raws, oversized };
 }
 
+// ls-files runs inside untrusted repos: core.fsmonitor would execute a repo-chosen program and a
+// partial clone could lazily fetch (running ssh or credential helpers), so both are disabled.
 function isTracked(file: string): boolean {
-  const r = Bun.spawnSync(["git", "-C", dirname(file), "ls-files", "--error-unmatch", "--", basename(file)], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  return r.exitCode === 0;
+  try {
+    const real = realpathSync(file);
+    const r = Bun.spawnSync(
+      [
+        "git",
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.allow=never",
+        "-C",
+        dirname(real),
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        basename(real),
+      ],
+      {
+        stdout: "ignore",
+        stderr: "ignore",
+        env: { ...process.env, GIT_PAGER: "cat", GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+      }
+    );
+    return r.exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "vendor", "Library"]);
 const ENV_TEMPLATES = new Set([".env.example", ".env.sample", ".env.template"]);
 const MAX_DEPTH = 4;
+
+function claudeSettings(dir: string): [string, Severity][] {
+  try {
+    return readdirSync(dir)
+      .filter((n) => /^settings.*\.json$/.test(n))
+      .map((n): [string, Severity] => [join(dir, n), "agent-config"]);
+  } catch {
+    return [];
+  }
+}
 
 function repoCandidates(root: string): [string, Severity][] {
   const out: [string, Severity][] = [];
@@ -162,11 +219,8 @@ function repoCandidates(root: string): [string, Severity][] {
     for (const e of entries) {
       const p = join(dir, e.name);
       if (e.isDirectory()) {
-        if (e.name === ".claude") {
-          out.push([join(p, "settings.json"), "agent-config"], [join(p, "settings.local.json"), "agent-config"]);
-        } else if (depth < MAX_DEPTH && !SKIP_DIRS.has(e.name) && !e.name.startsWith(".")) {
-          visit(p, depth + 1);
-        }
+        if (e.name === ".claude") out.push(...claudeSettings(p));
+        else if (depth < MAX_DEPTH && !SKIP_DIRS.has(e.name) && !e.name.startsWith(".")) visit(p, depth + 1);
       } else if (e.isFile()) {
         if (e.name === ".mcp.json") out.push([p, "agent-config"]);
         else if ((e.name === ".env" || e.name.startsWith(".env.")) && !ENV_TEMPLATES.has(e.name)) out.push([p, "env-file"]);
@@ -177,38 +231,53 @@ function repoCandidates(root: string): [string, Severity][] {
   return out;
 }
 
-export function scan(opts: { home: string; roots: string[] }): Finding[] {
+export function scan(opts: { home: string; roots: string[] }): { findings: Finding[]; skipped: string[] } {
   const h = opts.home;
   const candidates: [string, Severity][] = [
     ...[".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile", ".config/fish/config.fish"].map(
       (f): [string, Severity] => [join(h, f), "shell-rc"]
     ),
-    ...[".claude.json", ".claude/settings.json", ".claude/settings.local.json", ".codex/config.toml", ".gemini/settings.json", ".cursor/mcp.json"].map(
+    ...[".claude.json", ".codex/config.toml", ".gemini/settings.json", ".cursor/mcp.json"].map(
       (f): [string, Severity] => [join(h, f), "agent-config"]
     ),
+    ...claudeSettings(join(h, ".claude")),
     ...opts.roots.flatMap((r) => repoCandidates(resolve(r))),
   ];
 
   const seen = new Set<string>();
   const findings: Finding[] = [];
+  const skipped: string[] = [];
   for (const [file, kind] of candidates) {
     if (seen.has(file)) continue;
     seen.add(file);
     let text: string;
     try {
-      if (!statSync(file).isFile()) continue;
+      const st = statSync(file);
+      if (!st.isFile()) continue;
+      if (st.size > MAX_FILE_BYTES) {
+        skipped.push(file);
+        continue;
+      }
       text = readFileSync(file, "utf-8");
     } catch {
       continue;
     }
-    const raws = file.endsWith(".json") ? scanJson(file, text) : scanLines(file, text, file.endsWith(".toml"));
+    const { raws, oversized } = file.endsWith(".json") ? scanJson(file, text) : scanLines(file, text, file.endsWith(".toml"));
+    if (oversized) skipped.push(file);
     if (raws.length === 0) continue;
     const tracked = isTracked(file);
-    for (const { token, ...rest } of raws) {
-      findings.push({ ...rest, preview: mask(token), severity: tracked ? "tracked" : kind, tracked });
+    for (const { token, path, ...rest } of raws) {
+      findings.push({
+        ...rest,
+        ...(path ? { path: path.map((k) => (typeof k === "string" && secretish(k) ? mask(k) : k)) } : {}),
+        preview: mask(token),
+        severity: tracked ? "tracked" : kind,
+        tracked,
+      });
     }
   }
-  return findings.sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
+  findings.sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
+  return { findings, skipped };
 }
 
 export function mask(value: string): string {
@@ -224,29 +293,45 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-export function runScan(args: string[]): number {
-  const { values } = parseArgs({
-    args,
-    options: {
-      root: { type: "string", multiple: true },
-      json: { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-    strict: false,
-  });
-  const roots = Array.isArray(values.root) ? values.root.filter((r): r is string => typeof r === "string") : [];
-  const home = homedir();
-  const findings = scan({ home, roots: roots.length > 0 ? roots : [process.cwd()] });
-  const files = [...new Set(findings.map((f) => f.file))];
+const USAGE = "Usage: agentpass scan [--root <dir>]... [--json]";
 
-  if (values.json) {
-    console.log(JSON.stringify({ findings, secrets: findings.length, files: files.length }, null, 2));
-    return findings.length > 0 ? 1 : 0;
+function parseScanArgs(args: string[]): { roots: string[]; json: boolean } | null {
+  const roots: string[] = [];
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const next = args[i + 1];
+    if (a === "--json") json = true;
+    else if (a.startsWith("--root=") && a.length > 7) roots.push(a.slice(7));
+    else if (a === "--root" && next && !next.startsWith("--")) roots.push(args[++i]!);
+    else return null;
   }
+  return { roots, json };
+}
 
-  if (findings.length === 0) {
-    console.log("No plaintext secrets found in the places your AI agents read.");
-    return 0;
+export function runScan(args: string[]): number {
+  const opts = parseScanArgs(args);
+  if (!opts) {
+    console.error(USAGE);
+    return 2;
+  }
+  try {
+    return report(opts.roots.length > 0 ? opts.roots : [process.cwd()], opts.json);
+  } catch {
+    console.error("agentpass scan: internal error");
+    return 2;
+  }
+}
+
+function report(roots: string[], json: boolean): number {
+  const home = homedir();
+  const { findings, skipped } = scan({ home, roots });
+  const files = [...new Set(findings.map((f) => f.file))];
+  const code = findings.length > 0 ? 1 : 0;
+
+  if (json) {
+    console.log(JSON.stringify({ findings, secrets: findings.length, files: files.length, skipped }, null, 2));
+    return code;
   }
 
   const display = (file: string) => (file.startsWith(home + "/") ? "~" + file.slice(home.length) : file);
@@ -257,8 +342,16 @@ export function runScan(args: string[]): number {
       console.log(`  ${f.name || "(inline)"}  ${f.service}  ${f.preview}  (${where(f)})`);
     }
   }
-  console.log(
-    `\nFound ${plural(findings.length, "plaintext secret")} in ${plural(files.length, "file")} that your AI agents can read.`
-  );
-  return 1;
+  const skippedNote = skipped.length > 0 ? `Skipped oversized content in ${plural(skipped.length, "file")}.` : "";
+  if (findings.length > 0) {
+    console.log(
+      `\nFound ${plural(findings.length, "plaintext secret")} in ${plural(files.length, "file")} that your AI agents can read.`
+    );
+    if (skippedNote) console.log(skippedNote);
+  } else if (skippedNote) {
+    console.log(`Nothing detected in the scanned content. ${skippedNote}`);
+  } else {
+    console.log("No plaintext secrets found in the places your AI agents read.");
+  }
+  return code;
 }
