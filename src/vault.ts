@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { agentPassDir, saltFile, vaultFile } from "./paths";
 import { effectivePins, parseStoredPins, validatePins, type Pin } from "./egress";
 
@@ -7,6 +7,21 @@ const VERIFIER_PREFIX = "agentpass-verifier:";
 const SCHEMA_VERSION = "2";
 // other processes (agentpass add/pins) write the same file, so cached hosts expire quickly
 const PINNED_HOSTS_TTL_MS = 5000;
+
+export type UnlockMode = "keychain" | "passphrase";
+
+export function vaultUnlockMode(): UnlockMode {
+  const db = new Database(vaultFile());
+  try {
+    const row = db.query(`SELECT value FROM meta WHERE key = 'unlockMode'`).get() as { value: string } | undefined;
+    return row?.value === "keychain" ? "keychain" : "passphrase";
+  } catch {
+    // v1 vaults have no meta table and predate keychain mode
+    return "passphrase";
+  } finally {
+    db.close();
+  }
+}
 
 interface Secret {
   id: string;
@@ -111,12 +126,12 @@ export class Vault {
     );
   }
 
-  private async encrypt(plaintext: string): Promise<string> {
-    if (!this.encryptionKey) throw new Error("Vault not unlocked");
+  private async encrypt(plaintext: string, key = this.encryptionKey): Promise<string> {
+    if (!key) throw new Error("Vault not unlocked");
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = await crypto.subtle.encrypt(
       { name: "AES-GCM", iv },
-      this.encryptionKey,
+      key,
       new TextEncoder().encode(plaintext)
     );
     const combined = new Uint8Array(iv.length + ciphertext.byteLength);
@@ -125,23 +140,23 @@ export class Vault {
     return Buffer.from(combined).toString("base64");
   }
 
-  private async decrypt(ciphertext: string): Promise<string> {
-    if (!this.encryptionKey) throw new Error("Vault not unlocked");
+  private async decrypt(ciphertext: string, key = this.encryptionKey): Promise<string> {
+    if (!key) throw new Error("Vault not unlocked");
     const combined = Buffer.from(ciphertext, "base64");
     const iv = combined.subarray(0, 12);
     const data = combined.subarray(12);
     const plaintext = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv },
-      this.encryptionKey,
+      key,
       data
     );
     return new TextDecoder().decode(plaintext);
   }
 
-  private async writeVerifier(): Promise<void> {
+  private async writeVerifier(key = this.encryptionKey): Promise<void> {
     if (!this.db) throw new Error("Vault not initialized");
 
-    const verifier = await this.encrypt(`${VERIFIER_PREFIX}${crypto.randomUUID()}`);
+    const verifier = await this.encrypt(`${VERIFIER_PREFIX}${crypto.randomUUID()}`, key);
     this.db.run(
       `INSERT OR REPLACE INTO meta (key, value) VALUES ('passwordVerifier', ?)`,
       [verifier]
@@ -293,6 +308,51 @@ export class Vault {
       out.push({ name: row.name, value: await this.decrypt(row.value), pins: parseStoredPins(row.pins) });
     }
     return out;
+  }
+
+  setUnlockMode(mode: UnlockMode): void {
+    if (!this.db) throw new Error("Vault not initialized");
+    this.db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('unlockMode', ?)`, [mode]);
+  }
+
+  // Re-encrypts every value under newPassword in one write transaction; returns the backup path.
+  async rekey(newPassword: string, mode: UnlockMode): Promise<string> {
+    if (!this.db || !this.encryptionKey) throw new Error("Vault not unlocked");
+    const db = this.db;
+    const backup = `${vaultFile()}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    const newKey = await this.deriveKey(newPassword);
+
+    // IMMEDIATE takes the write lock, so no other process can add a value under the old key mid-rekey
+    db.run("BEGIN IMMEDIATE");
+    try {
+      for (const suffix of ["", "-wal", "-shm"]) {
+        if (existsSync(vaultFile() + suffix)) copyFileSync(vaultFile() + suffix, backup + suffix);
+      }
+      const rows = db.query(`SELECT id, name, value FROM secrets`).all() as { id: string; name: string; value: string }[];
+      const plaintexts = new Map<string, string>();
+      for (const row of rows) {
+        const plaintext = await this.decrypt(row.value).catch(() => {
+          throw new Error(`Could not decrypt "${row.name}"; nothing was changed`);
+        });
+        plaintexts.set(row.id, plaintext);
+        db.run(`UPDATE secrets SET value = ? WHERE id = ?`, [await this.encrypt(plaintext, newKey), row.id]);
+      }
+      await this.writeVerifier(newKey);
+      this.setUnlockMode(mode);
+
+      const written = db.query(`SELECT id, name, value FROM secrets`).all() as { id: string; name: string; value: string }[];
+      for (const row of written) {
+        const roundTrip = await this.decrypt(row.value, newKey).catch(() => null);
+        if (roundTrip !== plaintexts.get(row.id)) throw new Error(`"${row.name}" did not verify under the new key; nothing was changed`);
+      }
+      db.run("COMMIT");
+    } catch (err) {
+      db.run("ROLLBACK");
+      throw err;
+    }
+    this.encryptionKey = newKey;
+    this.hostCache = null;
+    return backup;
   }
 
   check(): boolean {
