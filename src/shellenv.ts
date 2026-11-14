@@ -3,7 +3,8 @@ import http from "http";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { certificateAuthority } from "./ca";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { BASE_URLS, MANIFEST_NAME, UntrustedError, homeDir, resolveProject } from "./project";
+import { basename } from "path";
+import { BASE_URLS, MANIFEST_NAME, UntrustedError, gitHead, homeDir, resolveProject } from "./project";
 import { PROVIDERS } from "./providers";
 import { allowedFile } from "./trust";
 
@@ -71,9 +72,23 @@ export function proxyReachable(port: number): Promise<boolean> {
   });
 }
 
+const tagPart = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "-");
+
+// <repo>@<branch>[+<agent>]; the proxy accepts ^[A-Za-z0-9._@+-]{1,96}$ after URL-decoding.
+export function sessionTag(dir: string, agent?: string): string | null {
+  const head = gitHead(dir);
+  const suffix = agent ? `+${tagPart(basename(agent)).slice(0, 32)}` : "";
+  const base = head ? `${tagPart(head.repo)}@${tagPart(head.ref)}` : "";
+  return base.slice(0, 96 - suffix.length) + suffix || null;
+}
+
 // The hook warns about an unreviewed manifest and still applies global defaults; env and run refuse it.
 // With no live proxy (port null) only the placeholders are exported.
-export function buildEnv(dir: string, port: number | null = livePort(), { hook = false } = {}): Record<string, string> {
+export function buildEnv(
+  dir: string,
+  port: number | null = livePort(),
+  { hook = false, agent }: { hook?: boolean; agent?: string } = {}
+): Record<string, string> {
   const env: Record<string, string> = {};
   const project = resolveProject(dir);
   if (project.manifest && !project.trusted) {
@@ -82,14 +97,17 @@ export function buildEnv(dir: string, port: number | null = livePort(), { hook =
     project.warnings.push(untrusted.message);
   }
   for (const warning of project.warnings) console.error(`agentpass: ${warning}`);
-  const proxyUrl = port === null ? null : `http://127.0.0.1:${port}`;
+  const tag = port === null ? null : sessionTag(dir, agent);
+  const t = tag ? encodeURIComponent(tag) : null;
+  const route = port === null ? null : `http://127.0.0.1:${port}${t ? `/_t/${t}` : ""}`;
   for (const [name, { secret }] of Object.entries(project.env)) {
     env[name] = `{{secret:${secret}}}`;
     const provider = PROVIDERS.find((p) => p.name === secret.split("-")[0]);
     const base = provider && BASE_URLS[provider.name];
-    if (proxyUrl && provider && base) env[base.env] = `${proxyUrl}${provider.pathPrefix}${base.path}`;
+    if (route && provider && base) env[base.env] = `${route}${provider.pathPrefix}${base.path}`;
   }
-  if (!proxyUrl) return env;
+  if (port === null) return env;
+  const proxyUrl = `http://${t ? `${t}@` : ""}127.0.0.1:${port}`;
   Object.assign(env, {
     HTTP_PROXY: proxyUrl,
     HTTPS_PROXY: proxyUrl,
@@ -110,14 +128,19 @@ const PROXY_DOWN = "agentpass: the proxy is not running, so placeholders reach s
 export function envOutput(dir: string, format: EnvFormat, hook = false): string {
   const port = livePort();
   const env = buildEnv(dir, port, { hook });
+  const fish = format === "fish";
   let out = formatEnv(env, format);
-  if (port !== null || Object.keys(env).length === 0) return out;
-  if (!hook) console.error(PROXY_DOWN);
-  else if (format === "fish") {
-    out += `set -q _AGENTPASS_WARNED_PROXY; or begin; set -g _AGENTPASS_WARNED_PROXY 1; echo ${fishQuote(PROXY_DOWN)} >&2; end;\n`;
-  } else {
-    out += `[[ -n \${_AGENTPASS_WARNED_PROXY-} ]] || { _AGENTPASS_WARNED_PROXY=1; echo ${shQuote(PROXY_DOWN)} >&2; };\n`;
+  if (port === null && Object.keys(env).length > 0) {
+    if (!hook) console.error(PROXY_DOWN);
+    else if (fish) {
+      out += `set -q _AGENTPASS_WARNED_PROXY; or begin; set -g _AGENTPASS_WARNED_PROXY 1; echo ${fishQuote(PROXY_DOWN)} >&2; end;\n`;
+    } else {
+      out += `[[ -n \${_AGENTPASS_WARNED_PROXY-} ]] || { _AGENTPASS_WARNED_PROXY=1; echo ${shQuote(PROXY_DOWN)} >&2; };\n`;
+    }
   }
+  // The hook adds HEAD to its cache key so a branch switch updates the session tag.
+  const head = hook && gitHead(dir);
+  if (head) out += fish ? `set -g _AGENTPASS_WATCH ${fishQuote(head.file)};\n` : `_AGENTPASS_WATCH=${shQuote(head.file)};\n`;
   return out;
 }
 
@@ -167,8 +190,8 @@ export function formatEnv(env: Record<string, string>, format: EnvFormat): strin
 export function hookScript(shell: Shell, cmd: string[]): string {
   const quote = shell === "fish" ? fishQuote : shQuote;
   const run = cmd.map((s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : quote(s))).join(" ");
-  // mtime + size so a same-second edit still changes the key.
-  const statFmt = process.platform === "linux" ? "-c '%Y %s'" : "-f '%m %z'";
+  // mtime + size + inode so a same-second edit, or git and editors renaming a file into place, changes the key.
+  const statFmt = process.platform === "linux" ? "-c '%Y %s %i'" : "-f '%m %z %i'";
   const watched = [globalConfigFile(), daemonFile(), allowedFile()].map(quote).join(" ");
   // Same walk as project.ts over physical paths: stop at the git toplevel or HOME, never look above HOME.
   const home = homeDir();
@@ -176,7 +199,11 @@ export function hookScript(shell: Shell, cmd: string[]): string {
 
   if (shell === "fish") {
     const inHome = home ? `test (string sub -l ${[...prefix].length} -- "$d/") = ${quote(prefix)}` : "false";
-    return `function __agentpass_hook --on-variable PWD --on-event fish_prompt
+    return `function __agentpass_stat
+    command stat ${statFmt} $argv ${watched} $_AGENTPASS_WATCH 2>/dev/null
+    echo
+end
+function __agentpass_hook --on-variable PWD --on-event fish_prompt
     set -l d (pwd -P)
     set -l m ''
     set -l key ''
@@ -191,15 +218,17 @@ export function hookScript(shell: Shell, cmd: string[]): string {
             end
             set d (string replace -r '/[^/]*$' '' -- $d)
         end
-        set key "$m|"(command stat ${statFmt} $m ${watched} 2>/dev/null; echo)
+        set key "$m|"(__agentpass_stat $m)
     end
     test "$key" = "$__agentpass_key"; and return
-    set -g __agentpass_key $key
     if set -q _AGENTPASS_RESTORE
         eval $_AGENTPASS_RESTORE
     end
+    set -e _AGENTPASS_WATCH
+    set -g __agentpass_key $key
     if test -n "$key"
         ${run} env --hook --shell fish --dir $PWD | source
+        set -g __agentpass_key "$m|"(__agentpass_stat $m)
     end
 end
 __agentpass_hook
@@ -207,7 +236,8 @@ __agentpass_hook
   }
 
   const inHome = home ? `[[ "$d/" == ${quote(prefix)}* ]]` : "false";
-  const fn = `_agentpass_hook() {
+  const fn = `_agentpass_stat() { command stat ${statFmt} "$@" ${watched} "\${_AGENTPASS_WATCH-}" 2>/dev/null; }
+_agentpass_hook() {
   local d="${shell === "zsh" ? "${PWD:A}" : "$(pwd -P)"}" m="" key="" out
   if ${inHome}; then
     while :; do
@@ -215,13 +245,15 @@ __agentpass_hook
       [[ -e "$d/.git" || "$d" == ${quote(home ?? "")} || -z "$d" ]] && break
       d="\${d%/*}"
     done
-    key="$m|$(command stat ${statFmt} \${m:+"$m"} ${watched} 2>/dev/null)"
+    key="$m|$(_agentpass_stat \${m:+"$m"})"
   fi
   [[ "$key" == "\${_AGENTPASS_KEY-}" ]] && return 0
-  _AGENTPASS_KEY="$key"
   eval "\${_AGENTPASS_RESTORE-}"
+  unset _AGENTPASS_WATCH
+  _AGENTPASS_KEY="$key"
   [[ -z "$key" ]] && return 0
   out="$(${run} env --hook --shell ${shell} --dir "$PWD")" && eval "$out"
+  _AGENTPASS_KEY="$m|$(_agentpass_stat \${m:+"$m"})"
 }
 `;
   if (shell === "zsh") {

@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { globalConfigFile } from "./paths";
 import { allow, disallow, isAllowed, readOwnedFile } from "./trust";
 
@@ -109,6 +109,24 @@ export function gitRoot(dir: string): string | null {
   for (let d = resolve(dir); ; d = dirname(d)) {
     if (existsSync(join(d, ".git"))) return d;
     if (dirname(d) === d) return null;
+  }
+}
+
+// Reads HEAD instead of spawning git: no subprocess per cd, and the repo's config gets no say.
+export function gitHead(dir: string): { repo: string; file: string; ref: string } | null {
+  try {
+    const top = gitRoot(realpathSync(dir));
+    if (!top) return null;
+    const dotgit = join(top, ".git");
+    const gitdir = statSync(dotgit).isDirectory()
+      ? dotgit
+      : resolve(top, readFileSync(dotgit, "utf-8").match(/^gitdir: (.*)$/m)?.[1]?.trim() ?? "");
+    const file = join(gitdir, "HEAD");
+    const head = readFileSync(file, "utf-8").trim();
+    const ref = head.startsWith("ref: ") ? head.slice(5).replace(/^refs\/heads\//, "") : head.slice(0, 7);
+    return { repo: basename(top), file, ref };
+  } catch {
+    return null;
   }
 }
 

@@ -46,7 +46,7 @@ beforeAll(async () => {
 
   proj = join(root, "proj");
   mkdirSync(proj);
-  spawnSync("git", ["init", "-q"], { cwd: proj });
+  spawnSync("git", ["init", "-q", "-b", "main"], { cwd: proj });
 });
 
 afterAll(() => {
@@ -83,7 +83,7 @@ describe("cli", () => {
     try {
       const json = JSON.parse(cli(["env", "--shell", "json"]).out);
       expect(json.OPENAI_API_KEY).toBe("{{secret:openai}}");
-      expect(json.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+      expect(json.HTTPS_PROXY).toBe("http://proj%40main@127.0.0.1:8888");
     } finally {
       rmSync(join(home, "daemon.json"));
     }
@@ -122,7 +122,7 @@ describe("cli", () => {
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
       const r = await cliAsync(["run", "--", "sh", "-c", 'echo "$OPENAI_API_KEY $HTTPS_PROXY $KEEP"; exit 7']);
-      expect(r.out).toBe(`{{secret:openai}} http://127.0.0.1:${port} kept\n`);
+      expect(r.out).toBe(`{{secret:openai}} http://proj%40main%2Bsh@127.0.0.1:${port} kept\n`);
       expect(r.code).toBe(7);
     } finally {
       server.close();
@@ -138,7 +138,7 @@ describe("cli", () => {
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
       const r = await cliAsync(["run", "-p", "test-password", "--", "sh", "-c", 'echo "$HTTPS_PROXY"']);
-      expect(r.out).toContain(`http://127.0.0.1:${port}\n`);
+      expect(r.out).toContain(`http://proj%40main%2Bsh@127.0.0.1:${port}\n`);
       expect(r.code).toBe(0);
     } finally {
       rmSync(join(home, "daemon.json"));

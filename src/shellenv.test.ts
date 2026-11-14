@@ -170,6 +170,62 @@ describe("buildEnv", () => {
   });
 });
 
+describe("session tags", () => {
+  const TAG_RE = /^[A-Za-z0-9._@+-]{1,96}$/;
+
+  function tagged(dir: string, agent?: string) {
+    const env = buildEnv(dir, 8888, { agent });
+    const proxy = new URL(env.HTTPS_PROXY!);
+    const route = env.OPENAI_BASE_URL!.match(/^http:\/\/127\.0\.0\.1:8888\/_t\/([^/]+)\/openai\/v1$/);
+    const tag = decodeURIComponent(proxy.username);
+    expect(route && decodeURIComponent(route[1]!)).toBe(tag);
+    expect(proxy.host).toBe("127.0.0.1:8888");
+    expect(tag).toMatch(TAG_RE);
+    for (const k of ["HTTP_PROXY", "http_proxy", "https_proxy"]) expect(env[k]).toBe(env.HTTPS_PROXY);
+    return tag;
+  }
+
+  test("tag proxy userinfo and base URLs with repo@branch, a short sha when detached, and +agent for run", () => {
+    const repo = join(root, "tag-repo");
+    mkdirSync(join(repo, "sub"), { recursive: true });
+    git(repo, "init", "-q", "-b", "main");
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    expect(tagged(join(repo, "sub"))).toBe("tag-repo@main");
+    expect(buildEnv(join(repo, "sub"), 8888).HTTPS_PROXY).toBe("http://tag-repo%40main@127.0.0.1:8888");
+    expect(buildEnv(repo, 8888).OPENAI_BASE_URL).toBe("http://127.0.0.1:8888/_t/tag-repo%40main/openai/v1");
+    expect(tagged(repo, "/opt/bin/claude")).toBe("tag-repo@main+claude");
+
+    git(repo, "checkout", "-q", "-b", "feat/x#1,y");
+    expect(tagged(repo)).toBe("tag-repo@feat-x-1-y");
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x");
+    git(repo, "checkout", "-q", "--detach");
+    const sha = readFileSync(join(repo, ".git", "HEAD"), "utf-8").trim();
+    expect(tagged(repo)).toBe(`tag-repo@${sha.slice(0, 7)}`);
+
+    const wt = join(root, "tag wt!");
+    git(repo, "worktree", "add", "-q", "-b", "side", wt);
+    expect(tagged(wt, "codex")).toBe("tag-wt-@side+codex");
+  });
+
+  test("tags are capped at 96 chars and keep the agent suffix", () => {
+    const repo = join(root, "r".repeat(120));
+    mkdirSync(repo);
+    git(repo, "init", "-q", "-b", "main");
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    expect(tagged(repo).length).toBe(96);
+    const withAgent = tagged(repo, "claude");
+    expect(withAgent.length).toBe(96);
+    expect(withAgent).toEndWith("+claude");
+  });
+
+  test("no tag outside a repo", () => {
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    const env = buildEnv(root, 8888);
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+    expect(env.OPENAI_BASE_URL).toBe("http://127.0.0.1:8888/openai/v1");
+  });
+});
+
 describe("CA bundle", () => {
   test("combines system roots with the AgentPass CA and regenerates only when stale", () => {
     rmSync(caBundleFile(), { force: true });
@@ -375,6 +431,23 @@ echo "\${NODE_EXTRA_CA_CERTS-unset}:\${ANTHROPIC_BASE_URL-unset}"`
         ].join("\n")
       );
       expect(r.err.match(/agentpass up/g)?.length).toBe(1);
+    });
+
+    test(`${shell}: the session tag follows a branch switch without a second env run`, () => {
+      proxyUp();
+      const repo = join(user, `tagged-${shell}`);
+      mkdirSync(repo);
+      git(repo, "init", "-q", "-b", "main");
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x");
+      const r = runHook(
+        shell,
+        `cd "${repo}"; TICK; TICK; echo "$HTTPS_PROXY"
+git checkout -q -b dev1; TICK; TICK; echo "$HTTPS_PROXY"`
+      );
+      expect(r.out).toBe(
+        `http://tagged-${shell}%40main@127.0.0.1:8888\nhttp://tagged-${shell}%40dev1@127.0.0.1:8888\n`
+      );
+      expect(r.calls).toBe(2);
     });
 
     test(`${shell}: an edited manifest waits for allow, and a bad one warns once`, () => {

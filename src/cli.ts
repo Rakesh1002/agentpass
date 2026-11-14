@@ -456,7 +456,7 @@ async function handleRun(args: string[]) {
   }
 
   const child: ChildProcess = spawn(cmd, argv.slice(1), {
-    env: { ...process.env, ...buildEnv(process.cwd(), port) },
+    env: { ...process.env, ...buildEnv(process.cwd(), port, { agent: cmd }) },
     stdio: "inherit",
   });
 
