@@ -13,13 +13,14 @@ export function allowedFile(): string {
 }
 
 // Checks the open fd, not the path, so the file checked is the file read. O_NONBLOCK keeps a FIFO from hanging.
-export function readOwnedFile(path: string): Buffer {
+// checkMode=false is for hash-trusted files, where an edit already revokes trust.
+export function readOwnedFile(path: string, checkMode = true): Buffer {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error("not a regular file");
     if (st.uid !== process.getuid!()) throw new Error("not owned by you");
-    if (st.mode & 0o022) throw new Error(`group- or world-writable (fix: chmod go-w ${path})`);
+    if (checkMode && st.mode & 0o022) throw new Error(`group- or world-writable (fix: chmod go-w ${path})`);
     return readFileSync(fd);
   } finally {
     closeSync(fd);

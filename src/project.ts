@@ -157,7 +157,7 @@ function locate(dir: string, warnings: string[]): Manifest | null {
       try {
         const path = realpathSync(candidate);
         if (!within(path, home)) throw new Error("it resolves outside your home directory");
-        return { path, bytes: readOwnedFile(path) };
+        return { path, bytes: readOwnedFile(path, false) };
       } catch (err) {
         warnings.push(`ignoring ${candidate}: ${err instanceof Error ? err.message : err}`);
         return null;
@@ -184,7 +184,15 @@ export function resolveProject(dir: string): ResolvedProject {
     }
   };
   const global = globalConfigFile();
-  add(global, existsSync(global) ? parseConfig(global, readFileSync(global, "utf-8")) : {}, "global");
+  if (existsSync(global)) {
+    let text: string | null = null;
+    try {
+      text = readOwnedFile(global).toString("utf-8");
+    } catch (err) {
+      warnings.push(`ignoring ${global}: ${err instanceof Error ? err.message : err}`);
+    }
+    if (text !== null) add(global, parseConfig(global, text), "global");
+  }
   if (manifest && trusted) add(manifest.path, parseConfig(manifest.path, manifest.bytes.toString("utf-8")), "project");
   const sorted: Record<string, Mapping> = {};
   for (const name of Object.keys(env).sort()) sorted[name] = env[name]!;

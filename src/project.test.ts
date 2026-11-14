@@ -90,22 +90,17 @@ describe("manifest discovery", () => {
     ]);
   });
 
-  test("ignores manifests that are group- or world-writable or owned by someone else", () => {
+  test("trusts allowed manifests whatever their mode, and ignores ones owned by someone else", () => {
     const m = join(root, ".agentpass.json");
     write(m, { env: { OPENAI_API_KEY: "openai" } });
     allowManifest(root);
-    for (const mode of [0o664, 0o646]) {
+    // umask 002 checkouts are group-writable; the content hash, not the mode, decides trust
+    for (const mode of [0o664, 0o646, 0o644]) {
       chmodSync(m, mode);
-      expect(resolveProject(root)).toEqual({
-        manifest: null,
-        trusted: false,
-        env: {},
-        warnings: [`ignoring ${m}: group- or world-writable (fix: chmod go-w ${m})`],
-      });
-      expect(() => allowManifest(root)).toThrow("group- or world-writable");
+      expect(resolveProject(root).trusted).toBe(true);
     }
-    chmodSync(m, 0o644);
-    expect(resolveProject(root).trusted).toBe(true);
+    write(m, { env: { OPENAI_API_KEY: "openai", STRIPE_SECRET_KEY: "stripe" } });
+    expect(resolveProject(root).trusted).toBe(false);
 
     const fifo = join(root, "fifo");
     mkdirSync(fifo);
@@ -246,6 +241,19 @@ describe("manifest resolution", () => {
   test("validates the global config too", () => {
     write(join(home, "config.json"), { env: { "A-B": "x" } });
     expect(() => resolveProject(root)).toThrow('invalid env var name "A-B"');
+  });
+
+  test("ignores a global config that is group- or world-writable", () => {
+    const g = join(home, "config.json");
+    write(g, { env: { GROQ_API_KEY: "groq" } });
+    for (const mode of [0o664, 0o646]) {
+      chmodSync(g, mode);
+      const r = resolveProject(root);
+      expect(r.env).toEqual({});
+      expect(r.warnings).toEqual([`ignoring ${g}: group- or world-writable (fix: chmod go-w ${g})`]);
+    }
+    chmodSync(g, 0o644);
+    expect(resolveProject(root).env).toEqual({ GROQ_API_KEY: { secret: "groq", source: "global" } });
   });
 });
 
