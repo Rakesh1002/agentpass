@@ -22,6 +22,18 @@ export function proxyPort(): number {
   return DEFAULT_PORT;
 }
 
+// A stale daemon.json must not point every network command in the shell at a dead port.
+export function livePort(): number | null {
+  try {
+    const { pid, port } = JSON.parse(readFileSync(daemonFile(), "utf-8"));
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port <= 0 || port >= 65536) return null;
+    process.kill(pid, 0);
+    return port;
+  } catch {
+    return null;
+  }
+}
+
 function systemRoots(): string | null {
   if (process.platform === "darwin") {
     const r = spawnSync(
@@ -60,8 +72,8 @@ export function proxyReachable(port: number): Promise<boolean> {
 }
 
 // The hook warns about an unreviewed manifest and still applies global defaults; env and run refuse it.
-export function buildEnv(dir: string, port = proxyPort(), { hook = false } = {}): Record<string, string> {
-  const proxyUrl = `http://127.0.0.1:${port}`;
+// With no live proxy (port null) only the placeholders are exported.
+export function buildEnv(dir: string, port: number | null = livePort(), { hook = false } = {}): Record<string, string> {
   const env: Record<string, string> = {};
   const project = resolveProject(dir);
   if (project.manifest && !project.trusted) {
@@ -70,12 +82,14 @@ export function buildEnv(dir: string, port = proxyPort(), { hook = false } = {})
     project.warnings.push(untrusted.message);
   }
   for (const warning of project.warnings) console.error(`agentpass: ${warning}`);
+  const proxyUrl = port === null ? null : `http://127.0.0.1:${port}`;
   for (const [name, { secret }] of Object.entries(project.env)) {
     env[name] = `{{secret:${secret}}}`;
     const provider = PROVIDERS.find((p) => p.name === secret.split("-")[0]);
     const base = provider && BASE_URLS[provider.name];
-    if (provider && base) env[base.env] = `${proxyUrl}${provider.pathPrefix}${base.path}`;
+    if (proxyUrl && provider && base) env[base.env] = `${proxyUrl}${provider.pathPrefix}${base.path}`;
   }
+  if (!proxyUrl) return env;
   Object.assign(env, {
     HTTP_PROXY: proxyUrl,
     HTTPS_PROXY: proxyUrl,
@@ -91,8 +105,20 @@ export function buildEnv(dir: string, port = proxyPort(), { hook = false } = {})
   return env;
 }
 
+const PROXY_DOWN = "agentpass: the proxy is not running, so placeholders reach servers unreplaced. Start it with: agentpass up";
+
 export function envOutput(dir: string, format: EnvFormat, hook = false): string {
-  return formatEnv(buildEnv(dir, undefined, { hook }), format);
+  const port = livePort();
+  const env = buildEnv(dir, port, { hook });
+  let out = formatEnv(env, format);
+  if (port !== null || Object.keys(env).length === 0) return out;
+  if (!hook) console.error(PROXY_DOWN);
+  else if (format === "fish") {
+    out += `set -q _AGENTPASS_WARNED_PROXY; or begin; set -g _AGENTPASS_WARNED_PROXY 1; echo ${fishQuote(PROXY_DOWN)} >&2; end;\n`;
+  } else {
+    out += `[[ -n \${_AGENTPASS_WARNED_PROXY-} ]] || { _AGENTPASS_WARNED_PROXY=1; echo ${shQuote(PROXY_DOWN)} >&2; };\n`;
+  }
+  return out;
 }
 
 export function shQuote(value: string): string {
@@ -153,6 +179,7 @@ export function hookScript(shell: Shell, cmd: string[]): string {
     return `function __agentpass_hook --on-variable PWD --on-event fish_prompt
     set -l d (pwd -P)
     set -l m ''
+    set -l key ''
     if ${inHome}
         while true
             if test -f "$d/${MANIFEST_NAME}"
@@ -164,18 +191,15 @@ export function hookScript(shell: Shell, cmd: string[]): string {
             end
             set d (string replace -r '/[^/]*$' '' -- $d)
         end
-    end
-    set -l key ''
-    if test -n "$m"
-        set key "$m "(command stat ${statFmt} $m ${watched} 2>/dev/null | string join ' ')
+        set key "$m|"(command stat ${statFmt} $m ${watched} 2>/dev/null; echo)
     end
     test "$key" = "$__agentpass_key"; and return
     set -g __agentpass_key $key
     if set -q _AGENTPASS_RESTORE
         eval $_AGENTPASS_RESTORE
     end
-    if test -n "$m"
-        ${run} env --hook --shell fish --dir (string replace -r '[^/]*$' '' -- $m) | source
+    if test -n "$key"
+        ${run} env --hook --shell fish --dir $PWD | source
     end
 end
 __agentpass_hook
@@ -191,13 +215,13 @@ __agentpass_hook
       [[ -e "$d/.git" || "$d" == ${quote(home ?? "")} || -z "$d" ]] && break
       d="\${d%/*}"
     done
+    key="$m|$(command stat ${statFmt} \${m:+"$m"} ${watched} 2>/dev/null)"
   fi
-  [[ -n "$m" ]] && key="$m $(command stat ${statFmt} "$m" ${watched} 2>/dev/null)"
   [[ "$key" == "\${_AGENTPASS_KEY-}" ]] && return 0
   _AGENTPASS_KEY="$key"
   eval "\${_AGENTPASS_RESTORE-}"
-  [[ -z "$m" ]] && return 0
-  out="$(${run} env --hook --shell ${shell} --dir "\${m%/*}/")" && eval "$out"
+  [[ -z "$key" ]] && return 0
+  out="$(${run} env --hook --shell ${shell} --dir "$PWD")" && eval "$out"
 }
 `;
   if (shell === "zsh") {

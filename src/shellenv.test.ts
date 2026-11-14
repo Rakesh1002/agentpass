@@ -16,11 +16,19 @@ import { certificateAuthority } from "./ca";
 import { matchProvider } from "./providers";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
 import { allowManifest, forbiddenVar } from "./project";
-import { buildEnv, ensureCaBundle, formatEnv, hookScript, proxyPort } from "./shellenv";
+import { buildEnv, ensureCaBundle, formatEnv, hookScript, livePort, proxyPort } from "./shellenv";
 import { allow } from "./trust";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
 const USER_HOME = process.env.HOME;
+
+function proxyUp(port = 8888) {
+  writeFileSync(daemonFile(), JSON.stringify({ pid: process.pid, port }));
+}
+
+function deadPid() {
+  return spawnSync("true").pid;
+}
 
 function git(cwd: string, ...args: string[]) {
   const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
@@ -76,11 +84,30 @@ describe("proxy port", () => {
     writeFileSync(daemonFile(), "garbage");
     expect(proxyPort()).toBe(8888);
   });
+
+  test("the proxy is live only while daemon.json names a running pid", () => {
+    expect(livePort()).toBeNull();
+    writeFileSync(daemonFile(), JSON.stringify({ port: 9123 }));
+    expect(livePort()).toBeNull();
+    writeFileSync(daemonFile(), JSON.stringify({ pid: deadPid(), port: 9123 }));
+    expect(livePort()).toBeNull();
+    proxyUp(9123);
+    expect(livePort()).toBe(9123);
+  });
 });
 
 describe("buildEnv", () => {
+  test("without a live proxy only the placeholders are exported", () => {
+    expect(buildEnv(join(proj, "sub"))).toEqual({
+      OPENAI_API_KEY: "{{secret:openai-work}}",
+      STRIPE_SECRET_KEY: "{{secret:stripe-test}}",
+    });
+    writeFileSync(daemonFile(), JSON.stringify({ pid: deadPid(), port: 9123 }));
+    expect(Object.keys(buildEnv(join(proj, "sub")))).toEqual(["OPENAI_API_KEY", "STRIPE_SECRET_KEY"]);
+  });
+
   test("produces placeholders, proxy and CA settings without the vault", () => {
-    writeFileSync(daemonFile(), JSON.stringify({ port: 9123 }));
+    proxyUp(9123);
     const env = buildEnv(join(proj, "sub"));
     const proxyUrl = "http://127.0.0.1:9123";
     expect(env).toEqual({
@@ -246,6 +273,7 @@ ${body.replaceAll("TICK", tick)}`;
   for (const shell of ["bash", "zsh"] as const) {
     test(`${shell}: exports on entering a project and unsets on leaving`, () => {
       const p = "http://127.0.0.1:8888";
+      proxyUp();
       const r = runHook(
         shell,
         `show start
@@ -272,6 +300,7 @@ env | grep -c '^STRIPE_SECRET_KEY=' || true`
 
     test(`${shell}: restores the values a project overwrote, across project hops`, () => {
       const p = "http://127.0.0.1:8888";
+      proxyUp();
       const r = runHook(
         shell,
         `export HTTPS_PROXY=http://corp:3128 OPENAI_API_KEY=sk-mine ANTHROPIC_API_KEY=
@@ -299,8 +328,58 @@ env | grep -E '^(HTTPS_PROXY|OPENAI_API_KEY|ANTHROPIC_API_KEY)=' | sort`
       );
     });
 
+    test(`${shell}: global defaults apply in every directory under HOME and follow config edits`, () => {
+      const p = "http://127.0.0.1:8888";
+      proxyUp();
+      mkdirSync(join(user, "plain2", "deep"), { recursive: true });
+      writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai-global" } }));
+      const r = runHook(
+        shell,
+        `cd "${user}"; TICK; show home
+cd "${user}/plain2/deep"; TICK; show deep
+printf '%s' '{"env":{"OPENAI_API_KEY":"openai-edited","ANTHROPIC_API_KEY":"anthropic"}}' > "${globalConfigFile()}"
+TICK; show edited
+cd "${proj}"; TICK; show proj
+cd "${root}"; TICK; show out`
+      );
+      expect(r.err).toBe("");
+      expect(r.out).toBe(
+        [
+          `home:{{secret:openai-global}}:unset:${p}`,
+          `deep:{{secret:openai-global}}:unset:${p}`,
+          `edited:{{secret:openai-edited}}:{{secret:anthropic}}:${p}`,
+          `proj:{{secret:openai-work}}:{{secret:anthropic}}:${p}`,
+          "out:unset:unset:unset",
+          "",
+        ].join("\n")
+      );
+    });
+
+    test(`${shell}: proxy vars follow the daemon, and a dead proxy warns once per session`, () => {
+      const r = runHook(
+        shell,
+        `cd "${proj}"; TICK; show down
+cd "${other}"; TICK; show down2
+printf '%s' '{"pid":${process.pid},"port":9999}' > "${daemonFile()}"; TICK; show up
+rm "${daemonFile()}"; TICK; show stopped
+echo "\${NODE_EXTRA_CA_CERTS-unset}:\${ANTHROPIC_BASE_URL-unset}"`
+      );
+      expect(r.out).toBe(
+        [
+          "down:{{secret:openai-work}}:unset:unset",
+          "down2:unset:{{secret:anthropic}}:unset",
+          "up:unset:{{secret:anthropic}}:http://127.0.0.1:9999",
+          "stopped:unset:{{secret:anthropic}}:unset",
+          "unset:unset",
+          "",
+        ].join("\n")
+      );
+      expect(r.err.match(/agentpass up/g)?.length).toBe(1);
+    });
+
     test(`${shell}: an edited manifest waits for allow, and a bad one warns once`, () => {
       const p = "http://127.0.0.1:8888";
+      proxyUp();
       const bad = join(user, `bad-${shell}`);
       mkdirSync(bad, { recursive: true });
       writeFileSync(join(bad, ".agentpass.json"), "{oops");
@@ -366,6 +445,7 @@ ap allow >/dev/null; TICK; probe allowed`
       allowManifest(user);
       mkdirSync(join(user, "repo", ".git"), { recursive: true });
       mkdirSync(join(user, "plain"), { recursive: true });
+      proxyUp();
       try {
         const r = runHook(
           shell,
@@ -373,11 +453,8 @@ ap allow >/dev/null; TICK; probe allowed`
 cd "${user}/plain"; TICK; show plain
 cd "${user}/repo"; TICK; show repo`
         );
-        expect(r.out).toBe(
-          ["root:unset:unset:unset", "plain:{{secret:home}}:unset:http://127.0.0.1:8888", "repo:unset:unset:unset", ""].join(
-            "\n"
-          )
-        );
+        const p = "http://127.0.0.1:8888";
+        expect(r.out).toBe(["root:unset:unset:unset", `plain:{{secret:home}}:unset:${p}`, `repo:unset:unset:${p}`, ""].join("\n"));
       } finally {
         rmSync(planted);
         rmSync(top);
@@ -386,6 +463,7 @@ cd "${user}/repo"; TICK; show repo`
   }
 
   test("an untrusted manifest exports only global defaults and warns once for the directory", () => {
+    proxyUp();
     const fresh = join(user, "fresh");
     mkdirSync(join(fresh, "sub"), { recursive: true });
     writeFileSync(join(fresh, ".agentpass.json"), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));

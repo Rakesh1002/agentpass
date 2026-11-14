@@ -76,9 +76,17 @@ describe("cli", () => {
   });
 
   test("env prints json and shell formats, and fails cleanly on a bad manifest", () => {
-    const json = JSON.parse(cli(["env", "--shell", "json"]).out);
-    expect(json.OPENAI_API_KEY).toBe("{{secret:openai}}");
-    expect(json.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+    const down = cli(["env", "--shell", "json"]);
+    expect(JSON.parse(down.out)).toEqual({ OPENAI_API_KEY: "{{secret:openai}}" });
+    expect(down.err).toContain("Start it with: agentpass up");
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ pid: process.pid, port: 8888 }));
+    try {
+      const json = JSON.parse(cli(["env", "--shell", "json"]).out);
+      expect(json.OPENAI_API_KEY).toBe("{{secret:openai}}");
+      expect(json.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+    } finally {
+      rmSync(join(home, "daemon.json"));
+    }
     expect(cli(["env", "--shell", "bash"]).out).toContain("export OPENAI_API_KEY='{{secret:openai}}';");
 
     const bad = join(root, "bad");
