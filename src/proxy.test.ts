@@ -1,6 +1,7 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import http from "http";
 import https from "https";
+import { Database } from "bun:sqlite";
 import { ProxyServer } from "./proxy";
 import { vault } from "./vault";
 import { listAudit } from "./audit";
@@ -419,6 +420,33 @@ describe("ProxyServer (provider-routed)", () => {
     expect(JSON.parse(allowed.body).auth).toBe("Bearer gsk-post-only");
 
     await proxy.stop();
+  });
+
+  test("serves a pool from its intact keys and skips one whose pins were edited outside the vault", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "ok";
+    const raw = new Database(join(testHome, "vault.db"));
+    const proxy = new ProxyServer({ port: 0 });
+    await proxy.start();
+    try {
+      raw.run(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'openai'`);
+      const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body).auth).toBe("Bearer sk-key-B");
+      expect(listAudit(2)[1]).toMatchObject({ statusCode: 403, error: "integrity_failed", secretNames: ["openai"] });
+
+      raw.run(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'openai-2'`);
+      const denied = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+      expect(denied.status).toBe(403);
+      expect(JSON.parse(denied.body)).toEqual({ error: "integrity_failed", secret: "openai", host: "api.openai.com" });
+      expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "integrity_failed", secretNames: ["openai", "openai-2"] });
+      expect(upstreamHits).toHaveLength(1);
+    } finally {
+      raw.run(`UPDATE secrets SET pins = NULL WHERE name IN ('openai', 'openai-2')`);
+      raw.close();
+      await proxy.stop();
+    }
   });
 
   test("records a wildcard-pinned pool key in the audit", async () => {

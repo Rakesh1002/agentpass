@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
@@ -71,6 +72,24 @@ describe("cli pins", () => {
     expect(run("pins", "missing").code).toBe(1);
     expect(pipe("sk", "add", "svc", "--method", "GET").code).toBe(1);
     expect(run("list").out).not.toContain("svc");
+  });
+
+  test("refuses a secret whose pins were edited outside agentpass until it is re-added with --host", () => {
+    run("init");
+    pipe("sk_test_tampered", "add", "stripe", "--host", "api.stripe.com");
+    const db = new Database(join(home, "vault.db"));
+    db.run(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
+    db.close();
+
+    for (const r of [run("pins", "stripe", "--set", "*:*"), run("get", "stripe"), pipe("sk_test_rotated", "add", "stripe")]) {
+      expect(r.code).toBe(1);
+      expect(r.err).toContain('Secret "stripe" failed its integrity check');
+      expect(r.out + r.err).not.toContain("sk_test");
+    }
+
+    expect(pipe("sk_test_repaired", "add", "stripe", "--host", "api.stripe.com").code).toBe(0);
+    expect(run("get", "stripe").code).toBe(0);
+    expect(run("pins", "stripe").out).toContain("stripe: api.stripe.com");
   });
 });
 

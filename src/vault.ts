@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
-import { copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
 import { agentPassDir, saltFile, vaultFile } from "./paths";
 import { effectivePins, parseStoredPins, validatePins, type Pin } from "./egress";
 
 const VERIFIER_PREFIX = "agentpass-verifier:";
-const SCHEMA_VERSION = "2";
+// v3: each value is encrypted with its name and pins as AES-GCM additional data
+const SCHEMA_VERSION = 3;
 // other processes (agentpass add/pins) write the same file, so cached hosts expire quickly
 const PINNED_HOSTS_TTL_MS = 5000;
 
@@ -33,13 +34,34 @@ interface Secret {
   lastUsed?: number;
 }
 
+type StoredRow = { name: string; value: string; pins: string | null };
+
+export class IntegrityError extends Error {
+  constructor(readonly secret: string) {
+    super(`Secret "${secret}" failed its integrity check: its name, pins or value were changed outside agentpass. Re-add it with --host, or delete it and add it again.`);
+  }
+}
+
+// The plaintext pins column stays readable for the interception set, so the AAD is what makes it trustworthy:
+// canonical JSON (sorted keys) of {name, pins}, with SQL NULL pins as an explicit null.
+export function valueAad(name: string, pins: string | null): Uint8Array {
+  const parsed: unknown = pins === null ? null : JSON.parse(pins);
+  if (pins !== null && !Array.isArray(parsed)) throw new Error("Stored pins are not an array");
+  const sorted = (_key: string, v: unknown) =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : 1)))
+      : v;
+  return new TextEncoder().encode(JSON.stringify({ name, pins: parsed }, sorted));
+}
+
 export class Vault {
   private db: Database | null = null;
   private encryptionKey: CryptoKey | null = null;
   private isInitialized = false;
   private hostCache: { hosts: Set<string>; at: number } | null = null;
 
-  async init(masterPassword: string): Promise<void> {
+  // Returns the backup path when this unlock upgraded an older vault in place.
+  async init(masterPassword: string): Promise<string | null> {
     this.hostCache = null;
     const vaultDir = agentPassDir();
     mkdirSync(vaultDir, { recursive: true });
@@ -64,7 +86,7 @@ export class Vault {
         )
       `);
       this.db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
-      this.db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
+      this.db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [String(SCHEMA_VERSION)]);
     } else {
       this.db = new Database(vaultFile());
       this.db.run(`PRAGMA journal_mode = WAL`);
@@ -74,7 +96,9 @@ export class Vault {
 
     await this.verifyPasswordOrUpgrade(isNewVault);
     this.migrate();
+    const upgradeBackup = await this.bindValues();
     this.isInitialized = true;
+    return upgradeBackup;
   }
 
   private migrate(): void {
@@ -83,12 +107,62 @@ export class Vault {
     if (!columns.some((c) => c.name === "pins")) {
       this.db.run(`ALTER TABLE secrets ADD COLUMN pins TEXT`);
     }
-    this.db.run(`INSERT OR IGNORE INTO meta (key, value) VALUES ('version', ?)`, [SCHEMA_VERSION]);
-    // never mark a newer vault as older
-    this.db.run(
-      `UPDATE meta SET value = ? WHERE key = 'version' AND CAST(value AS INTEGER) < ?`,
-      [SCHEMA_VERSION, Number(SCHEMA_VERSION)]
-    );
+  }
+
+  // v1/v2 values carry no AAD: re-encrypt each under its name and pins, after a backup, in one write
+  // transaction that commits only if every value reads back. Returns the backup path, or null if nothing ran.
+  private async bindValues(): Promise<string | null> {
+    if (!this.db) throw new Error("Vault not initialized");
+    const db = this.db;
+    // a vault without a version row predates the meta table, so it is v1; never mark a newer vault as older
+    const version = () =>
+      Number((db.query(`SELECT value FROM meta WHERE key = 'version'`).get() as { value: string } | null)?.value ?? 1);
+    if (version() >= SCHEMA_VERSION) return null;
+
+    let backup: string | null = null;
+    db.run("BEGIN IMMEDIATE");
+    try {
+      // another process may have upgraded the vault while this one waited for the write lock
+      if (version() >= SCHEMA_VERSION) {
+        db.run("COMMIT");
+        return null;
+      }
+      backup = this.backup(`v${version()}-`);
+      const rows = db.query(`SELECT id, name, value, pins FROM secrets`).all() as (StoredRow & { id: string })[];
+      const plaintexts = new Map<string, string>();
+      for (const row of rows) {
+        try {
+          const plaintext = await this.decrypt(row.value);
+          plaintexts.set(row.id, plaintext);
+          db.run(`UPDATE secrets SET value = ? WHERE id = ?`, [await this.seal(row, plaintext), row.id]);
+        } catch {
+          throw new Error(`Could not upgrade "${row.name}": its stored value or pins do not read; nothing was changed`);
+        }
+      }
+      const written = db.query(`SELECT id, name, value, pins FROM secrets`).all() as (StoredRow & { id: string })[];
+      for (const row of written) {
+        const roundTrip = await this.open(row).catch(() => null);
+        if (roundTrip !== plaintexts.get(row.id)) throw new Error(`"${row.name}" did not verify after the upgrade; nothing was changed`);
+      }
+      db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?)`, [String(SCHEMA_VERSION)]);
+      db.run("COMMIT");
+      return backup;
+    } catch (err) {
+      db.run("ROLLBACK");
+      this.close();
+      // the rollback left the vault as it was, and a service restart loop would otherwise pile up copies
+      for (const suffix of ["", "-wal", "-shm"]) if (backup) rmSync(backup + suffix, { force: true });
+      throw err;
+    }
+  }
+
+  // Copies vault.db with its -wal and -shm; callers hold the write lock so no commit lands mid-copy.
+  private backup(label = ""): string {
+    const backup = `${vaultFile()}.bak-${label}${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (existsSync(vaultFile() + suffix)) copyFileSync(vaultFile() + suffix, backup + suffix);
+    }
+    return backup;
   }
 
   private async deriveKey(password: string): Promise<CryptoKey> {
@@ -126,11 +200,11 @@ export class Vault {
     );
   }
 
-  private async encrypt(plaintext: string, key = this.encryptionKey): Promise<string> {
+  private async encrypt(plaintext: string, key = this.encryptionKey, additionalData?: Uint8Array): Promise<string> {
     if (!key) throw new Error("Vault not unlocked");
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
+      { name: "AES-GCM", iv, ...(additionalData && { additionalData }) },
       key,
       new TextEncoder().encode(plaintext)
     );
@@ -140,17 +214,36 @@ export class Vault {
     return Buffer.from(combined).toString("base64");
   }
 
-  private async decrypt(ciphertext: string, key = this.encryptionKey): Promise<string> {
+  private async decrypt(ciphertext: string, key = this.encryptionKey, additionalData?: Uint8Array): Promise<string> {
     if (!key) throw new Error("Vault not unlocked");
     const combined = Buffer.from(ciphertext, "base64");
     const iv = combined.subarray(0, 12);
     const data = combined.subarray(12);
     const plaintext = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
+      { name: "AES-GCM", iv, ...(additionalData && { additionalData }) },
       key,
       data
     );
     return new TextDecoder().decode(plaintext);
+  }
+
+  private async seal(row: { name: string; pins: string | null }, plaintext: string, key = this.encryptionKey): Promise<string> {
+    return this.encrypt(plaintext, key, valueAad(row.name, row.pins));
+  }
+
+  // Throws IntegrityError when the row's name, pins or value differ from what was encrypted.
+  private async open(row: StoredRow, key = this.encryptionKey): Promise<string> {
+    if (!key) throw new Error("Vault not unlocked");
+    try {
+      return await this.decrypt(row.value, key, valueAad(row.name, row.pins));
+    } catch {
+      throw new IntegrityError(row.name);
+    }
+  }
+
+  private row(name: string): StoredRow | null {
+    if (!this.db) throw new Error("Vault not initialized");
+    return this.db.query(`SELECT name, value, pins FROM secrets WHERE name = ?`).get(name) as StoredRow | null;
   }
 
   private async writeVerifier(key = this.encryptionKey): Promise<void> {
@@ -206,9 +299,12 @@ export class Vault {
 
     const id = crypto.randomUUID();
     const now = Date.now();
-    // re-adding a secret (key rotation) keeps its pins unless new ones are given
-    const storedPins = pins === undefined ? this.storedPins(name) : serializePins(pins);
-    const encrypted = await this.encrypt(value);
+    // re-adding a secret (key rotation) keeps its pins unless new ones are given, and only pins that verify,
+    // so a rotation never authenticates pins someone edited in the file
+    const existing = pins === undefined ? this.row(name) : null;
+    if (existing) await this.open(existing);
+    const storedPins = pins === undefined ? (existing?.pins ?? null) : serializePins(pins);
+    const encrypted = await this.seal({ name, pins: storedPins }, value);
 
     this.db.run(
       `INSERT OR REPLACE INTO secrets (id, name, type, value, created, updated, pins) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -217,27 +313,25 @@ export class Vault {
     this.hostCache = null;
   }
 
+  // Re-encrypts the value under the new pins; refuses a row that fails its integrity check.
   async setPins(name: string, pins: Pin[] | null): Promise<boolean> {
     if (!this.db) throw new Error("Vault not initialized");
 
+    const stored = serializePins(pins);
+    const row = this.row(name);
+    if (!row) return false;
+    const value = await this.seal({ name, pins: stored }, await this.open(row));
     const result = this.db.run(
-      `UPDATE secrets SET pins = ?, updated = ? WHERE name = ?`,
-      [serializePins(pins), Date.now(), name]
+      `UPDATE secrets SET pins = ?, value = ?, updated = ? WHERE name = ?`,
+      [stored, value, Date.now(), name]
     );
     this.hostCache = null;
     return result.changes > 0;
   }
 
+  // Plaintext pins for display; they are only trustworthy once the value decrypts under them (getEntry).
   async getPins(name: string): Promise<Pin[] | null> {
-    return parseStoredPins(this.storedPins(name));
-  }
-
-  private storedPins(name: string): string | null {
-    if (!this.db) throw new Error("Vault not initialized");
-    const row = this.db.query(`SELECT pins FROM secrets WHERE name = ?`).get(name) as
-      | { pins: string | null }
-      | undefined;
-    return row?.pins ?? null;
+    return parseStoredPins(this.row(name)?.pins ?? null);
   }
 
   async pinnedHosts(): Promise<Set<string>> {
@@ -265,20 +359,17 @@ export class Vault {
   }
 
   async get(name: string): Promise<string | null> {
-    if (!this.db) throw new Error("Vault not initialized");
+    const entry = await this.getEntry(name);
+    if (entry) this.db?.run(`UPDATE secrets SET lastUsed = ? WHERE name = ?`, [Date.now(), name]);
+    return entry?.value ?? null;
+  }
 
-    const row = this.db.query(
-      `SELECT value, lastUsed FROM secrets WHERE name = ?`
-    ).get(name) as { value: string; lastUsed?: number } | undefined;
-
+  // Value and pins from one row read, so the pins a caller enforces are the ones the value decrypted under
+  // and a concurrent edit of the file cannot split them. Throws IntegrityError on a tampered row.
+  async getEntry(name: string): Promise<{ value: string; pins: Pin[] | null } | null> {
+    const row = this.row(name);
     if (!row) return null;
-
-    this.db.run(
-      `UPDATE secrets SET lastUsed = ? WHERE name = ?`,
-      [Date.now(), name]
-    );
-
-    return this.decrypt(row.value);
+    return { value: await this.open(row), pins: parseStoredPins(row.pins) };
   }
 
   async delete(name: string): Promise<boolean> {
@@ -296,18 +387,25 @@ export class Vault {
     return !!row;
   }
 
-  async getPool(provider: string): Promise<{ name: string; value: string; pins: Pin[] | null }[]> {
+  // Keys that fail their integrity check are left out and named in `failed`; the rest of the pool still serves.
+  async getPool(provider: string): Promise<{ keys: { name: string; value: string; pins: Pin[] | null }[]; failed: string[] }> {
     if (!this.db) throw new Error("Vault not initialized");
 
     const rows = this.db.query(
       `SELECT name, value, pins FROM secrets WHERE name = ? OR name LIKE ? ESCAPE '\\' ORDER BY name`
-    ).all(provider, `${provider.replace(/[\\%_]/g, "\\$&")}-%`) as { name: string; value: string; pins: string | null }[];
+    ).all(provider, `${provider.replace(/[\\%_]/g, "\\$&")}-%`) as StoredRow[];
 
-    const out: { name: string; value: string; pins: Pin[] | null }[] = [];
+    const keys: { name: string; value: string; pins: Pin[] | null }[] = [];
+    const failed: string[] = [];
     for (const row of rows) {
-      out.push({ name: row.name, value: await this.decrypt(row.value), pins: parseStoredPins(row.pins) });
+      try {
+        keys.push({ name: row.name, value: await this.open(row), pins: parseStoredPins(row.pins) });
+      } catch (err) {
+        if (!(err instanceof IntegrityError)) throw err;
+        failed.push(row.name);
+      }
     }
-    return out;
+    return { keys, failed };
   }
 
   setUnlockMode(mode: UnlockMode): void {
@@ -315,34 +413,33 @@ export class Vault {
     this.db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('unlockMode', ?)`, [mode]);
   }
 
-  // Re-encrypts every value under newPassword in one write transaction; returns the backup path.
+  // Re-encrypts every value under newPassword, bound to the same name and pins, in one write transaction;
+  // returns the backup path.
   async rekey(newPassword: string, mode: UnlockMode): Promise<string> {
     if (!this.db || !this.encryptionKey) throw new Error("Vault not unlocked");
     const db = this.db;
-    const backup = `${vaultFile()}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
     const newKey = await this.deriveKey(newPassword);
 
     // IMMEDIATE takes the write lock, so no other process can add a value under the old key mid-rekey
     db.run("BEGIN IMMEDIATE");
+    let backup: string;
     try {
-      for (const suffix of ["", "-wal", "-shm"]) {
-        if (existsSync(vaultFile() + suffix)) copyFileSync(vaultFile() + suffix, backup + suffix);
-      }
-      const rows = db.query(`SELECT id, name, value FROM secrets`).all() as { id: string; name: string; value: string }[];
+      backup = this.backup();
+      const rows = db.query(`SELECT id, name, value, pins FROM secrets`).all() as (StoredRow & { id: string })[];
       const plaintexts = new Map<string, string>();
       for (const row of rows) {
-        const plaintext = await this.decrypt(row.value).catch(() => {
+        const plaintext = await this.open(row).catch(() => {
           throw new Error(`Could not decrypt "${row.name}"; nothing was changed`);
         });
         plaintexts.set(row.id, plaintext);
-        db.run(`UPDATE secrets SET value = ? WHERE id = ?`, [await this.encrypt(plaintext, newKey), row.id]);
+        db.run(`UPDATE secrets SET value = ? WHERE id = ?`, [await this.seal(row, plaintext, newKey), row.id]);
       }
       await this.writeVerifier(newKey);
       this.setUnlockMode(mode);
 
-      const written = db.query(`SELECT id, name, value FROM secrets`).all() as { id: string; name: string; value: string }[];
+      const written = db.query(`SELECT id, name, value, pins FROM secrets`).all() as (StoredRow & { id: string })[];
       for (const row of written) {
-        const roundTrip = await this.decrypt(row.value, newKey).catch(() => null);
+        const roundTrip = await this.open(row, newKey).catch(() => null);
         if (roundTrip !== plaintexts.get(row.id)) throw new Error(`"${row.name}" did not verify under the new key; nothing was changed`);
       }
       db.run("COMMIT");
