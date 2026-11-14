@@ -12,7 +12,8 @@ const ORIG_HOME = process.env.HOME;
 let mockUpstream: http.Server;
 let mockPort: number;
 let upstreamHits: { headers: http.IncomingHttpHeaders; path: string }[] = [];
-let mockBehavior: "ok" | "rate-limit-once" | "always-401" | "401-then-ok" | "sse" = "ok";
+let mockBehavior: "ok" | "rate-limit-once" | "always-401" | "401-then-ok" | "sse" | "always-429" = "ok";
+let retryAfterByAuth: Record<string, string> = {};
 let callCount = 0;
 let streamGate: Promise<void> = Promise.resolve();
 let upstreamFinished = false;
@@ -30,7 +31,13 @@ function startMockUpstream(): Promise<void> {
       upstreamHits.push({ headers: req.headers, path: req.url || "" });
 
       if (mockBehavior === "rate-limit-once" && callCount === 1) {
-        res.writeHead(429, { "retry-after": "5" });
+        res.writeHead(429, { "retry-after": retryAfterByAuth[String(req.headers.authorization)] ?? "5" });
+        res.end(JSON.stringify({ error: "rate_limited" }));
+        return;
+      }
+      if (mockBehavior === "always-429") {
+        const retryAfter = retryAfterByAuth[String(req.headers.authorization)];
+        res.writeHead(429, retryAfter ? { "retry-after": retryAfter } : {});
         res.end(JSON.stringify({ error: "rate_limited" }));
         return;
       }
@@ -182,7 +189,90 @@ describe("ProxyServer (provider-routed)", () => {
     await proxy.start();
 
     const res = await get(`http://127.0.0.1:18805/openai/v1/models`);
-    expect([401, 503]).toContain(res.status);
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "all_keys_exhausted", provider: "openai", lastStatus: 401 });
+
+    // auth failures are not cooled, so a retry tries every key again
+    await get(`http://127.0.0.1:18805/openai/v1/models`);
+    expect(upstreamHits).toHaveLength(4);
+
+    await proxy.stop();
+  });
+
+  test("skips a rate-limited key until its Retry-After seconds elapse", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "rate-limit-once";
+    retryAfterByAuth = { "Bearer sk-key-A": "1" };
+
+    const proxy = new ProxyServer({ port: 18811 });
+    await proxy.start();
+    const keysUsed = () => upstreamHits.map((h) => h.headers.authorization);
+
+    expect((await get(`http://127.0.0.1:18811/openai/v1/models`)).status).toBe(200);
+    expect(keysUsed()).toEqual(["Bearer sk-key-A", "Bearer sk-key-B"]);
+
+    expect((await get(`http://127.0.0.1:18811/openai/v1/models`)).status).toBe(200);
+    expect(keysUsed()).toEqual(["Bearer sk-key-A", "Bearer sk-key-B", "Bearer sk-key-B"]);
+
+    await Bun.sleep(1100);
+    expect((await get(`http://127.0.0.1:18811/openai/v1/models`)).status).toBe(200);
+    expect(keysUsed()[3]).toBe("Bearer sk-key-A");
+
+    await proxy.stop();
+  });
+
+  test("returns 429 with the soonest Retry-After when every key is cooling", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "always-429";
+    retryAfterByAuth = {
+      "Bearer sk-key-A": new Date(Date.now() + 20_000).toUTCString(),
+      "Bearer sk-key-B": "90",
+    };
+
+    const proxy = new ProxyServer({ port: 18812 });
+    await proxy.start();
+
+    const first = await new Promise<{ status: number; retryAfter: number; body: string }>((resolve, reject) => {
+      http
+        .get(`http://127.0.0.1:18812/openai/v1/models`, (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c));
+          res.on("end", () =>
+            resolve({ status: res.statusCode || 0, retryAfter: Number(res.headers["retry-after"]), body })
+          );
+        })
+        .on("error", reject);
+    });
+    expect(first.status).toBe(429);
+    expect(first.retryAfter).toBeGreaterThanOrEqual(18);
+    expect(first.retryAfter).toBeLessThanOrEqual(20);
+    expect(JSON.parse(first.body)).toMatchObject({ error: "all_keys_cooling", provider: "openai" });
+    expect(upstreamHits).toHaveLength(2);
+
+    const second = await get(`http://127.0.0.1:18812/openai/v1/models`);
+    expect(second.status).toBe(429);
+    expect(upstreamHits).toHaveLength(2);
+
+    await proxy.stop();
+  });
+
+  test("cools a key for 60 seconds when Retry-After is missing", async () => {
+    upstreamHits = [];
+    callCount = 0;
+    mockBehavior = "always-429";
+    retryAfterByAuth = {};
+
+    const proxy = new ProxyServer({ port: 18813 });
+    await proxy.start();
+
+    const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      http.get(`http://127.0.0.1:18813/openai/v1/models`, (r) => (r.resume(), resolve(r))).on("error", reject);
+    });
+    expect(res.statusCode).toBe(429);
+    expect(Number(res.headers["retry-after"])).toBeGreaterThanOrEqual(59);
+    expect(Number(res.headers["retry-after"])).toBeLessThanOrEqual(60);
 
     await proxy.stop();
   });

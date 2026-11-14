@@ -59,6 +59,8 @@ const PLACEHOLDER_RE = /\{\{secret:([A-Za-z0-9_.-]+)\}\}/g;
 export class ProxyServer {
   private server: http.Server | null = null;
   private config: ProxyConfig;
+  // secret name -> epoch ms until which a rate-limited key is skipped
+  private cooldowns = new Map<string, number>();
 
   constructor(config: Partial<ProxyConfig> = {}) {
     this.config = {
@@ -526,12 +528,9 @@ export class ProxyServer {
 
     let lastStatus = 502;
 
-    // Bounded iteration: max attempts = pool size (Section 4.1)
-    let attempts = 0;
-    const maxAttempts = pool.length;
-
+    // Bounded iteration: at most one attempt per key (Section 4.1)
     for (const { name, value } of pool) {
-      attempts++;
+      if ((this.cooldowns.get(name) ?? 0) > Date.now()) continue;
       const headers = sanitizeRequestHeaders(req.headers, provider.upstream.host);
       provider.applyAuth(headers, value);
 
@@ -572,13 +571,10 @@ export class ProxyServer {
 
       lastStatus = result.status;
 
+      if (provider.isRateLimit(result.status)) {
+        this.cooldowns.set(name, Date.now() + retryAfterMs(result.headers["retry-after"]));
+      }
       if (provider.isRateLimit(result.status) || provider.isAuthError(result.status)) {
-        if (attempts >= maxAttempts) {
-          console.warn(
-            `[AgentPass] All ${maxAttempts} keys exhausted for ${provider.name}. Returning last error (${result.status}).`
-          );
-          return result;
-        }
         // nothing has been sent to the client yet, so drop this body and fail over
         result.body.resume();
         continue;
@@ -587,13 +583,38 @@ export class ProxyServer {
       return result;
     }
 
-    return { status: lastStatus || 503, headers: {}, body: Buffer.from(
-      JSON.stringify({
-        error: "all_keys_exhausted",
-        provider: provider.name,
-        lastStatus,
-      })
-    ) };
+    const now = Date.now();
+    const soonest = Math.min(
+      ...pool.map((key) => this.cooldowns.get(key.name) ?? 0).filter((until) => until > now)
+    );
+    const cooling = Number.isFinite(soonest);
+    const error = cooling ? "all_keys_cooling" : "all_keys_exhausted";
+    const status = cooling ? 429 : 503;
+    console.warn(`[AgentPass] All ${pool.length} keys unavailable for ${provider.name} (${error}).`);
+    appendAudit({
+      method,
+      destination,
+      secretNames: pool.map((key) => key.name),
+      statusCode: status,
+      durationMs: Date.now() - started,
+      error,
+      routedTier,
+      escalated,
+    });
+
+    if (cooling) {
+      const retryAfter = Math.max(1, Math.ceil((soonest - now) / 1000));
+      return {
+        status,
+        headers: { "content-type": "application/json", "retry-after": String(retryAfter) },
+        body: Buffer.from(JSON.stringify({ error, provider: provider.name, retryAfter })),
+      };
+    }
+    return {
+      status,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({ error, provider: provider.name, lastStatus })),
+    };
   }
 
   private async handleConnect(
@@ -877,6 +898,16 @@ async function replacePlaceholders(
   }
 
   return { value: output, found, missing };
+}
+
+const DEFAULT_COOLDOWN_MS = 60_000;
+
+// Retry-After is either delta-seconds or an HTTP-date (RFC 9110 10.2.3).
+function retryAfterMs(value: string | undefined): number {
+  const raw = value?.trim();
+  if (raw && /^\d+$/.test(raw)) return Number(raw) * 1000;
+  const date = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : DEFAULT_COOLDOWN_MS;
 }
 
 function placeholderNames(headers: http.IncomingHttpHeaders): string[] {
