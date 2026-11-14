@@ -138,6 +138,23 @@ describe("cli", () => {
     }
   });
 
+  test("run's in-process proxy hands the child its actual port when the configured one is taken", async () => {
+    const taken = http.createServer((_req, res) => res.writeHead(404).end());
+    await new Promise<void>((r) => taken.listen(0, "127.0.0.1", r));
+    const port = (taken.address() as { port: number }).port;
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
+    try {
+      const r = await cliAsync(["run", "--", process.execPath, "-e", PROBE], { AGENTPASS_PASSWORD: "test-password" });
+      const [proxyUrl, health] = probeLine(r.out).split(" ");
+      expect(proxyUrl).not.toBe(`http://127.0.0.1:${port}`);
+      expect(health).toBe("200");
+      expect(r.code).toBe(0);
+    } finally {
+      taken.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
   test("run's in-process proxy ignores proxy env pointing at itself, and the child still gets it", async () => {
     let hits = 0;
     const upstream = http.createServer((_req, res) => {

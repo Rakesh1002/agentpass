@@ -231,6 +231,23 @@ describe("daemon", () => {
     }
   });
 
+  test("records the actual port in daemon.json when the requested one is taken", async () => {
+    const taken = http.createServer();
+    await new Promise<void>((r) => taken.listen(0, "127.0.0.1", r));
+    const port = (taken.address() as { port: number }).port;
+    expect(box.cli(["init"]).code).toBe(0);
+    const daemon = startDaemon({}, port);
+    try {
+      await waitFor(() => existsSync(daemonJson()), "daemon.json");
+      const actual = JSON.parse(readFileSync(daemonJson(), "utf-8")).port;
+      expect(actual).not.toBe(port);
+      expect(await proxyReachable(actual)).toBe(true);
+    } finally {
+      daemon.child.kill("SIGKILL");
+      taken.close();
+    }
+  });
+
   test("a stale daemon.json from a dead process is reported and replaced", async () => {
     expect(box.cli(["init"]).code).toBe(0);
     const dead = spawnSync("true").pid;
