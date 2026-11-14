@@ -1027,13 +1027,16 @@ function originFormTarget(target: string, host: string, port: number): string | 
 const DEFAULT_COOLDOWN_MS = 60_000;
 // a 429 always cools the key, or Retry-After: 0 would read as exhausted (503) instead of cooling (429)
 const MIN_COOLDOWN_MS = 1_000;
+// an upstream (or anything on its path) must not be able to bench a key for good
+const MAX_COOLDOWN_MS = 3_600_000;
 
 // Retry-After is either delta-seconds or an HTTP-date (RFC 9110 10.2.3).
 function retryAfterMs(value: string | undefined): number {
   const raw = value?.trim();
-  if (raw && /^\d+$/.test(raw)) return Math.max(MIN_COOLDOWN_MS, Number(raw) * 1000);
+  const clamp = (ms: number) => Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, ms));
+  if (raw && /^\d+$/.test(raw)) return clamp(Number(raw) * 1000);
   const remaining = raw ? Date.parse(raw) - Date.now() : NaN;
-  return remaining > 0 ? Math.max(MIN_COOLDOWN_MS, remaining) : DEFAULT_COOLDOWN_MS;
+  return remaining > 0 ? clamp(remaining) : DEFAULT_COOLDOWN_MS;
 }
 
 function placeholderNames(headers: http.IncomingHttpHeaders): string[] {

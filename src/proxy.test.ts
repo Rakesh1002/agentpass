@@ -318,6 +318,25 @@ describe("ProxyServer (provider-routed)", () => {
     }
   });
 
+  test("caps a huge or far-future Retry-After at one hour", async () => {
+    mockBehavior = "always-429";
+    for (const value of ["99999999999", "9".repeat(400), new Date(Date.now() + 365 * 86_400_000).toUTCString()]) {
+      upstreamHits = [];
+      callCount = 0;
+      retryAfterByAuth = { "Bearer sk-key-A": value, "Bearer sk-key-B": value };
+
+      const proxy = new ProxyServer({ port: 0 });
+      await proxy.start();
+
+      const res = await get(`http://127.0.0.1:${proxy.getPort()}/openai/v1/models`);
+      expect(res.status).toBe(429);
+      expect(Number(res.headers["retry-after"])).toBeGreaterThanOrEqual(3599);
+      expect(Number(res.headers["retry-after"])).toBeLessThanOrEqual(3600);
+
+      await proxy.stop();
+    }
+  });
+
   test("returns 404 for unknown provider prefix", async () => {
     const proxy = new ProxyServer({ port: 0 });
     await proxy.start();
