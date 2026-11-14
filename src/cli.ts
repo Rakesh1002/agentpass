@@ -392,8 +392,9 @@ async function handleAudit(args: string[]) {
     const status = row.statusCode || "-";
     const secrets = row.secretNames.length > 0 ? row.secretNames.join(",") : "-";
     const error = row.error ? ` error="${row.error}"` : "";
+    const wildcard = row.wildcard ? ` wildcard=${row.wildcard.join(",")}` : "";
     console.log(
-      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}`
+      `${timestamp} ${row.method} ${row.destination} status=${status} secrets=${secrets} duration=${row.durationMs}ms${error}${wildcard}`
     );
   }
 }

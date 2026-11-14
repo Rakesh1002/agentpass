@@ -75,19 +75,19 @@ export class CertificateAuthority {
 
   getHostCertificate(hostname: string): PemPair {
     const normalizedHost = hostname.toLowerCase();
-
-    if (certCache.has(normalizedHost)) return certCache.get(normalizedHost)!;
-
     const safeName = normalizedHost.replace(/[^a-z0-9.-]/gi, "_");
     const hostCertPath = resolve(certDir(), `${safeName}.crt`);
     const hostKeyPath = resolve(certDir(), `${safeName}.key`);
+
+    // keyed by path so a different AGENTPASS_HOME (and CA) never reuses another CA's leaf
+    if (certCache.has(hostCertPath)) return certCache.get(hostCertPath)!;
 
     if (existsSync(hostCertPath) && existsSync(hostKeyPath)) {
       const pair = {
         cert: readFileSync(hostCertPath, "utf-8"),
         key: readFileSync(hostKeyPath, "utf-8"),
       };
-      certCache.set(normalizedHost, pair);
+      certCache.set(hostCertPath, pair);
       return pair;
     }
 
@@ -132,7 +132,7 @@ export class CertificateAuthority {
     writeFileSync(tmpHostKey, pair.key, { mode: 0o600 });
     renameSync(tmpHostCert, hostCertPath);
     renameSync(tmpHostKey, hostKeyPath);
-    certCache.set(normalizedHost, pair);
+    certCache.set(hostCertPath, pair);
     return pair;
   }
 }

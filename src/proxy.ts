@@ -6,6 +6,7 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
+import { egressVerdict } from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -143,7 +144,11 @@ export class ProxyServer {
     const client = isHttps ? https : http;
     const destination = `${url.hostname}:${url.port || (isHttps ? 443 : 80)}`;
 
-    const substitution = await substitutePlaceholders(req.headers, (name) => vault.get(name));
+    const egress = await this.enforceEgress(req, res, url.hostname, url.pathname, destination, started);
+    if (!egress) return;
+    const { wildcard } = egress;
+
+    const substitution = await substitutePlaceholders(req.headers, egress.resolve);
     if (substitution.missingSecrets.length > 0) {
       const error = `Missing secret: ${substitution.missingSecrets.join(", ")}`;
       appendAudit({
@@ -158,6 +163,8 @@ export class ProxyServer {
       res.end(error);
       return;
     }
+    // RFC 9112 3.2.2: use the absolute-form authority, never the client's Host (domain fronting)
+    substitution.headers.host = url.host;
 
     const proxyReq = client.request(
       {
@@ -175,6 +182,7 @@ export class ProxyServer {
           secretNames: substitution.secretNames,
           statusCode: proxyRes.statusCode,
           durationMs: Date.now() - started,
+          wildcard,
         });
         res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
         proxyRes.pipe(res, { end: true });
@@ -190,12 +198,54 @@ export class ProxyServer {
         statusCode: 502,
         durationMs: Date.now() - started,
         error: err.message,
+        wildcard,
       });
       res.writeHead(502, { "Content-Type": "text/plain" });
       res.end(`Proxy Error: ${err.message}`);
     });
 
     req.pipe(proxyReq, { end: true });
+  }
+
+  // Answers 403 and returns null if any placeholder's pins reject this destination.
+  private async enforceEgress(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    path: string,
+    destination: string,
+    started: number
+  ): Promise<{ resolve: (name: string) => Promise<string | null>; wildcard: string[] } | null> {
+    const method = req.method || "GET";
+    const names = placeholderNames(req.headers);
+    const allowed = new Set<string>();
+    const wildcard: string[] = [];
+
+    for (const name of names) {
+      if (!(await vault.has(name))) continue;
+      const verdict = egressVerdict(name, await vault.getPins(name), host, method, path);
+      if (verdict === "wildcard") wildcard.push(name);
+      if (verdict !== "deny") {
+        allowed.add(name);
+        continue;
+      }
+
+      appendAudit({
+        method,
+        destination,
+        secretNames: names,
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "egress_blocked",
+      });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "egress_blocked", secret: name, host }));
+      return null;
+    }
+
+    // only names checked above may resolve, so a secret added mid-request cannot skip the check
+    const resolve = async (name: string) => (allowed.has(name) ? vault.get(name) : null);
+    return { resolve, wildcard };
   }
 
   private async handleProviderRoute(
@@ -544,7 +594,11 @@ export class ProxyServer {
       const httpsServer = https.createServer({ key: hostPair.key, cert: certChain }, async (req, res) => {
         const startedReq = Date.now();
         try {
-          const substitution = await substitutePlaceholders(req.headers, (n) => vault.get(n));
+          const egress = await this.enforceEgress(req, res, hostname, req.url || "/", `${hostname}:${port}`, startedReq);
+          if (!egress) return;
+          const { wildcard } = egress;
+
+          const substitution = await substitutePlaceholders(req.headers, egress.resolve);
           if (substitution.missingSecrets.length > 0) {
             appendAudit({
               method: req.method || "GET",
@@ -558,6 +612,8 @@ export class ProxyServer {
             res.end("Missing secrets\n");
             return;
           }
+          // the upstream connection goes to the CONNECT host, so Host must not front another site
+          substitution.headers.host = port === 443 ? hostname : `${hostname}:${port}`;
 
           const upstreamReq = https.request(
             {
@@ -575,6 +631,7 @@ export class ProxyServer {
                 secretNames: substitution.secretNames,
                 statusCode: upstreamRes.statusCode,
                 durationMs: Date.now() - startedReq,
+                wildcard,
               });
               res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
               upstreamRes.pipe(res, { end: true });
@@ -589,6 +646,7 @@ export class ProxyServer {
               statusCode: 502,
               durationMs: Date.now() - startedReq,
               error: err.message,
+              wildcard,
             });
             try {
               res.writeHead(502, { "Content-Type": "text/plain" });
@@ -741,6 +799,17 @@ async function replacePlaceholders(
   }
 
   return { value: output, found, missing };
+}
+
+function placeholderNames(headers: http.IncomingHttpHeaders): string[] {
+  const names = new Set<string>();
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    if (!SCANNED_HEADERS.has(headerName.toLowerCase()) || typeof headerValue !== "string") continue;
+    for (const match of headerValue.matchAll(PLACEHOLDER_RE)) {
+      if (match[1]) names.add(match[1]);
+    }
+  }
+  return [...names];
 }
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
