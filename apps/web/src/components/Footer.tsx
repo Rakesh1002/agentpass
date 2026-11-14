@@ -38,6 +38,9 @@ export default function Footer() {
             >
               Docs
             </a>
+            <a href="/privacy" className="transition-colors hover:text-fg">
+              Privacy
+            </a>
           </div>
         </div>
       </div>

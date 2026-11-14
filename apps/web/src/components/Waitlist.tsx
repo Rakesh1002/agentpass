@@ -71,9 +71,15 @@ export default function Waitlist() {
           </motion.div>
         ) : (
           <form onSubmit={handleSubmit} className="mt-8">
+            <label htmlFor="waitlist-email" className="sr-only">
+              Email address
+            </label>
             <div className="flex flex-col gap-3 sm:flex-row">
               <input
+                id="waitlist-email"
+                name="email"
                 type="email"
+                autoComplete="email"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -93,8 +99,12 @@ export default function Waitlist() {
               </button>
             </div>
             {status === "error" && (
-              <p className="mt-3 text-sm text-red-400">{errorMsg}</p>
+              <p role="alert" className="mt-3 text-sm text-red-400">{errorMsg}</p>
             )}
+            <p className="mt-4 text-xs text-muted">
+              We keep your email and a salted hash of your IP address (to stop abuse), and use them only to
+              send release notes. <a href="/privacy" className="underline hover:text-fg">Privacy</a>
+            </p>
           </form>
         )}
       </motion.div>
