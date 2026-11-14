@@ -274,6 +274,26 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("blocks encoded path separators under a path pin", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1", pathPrefix: "/v1" }]);
+    const target = await startTarget();
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, {
+      auth: "Bearer {{secret:svc}}",
+      path: "/v1/a%2F..%2Fadmin",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toEqual({ error: "egress_blocked", secret: "svc", host: "127.0.0.1" });
+    expect(target.requests).toHaveLength(0);
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "egress_blocked", secretNames: ["svc"] });
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("denies secrets without pins by default, including provider keys off their provider host", async () => {
     await sharedVault.init("correct-password");
     await sharedVault.add("stripe", "sk_test");

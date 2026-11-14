@@ -29,6 +29,21 @@ describe("egress pins", () => {
     expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "https://evil.example/v1/charges")).toBe("deny");
   });
 
+  test("denies encoded separators and NUL in the path under a path pin", () => {
+    const pins = [{ host: "api.stripe.com", pathPrefix: "/v1/charges" }];
+    for (const path of [
+      "/v1/charges/..%2fcustomers",
+      "/v1/charges/..%2Fcustomers",
+      "/v1/charges/..%5ccustomers",
+      "/v1/charges/..%5Ccustomers",
+      "/v1/charges/ch_1%00",
+    ]) {
+      expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", path)).toBe("deny");
+    }
+    expect(egressVerdict("stripe", pins, "api.stripe.com", "GET", "/v1/charges/ch_1?next=%2Fdone")).toBe("allow");
+    expect(egressVerdict("stripe", [{ host: "api.stripe.com" }], "api.stripe.com", "GET", "/v1/a%2Fb")).toBe("allow");
+  });
+
   test("denies by default when a secret has no pins", () => {
     expect(effectivePins("stripe", null)).toEqual([]);
     expect(egressVerdict("stripe", null, "api.stripe.com", "GET", "/")).toBe("deny");

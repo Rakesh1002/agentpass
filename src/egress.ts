@@ -74,6 +74,8 @@ function pathAllowed(prefix: string, rawPath: string): boolean {
   const path = rawPath.split("?")[0] || "/";
   // dot segments, backslashes or absolute-form targets could resolve outside the prefix upstream
   if (normalizePath(path) !== path) return false;
+  // servers that decode before routing would turn these into separators or truncate at NUL
+  if (/%(2f|5c|00)/i.test(path)) return false;
   if (path === prefix) return true;
   return path.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`);
 }
