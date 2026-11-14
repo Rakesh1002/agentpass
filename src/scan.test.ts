@@ -369,13 +369,13 @@ describe("scan hardening", () => {
 
   test("skips oversized files and lines quickly and says so", () => {
     put(join(home, ".zshrc"), `export A=${"a".repeat(80_000)}\nexport OPENAI_API_KEY=${T.openaiProj}\n`);
-    put(join(home, ".claude.json"), JSON.stringify({ env: { GITHUB_TOKEN: T.github }, pad: "b".repeat(1_100_000) }));
+    put(join(home, ".bashrc"), `export GITHUB_TOKEN=${T.github}\n# ${"b".repeat(1_100_000)}\n`);
 
     const start = performance.now();
     const result = scan({ home, roots: [] });
     expect(performance.now() - start).toBeLessThan(200);
     expect(summary(result.findings)).toEqual(["~/.zshrc|OPENAI_API_KEY|OpenAI"]);
-    expect(result.skipped.sort()).toEqual([join(home, ".claude.json"), join(home, ".zshrc")].sort());
+    expect(result.skipped.sort()).toEqual([join(home, ".bashrc"), join(home, ".zshrc")].sort());
 
     expect(run(["--root", root]).out).toContain("Skipped oversized content in 2 files");
     rmSync(join(home, ".zshrc"));
@@ -383,6 +383,13 @@ describe("scan hardening", () => {
     expect(clean.code).toBe(0);
     expect(clean.out).not.toContain("No plaintext secrets found");
     expect(clean.out).toContain("Skipped oversized content in 1 file");
+  });
+
+  test("scans a large ~/.claude.json instead of skipping it", () => {
+    put(join(home, ".claude.json"), JSON.stringify({ env: { GITHUB_TOKEN: T.github }, pad: "b".repeat(1_100_000) }));
+    const result = scan({ home, roots: [] });
+    expect(summary(result.findings)).toEqual(["~/.claude.json|GITHUB_TOKEN|GitHub"]);
+    expect(result.skipped).toEqual([join(home, ".claude.json")]);
   });
 
   test("scans every settings*.json under .claude", () => {

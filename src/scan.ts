@@ -48,6 +48,8 @@ const PLACEHOLDER = /\{\{secret:|\$\{|^\$|your[-_ ]|x{4,}|^x+$|change[-_]?me|exa
 const ASSIGN = /(?:["']([A-Za-z_]\w{0,63})["']\s*:|(?<![\w.])([A-Za-z_]\w{0,63})\s*=)\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`,;)}\]]+))/g;
 const DISPLAY_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const MAX_FILE_BYTES = 1024 * 1024;
+// ~/.claude.json grows with project history; per-string caps keep large JSON linear.
+const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_STRING = 16 * 1024;
 
 function entropy(s: string): number {
@@ -254,7 +256,7 @@ export function scan(opts: { home: string; roots: string[] }): { findings: Findi
     try {
       const st = statSync(file);
       if (!st.isFile()) continue;
-      if (st.size > MAX_FILE_BYTES) {
+      if (st.size > (file.endsWith(".json") ? MAX_JSON_BYTES : MAX_FILE_BYTES)) {
         skipped.push(file);
         continue;
       }
