@@ -31,3 +31,15 @@ export function certDir(): string {
 export function routingConfigFile(): string {
   return resolve(agentPassDir(), "routing.json");
 }
+
+export function globalConfigFile(): string {
+  return resolve(agentPassDir(), "config.json");
+}
+
+export function daemonFile(): string {
+  return resolve(agentPassDir(), "daemon.json");
+}
+
+export function caBundleFile(): string {
+  return resolve(agentPassDir(), "ca-bundle.pem");
+}
