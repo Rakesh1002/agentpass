@@ -1,12 +1,19 @@
-interface WaitlistEntry {
-  email: string;
-  created_at: string;
-  ip_hash?: string;
-  referrer?: string;
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+declare global {
+  interface CloudflareEnv {
+    DB?: {
+      prepare(query: string): { bind(...values: unknown[]): { run(): Promise<unknown> } };
+    };
+    AGENTPASS_KV?: {
+      get(key: string): Promise<string | null>;
+      put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+    };
+    WAITLIST_IP_SALT?: string;
+  }
 }
 
-async function hashIp(ip: string): Promise<string> {
-  const salt = process.env.WAITLIST_IP_SALT;
+async function hashIp(ip: string, salt: string | undefined): Promise<string> {
   if (!salt) {
     throw new Error("WAITLIST_IP_SALT is not configured");
   }
@@ -19,6 +26,13 @@ async function hashIp(ip: string): Promise<string> {
 
 export async function POST(request: Request) {
   try {
+    const { env } = getCloudflareContext();
+    const db = env.DB;
+    if (!db) {
+      console.error("Waitlist error: D1 binding DB is missing");
+      return Response.json({ error: "Signups are unavailable right now." }, { status: 500 });
+    }
+
     const body = await request.json();
     const email = typeof body.email === "string" ? body.email.trim() : "";
 
@@ -27,8 +41,8 @@ export async function POST(request: Request) {
     }
 
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
-    const ipHash = await hashIp(ip);
-    const kv = (globalThis as any).AGENTPASS_KV;
+    const ipHash = await hashIp(ip, env.WAITLIST_IP_SALT);
+    const kv = env.AGENTPASS_KV;
     if (kv) {
       const key = `rate:${ipHash}`;
       const count = parseInt((await kv.get(key)) || "0", 10);
@@ -38,24 +52,12 @@ export async function POST(request: Request) {
       await kv.put(key, String(count + 1), { expirationTtl: 3600 });
     }
 
-    const entry: WaitlistEntry = {
-      email,
-      created_at: new Date().toISOString(),
-      ip_hash: ipHash,
-      referrer: request.headers.get("referer") || undefined,
-    };
+    await db
+      .prepare(`INSERT INTO waitlist (email, created_at, ip_hash, referrer) VALUES (?, ?, ?, ?)`)
+      .bind(email, new Date().toISOString(), ipHash, request.headers.get("referer") || null)
+      .run();
 
-    const db = (globalThis as any).DB;
-    if (db) {
-      await db
-        .prepare(
-          `INSERT INTO waitlist (email, created_at, ip_hash, referrer) VALUES (?, ?, ?, ?)`
-        )
-        .bind(entry.email, entry.created_at, entry.ip_hash, entry.referrer || null)
-        .run();
-    }
-
-    return Response.json({ success: true, email: entry.email });
+    return Response.json({ success: true, email });
   } catch (err) {
     console.error("Waitlist error:", err);
     return Response.json(
