@@ -1,10 +1,15 @@
+import Mark from "./Mark";
+
 export default function Footer() {
   return (
     <footer className="border-t border-border">
       <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
         <div className="flex flex-col items-center justify-between gap-6 sm:flex-row">
           <div className="flex items-center gap-2 text-sm text-muted">
-            <span className="font-semibold text-fg">AgentPass</span>
+            <span className="text-fg">
+              <Mark size={20} />
+            </span>
+            <span className="font-semibold tracking-tight text-fg">agentpass</span>
             <span>— Local credential firewall for AI coding agents. Open source.</span>
           </div>
 

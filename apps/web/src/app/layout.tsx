@@ -1,11 +1,17 @@
 import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+
+const sans = Geist({ subsets: ["latin"], variable: "--font-geist-sans" });
+const mono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
 
 const TITLE = "AgentPass — A local credential firewall for AI coding agents";
 const DESCRIPTION =
   "Add a key once; every agent and worktree uses it through placeholders, and the real value only goes to the hosts you pin it to. Open source, alpha.";
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://agentpass.sh"),
+  alternates: { canonical: "/" },
   title: TITLE,
   description: DESCRIPTION,
   openGraph: { title: TITLE, description: DESCRIPTION, type: "website" },
@@ -18,22 +24,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
-      <head>
-        <link
-          rel="preconnect"
-          href="https://cdn.jsdelivr.net"
-          crossOrigin="anonymous"
-        />
-        <link
-          href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/style.css"
-          rel="stylesheet"
-        />
-        <link
-          href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css"
-          rel="stylesheet"
-        />
-      </head>
+    <html lang="en" className={`dark ${sans.variable} ${mono.variable}`}>
       <body className="min-h-screen antialiased">
         {children}
       </body>

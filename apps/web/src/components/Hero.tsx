@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Shield } from "lucide-react";
+import Mark from "./Mark";
 
 const demo: { cmd?: string; out?: string; tone?: string }[] = [
   { cmd: "agentpass init" },
@@ -28,13 +28,19 @@ export default function Hero() {
       <div className="absolute inset-0 glow-bg pointer-events-none" />
 
       <div className="relative mx-auto max-w-4xl px-4 text-center">
+        <div className="mb-8 flex items-center justify-center gap-3">
+          <span className="text-fg">
+            <Mark size={40} />
+          </span>
+          <span className="text-2xl font-semibold tracking-tight text-fg">agentpass</span>
+        </div>
+
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.6 }}
           className="inline-flex items-center gap-2 rounded-full border border-accent/20 bg-accent/5 px-3 py-1 text-xs font-medium text-accent mb-8"
         >
-          <Shield className="h-3 w-3" />
           Open source · Runs on your machine · Alpha
         </motion.div>
 

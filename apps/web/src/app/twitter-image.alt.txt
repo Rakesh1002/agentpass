@@ -1,0 +1,1 @@
+AgentPass: a local credential firewall for AI coding agents
