@@ -11,6 +11,7 @@ import { loadRoutingConfig, writeDefaultConfig } from "./router";
 import { effectivePins, validatePins, type Pin } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
+import { constants } from "os";
 import { maskSecret } from "./mask";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
@@ -538,7 +539,11 @@ async function handleRun(args: string[]) {
     console.error(`Failed to start "${cmd}":`, err.message);
     cleanup(1);
   });
-  child.on("exit", (code: number | null) => cleanup(code ?? 0));
+  child.on("exit", (code, signal) => cleanup(exitStatus(code, signal)));
+}
+
+function exitStatus(code: number | null, signal: NodeJS.Signals | null): number {
+  return code ?? 128 + (signal ? constants.signals[signal] : 0);
 }
 
 async function handleDaemon(args: string[]) {

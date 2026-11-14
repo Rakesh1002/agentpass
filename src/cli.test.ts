@@ -105,6 +105,19 @@ describe("cli", () => {
     }
   });
 
+  test("run exits 128+signum when the child dies by a signal", async () => {
+    const server = http.createServer((_req, res) => res.writeHead(200).end("{}"));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ port: (server.address() as { port: number }).port }));
+    try {
+      expect((await cliAsync(["run", "--", "sh", "-c", "kill -TERM $$"])).code).toBe(143);
+      expect((await cliAsync(["run", "--", "sh", "-c", "kill -KILL $$"])).code).toBe(137);
+    } finally {
+      server.close();
+      rmSync(join(home, "daemon.json"));
+    }
+  });
+
   test("run starts the proxy in-process when none is reachable", async () => {
     const probe = http.createServer();
     await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
