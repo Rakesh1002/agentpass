@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
+import { copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { agentPassDir, saltFile, vaultFile } from "./paths";
 import { effectivePins, parseStoredPins, validatePins, type Pin } from "./egress";
 
@@ -60,8 +60,8 @@ export class Vault {
   private isInitialized = false;
   private hostCache: { hosts: Set<string>; at: number } | null = null;
 
-  // Returns the backup path when this unlock upgraded an older vault in place.
-  async init(masterPassword: string): Promise<string | null> {
+  // Returns true when this unlock upgraded an older vault in place.
+  async init(masterPassword: string): Promise<boolean> {
     this.hostCache = null;
     const vaultDir = agentPassDir();
     mkdirSync(vaultDir, { recursive: true });
@@ -96,9 +96,9 @@ export class Vault {
 
     await this.verifyPasswordOrUpgrade(isNewVault);
     this.migrate();
-    const upgradeBackup = await this.bindValues();
+    const upgraded = await this.bindValues();
     this.isInitialized = true;
-    return upgradeBackup;
+    return upgraded;
   }
 
   private migrate(): void {
@@ -109,25 +109,24 @@ export class Vault {
     }
   }
 
-  // v1/v2 values carry no AAD: re-encrypt each under its name and pins, after a backup, in one write
-  // transaction that commits only if every value reads back. Returns the backup path, or null if nothing ran.
-  private async bindValues(): Promise<string | null> {
+  // v1/v2 values carry no AAD: re-encrypt each under its name and pins in one write transaction that commits
+  // only if every value reads back. No backup: an unbound copy could have its pins widened and be restored,
+  // and the next unlock would then bind the widened pins as authentic.
+  private async bindValues(): Promise<boolean> {
     if (!this.db) throw new Error("Vault not initialized");
     const db = this.db;
     // a vault without a version row predates the meta table, so it is v1; never mark a newer vault as older
     const version = () =>
       Number((db.query(`SELECT value FROM meta WHERE key = 'version'`).get() as { value: string } | null)?.value ?? 1);
-    if (version() >= SCHEMA_VERSION) return null;
+    if (version() >= SCHEMA_VERSION) return false;
 
-    let backup: string | null = null;
     db.run("BEGIN IMMEDIATE");
     try {
       // another process may have upgraded the vault while this one waited for the write lock
       if (version() >= SCHEMA_VERSION) {
         db.run("COMMIT");
-        return null;
+        return false;
       }
-      backup = this.backup(`v${version()}-`);
       const rows = db.query(`SELECT id, name, value, pins FROM secrets`).all() as (StoredRow & { id: string })[];
       const plaintexts = new Map<string, string>();
       for (const row of rows) {
@@ -146,12 +145,10 @@ export class Vault {
       }
       db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES ('version', ?)`, [String(SCHEMA_VERSION)]);
       db.run("COMMIT");
-      return backup;
+      return true;
     } catch (err) {
       db.run("ROLLBACK");
       this.close();
-      // the rollback left the vault as it was, and a service restart loop would otherwise pile up copies
-      for (const suffix of ["", "-wal", "-shm"]) if (backup) rmSync(backup + suffix, { force: true });
       throw err;
     }
   }

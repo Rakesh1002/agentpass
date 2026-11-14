@@ -285,7 +285,7 @@ describe("vault", () => {
     vault.close();
   });
 
-  test("upgrades a v2 vault by binding every value to its pins, after a backup, and keeps the values", async () => {
+  test("upgrades a v2 vault by binding every value to its pins, keeps the values, and leaves no unbound copy", async () => {
     await writeLegacyVault(2, "correct-password", {
       openai: "sk-v2-openai",
       stripe: ["sk_live_v2", '[{"host":"api.stripe.com"}]'],
@@ -293,30 +293,25 @@ describe("vault", () => {
     const v2 = rawRows();
 
     await expect(new Vault().init("wrong-password")).rejects.toThrow("Invalid master password");
-    expect(vaultBackups()).toEqual([]);
     expect(vaultSchema().version).toBe("2");
 
     const vault = new Vault();
-    await vault.init("correct-password");
+    expect(await vault.init("correct-password")).toBe(true);
     expect(await vault.get("openai")).toBe("sk-v2-openai");
     expect(await vault.getEntry("stripe")).toEqual({ value: "sk_live_v2", pins: [{ host: "api.stripe.com" }] });
     expect(vaultSchema().version).toBe("3");
     expect(rawRows().map((row) => row.value)).not.toContain(v2[0]!.value);
-
-    const backups = vaultBackups();
-    expect(backups).toHaveLength(1);
-    expect(backups[0]).toMatch(/^vault\.db\.bak-v2-\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
-    expect(rawRows(join(agentPassDir(), backups[0]!))).toEqual(v2);
+    // an unbound copy could be edited to widen pins and restored, and the next unlock would bind them
+    expect(vaultBackups()).toEqual([]);
 
     tamper(`UPDATE secrets SET pins = '[{"host":"*"}]' WHERE name = 'stripe'`);
     await expect(vault.get("stripe")).rejects.toThrow(IntegrityError);
     vault.close();
 
     const reopened = new Vault();
-    await reopened.init("correct-password");
+    expect(await reopened.init("correct-password")).toBe(false);
     expect(await reopened.get("openai")).toBe("sk-v2-openai");
     reopened.close();
-    expect(vaultBackups()).toHaveLength(1);
   });
 
   test("a v2 upgrade that cannot read every value changes nothing and leaves no backup", async () => {

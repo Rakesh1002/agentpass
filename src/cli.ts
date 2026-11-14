@@ -281,11 +281,10 @@ async function vaultPassword(): Promise<string> {
 
 async function unlock(): Promise<void> {
   if (vault.check()) return;
-  const upgradeBackup = await vault.init(await vaultPassword());
-  if (upgradeBackup) {
+  if (await vault.init(await vaultPassword())) {
     // a proxy still running the old code cannot read upgraded values, so it fails closed until restarted
     console.error(
-      `Upgraded the vault so each value is bound to its pins. Backup of the previous vault: ${upgradeBackup}\n` +
+      "Upgraded the vault so each value is bound to its pins.\n" +
         "If the background proxy is running, restart it: agentpass down && agentpass up"
     );
   }
