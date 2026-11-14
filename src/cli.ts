@@ -6,6 +6,8 @@ import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
 import { certificateAuthority } from "./ca";
 import { loadRoutingConfig, writeDefaultConfig } from "./router";
+import { effectivePins, validatePins, type Pin } from "./egress";
+import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, writeFileSync } from "fs";
@@ -52,6 +54,9 @@ async function main() {
         break;
       case "list":
         await handleList();
+        break;
+      case "pins":
+        await handlePins(args.slice(1));
         break;
       case "get":
         await handleGet(args.slice(1));
@@ -106,6 +111,12 @@ Usage: agentpass <command> [options]
 Commands:
   init                  Initialize vault with master password
   add <name>            Add a secret
+      --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name)
+      --path <prefix>     Only for paths under this prefix
+      --method GET,POST   Only for these methods
+  pins <name>           Show a secret's pins
+      --set <h>[,<h>]     Replace pins (with --path / --method)
+      --clear             Remove explicit pins
   list                  List all secrets
   get <name>            Get a secret value
   delete <name>         Delete a secret
@@ -125,6 +136,7 @@ Examples:
   agentpass init
   agentpass add openai
   agentpass add anthropic
+  agentpass add stripe-test --host api.stripe.com --method GET,POST
   agentpass routing init
   agentpass run claude
   agentpass run cursor-agent
@@ -234,6 +246,9 @@ async function handleAdd(args: string[]) {
     options: {
       type: { type: "string", short: "t", default: "api_key" },
       value: { type: "string", short: "v" },
+      host: { type: "string" },
+      path: { type: "string" },
+      method: { type: "string" },
     },
     allowPositionals: true,
     strict: false,
@@ -243,8 +258,9 @@ async function handleAdd(args: string[]) {
   const type = typeof values.type === "string" ? values.type : "api_key";
 
   if (!name) {
-    throw new Error("Usage: agentpass add <name>");
+    throw new Error("Usage: agentpass add <name> [--host <host>[,<host>...]] [--path <prefix>] [--method GET,POST]");
   }
+  const pins = pinsFromFlags(values.host, values.path, values.method);
 
   const value =
     typeof values.value === "string" && values.value.length > 0
@@ -252,8 +268,68 @@ async function handleAdd(args: string[]) {
       : await promptHidden(`Secret value for ${name}: `);
 
   await unlock();
-  await vault.add(name, value, type);
+  await vault.add(name, value, type, pins);
   console.log(`Added secret: ${name}`);
+  const stored = await vault.getPins(name);
+  if (effectivePins(name, stored).length === 0) {
+    const known = KNOWN_SERVICES[name.split("-")[0] ?? ""];
+    console.log(
+      `Warning: ${name} has no pins, so the proxy will never substitute it.` +
+        ` Pin it with: agentpass pins ${name} --set ${known ?? "<host>"}` +
+        (known ? ` (or re-add with --host ${known})` : "")
+    );
+  }
+  vault.close();
+}
+
+function pinsFromFlags(host: unknown, path: unknown, method: unknown): Pin[] | undefined {
+  if (host === undefined) {
+    if (path !== undefined || method !== undefined) throw new Error("--path and --method require hosts (--host or --set)");
+    return undefined;
+  }
+  const hosts = typeof host === "string" ? host.split(",").map((h) => h.trim()).filter(Boolean) : [];
+  if (hosts.length === 0) throw new Error("--host needs at least one host");
+  if (path !== undefined && typeof path !== "string") throw new Error("--path needs a value");
+  if (method !== undefined && typeof method !== "string") throw new Error("--method needs a value");
+
+  const methods = method?.split(",").map((m) => m.trim()).filter(Boolean);
+  return validatePins(
+    hosts.map((h) => ({ host: h, ...(methods ? { methods } : {}), ...(path ? { pathPrefix: path } : {}) }))
+  );
+}
+
+function formatPins(name: string, stored: Pin[] | null): string {
+  const format = (pin: Pin) =>
+    `${pin.host}${pin.pathPrefix ?? ""}${pin.methods ? ` [${pin.methods.join(",")}]` : ""}`;
+  if (stored) return stored.map(format).join(", ");
+  const implicit = effectivePins(name, null);
+  return implicit.length > 0 ? `${implicit.map(format).join(", ")} (implicit)` : "none (deny by default)";
+}
+
+async function handlePins(args: string[]) {
+  await ensureVaultFile();
+
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      set: { type: "string" },
+      clear: { type: "boolean", default: false },
+      path: { type: "string" },
+      method: { type: "string" },
+    },
+    allowPositionals: true,
+    strict: false,
+  });
+
+  const name = positionals[0];
+  if (!name) throw new Error("Usage: agentpass pins <name> [--set <host>[,<host>...] [--path <prefix>] [--method GET,POST] | --clear]");
+  if (values.set !== undefined && values.clear) throw new Error("Use either --set or --clear");
+  const pins = values.clear ? null : pinsFromFlags(values.set, values.path, values.method);
+
+  await unlock();
+  if (!(await vault.has(name))) throw new Error(`Secret "${name}" not found`);
+  if (pins !== undefined) await vault.setPins(name, pins);
+  console.log(`${name}: ${formatPins(name, await vault.getPins(name))}`);
   vault.close();
 }
 
@@ -268,7 +344,7 @@ async function handleList() {
     console.log("Stored secrets:");
     for (const s of secrets) {
       console.log(
-        `  ${s.name} (${s.type}) — updated ${new Date(s.updated).toLocaleDateString()}`
+        `  ${s.name} (${s.type}) — pins: ${formatPins(s.name, s.pins)} — updated ${new Date(s.updated).toLocaleDateString()}`
       );
     }
   }
