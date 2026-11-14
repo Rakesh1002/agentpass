@@ -15,38 +15,63 @@ import { join, resolve } from "path";
 import { certificateAuthority } from "./ca";
 import { matchProvider } from "./providers";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { buildEnv, ensureCaBundle, formatEnv, hookScript, proxyPort } from "./shellenv";
+import { allowManifest, forbiddenVar } from "./project";
+import { buildEnv, ensureCaBundle, formatEnv, hookScript, livePort, proxyPort } from "./shellenv";
+import { allow } from "./trust";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
+const USER_HOME = process.env.HOME;
+
+function proxyUp(port = 8888) {
+  writeFileSync(daemonFile(), JSON.stringify({ pid: process.pid, port }));
+}
+
+function deadPid() {
+  return spawnSync("true").pid;
+}
+
+function git(cwd: string, ...args: string[]) {
+  const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  if (r.status !== 0) throw new Error(r.stderr);
+}
+
+process.umask(0o022);
 let root: string;
 let home: string;
+let user: string;
 let proj: string;
 let other: string;
 
 beforeAll(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "agentpass-env-")));
   home = join(root, "home");
+  user = join(root, "user");
   process.env.AGENTPASS_HOME = home;
+  process.env.HOME = user;
   certificateAuthority.ensureCa();
 
-  proj = join(root, "proj");
+  proj = join(user, "proj");
   mkdirSync(join(proj, "sub"), { recursive: true });
   writeFileSync(
     join(proj, ".agentpass.json"),
     JSON.stringify({ env: { STRIPE_SECRET_KEY: "stripe-test", OPENAI_API_KEY: "openai-work" } })
   );
-  other = join(root, "other");
+  allowManifest(proj);
+  other = join(user, "other");
   mkdirSync(other);
   writeFileSync(join(other, ".agentpass.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "anthropic" } }));
+  allowManifest(other);
 });
 
 afterAll(() => {
   delete process.env.AGENTPASS_HOME;
+  process.env.HOME = USER_HOME;
   rmSync(root, { recursive: true, force: true });
 });
 
 beforeEach(() => {
   process.env.AGENTPASS_HOME = home;
+  process.env.HOME = user;
   rmSync(daemonFile(), { force: true });
   rmSync(globalConfigFile(), { force: true });
 });
@@ -59,11 +84,30 @@ describe("proxy port", () => {
     writeFileSync(daemonFile(), "garbage");
     expect(proxyPort()).toBe(8888);
   });
+
+  test("the proxy is live only while daemon.json names a running pid", () => {
+    expect(livePort()).toBeNull();
+    writeFileSync(daemonFile(), JSON.stringify({ port: 9123 }));
+    expect(livePort()).toBeNull();
+    writeFileSync(daemonFile(), JSON.stringify({ pid: deadPid(), port: 9123 }));
+    expect(livePort()).toBeNull();
+    proxyUp(9123);
+    expect(livePort()).toBe(9123);
+  });
 });
 
 describe("buildEnv", () => {
+  test("without a live proxy only the placeholders are exported", () => {
+    expect(buildEnv(join(proj, "sub"))).toEqual({
+      OPENAI_API_KEY: "{{secret:openai-work}}",
+      STRIPE_SECRET_KEY: "{{secret:stripe-test}}",
+    });
+    writeFileSync(daemonFile(), JSON.stringify({ pid: deadPid(), port: 9123 }));
+    expect(Object.keys(buildEnv(join(proj, "sub")))).toEqual(["OPENAI_API_KEY", "STRIPE_SECRET_KEY"]);
+  });
+
   test("produces placeholders, proxy and CA settings without the vault", () => {
-    writeFileSync(daemonFile(), JSON.stringify({ port: 9123 }));
+    proxyUp(9123);
     const env = buildEnv(join(proj, "sub"));
     const proxyUrl = "http://127.0.0.1:9123";
     expect(env).toEqual({
@@ -88,7 +132,7 @@ describe("buildEnv", () => {
     writeFileSync(
       globalConfigFile(),
       JSON.stringify({
-        env: { A: "anthropic", O: "openai", G: "groq-2", R: "openrouter", X: "openaix" },
+        env: { A_KEY: "anthropic", O_KEY: "openai", G_KEY: "groq-2", R_KEY: "openrouter", X_KEY: "openaix" },
       })
     );
     const env = buildEnv(root, 8888);
@@ -113,6 +157,83 @@ describe("buildEnv", () => {
   test("manifest vars cannot override the proxy settings", () => {
     writeFileSync(globalConfigFile(), JSON.stringify({ env: { HTTPS_PROXY: "evil" } }));
     expect(buildEnv(root, 8888).HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+  });
+
+  test("every var the env layer sets is a name no manifest may map", () => {
+    writeFileSync(
+      globalConfigFile(),
+      JSON.stringify({ env: { A_KEY: "anthropic", O_KEY: "openai", G_KEY: "groq", R_KEY: "openrouter" } })
+    );
+    const own = Object.keys(buildEnv(root, 8888)).filter((k) => !k.endsWith("_KEY"));
+    expect(own.length).toBeGreaterThan(10);
+    expect(own.filter((k) => forbiddenVar(k) === null)).toEqual([]);
+  });
+});
+
+describe("session tags", () => {
+  const TAG_RE = /^[A-Za-z0-9._@+-]{1,96}$/;
+
+  function tagged(dir: string, agent?: string) {
+    const env = buildEnv(dir, 8888, { agent });
+    const proxy = new URL(env.HTTPS_PROXY!);
+    const route = env.OPENAI_BASE_URL!.match(/^http:\/\/127\.0\.0\.1:8888\/_t\/([^/]+)\/openai\/v1$/);
+    const tag = decodeURIComponent(proxy.username);
+    expect(route && decodeURIComponent(route[1]!)).toBe(tag);
+    expect(proxy.host).toBe("127.0.0.1:8888");
+    expect(tag).toMatch(TAG_RE);
+    for (const k of ["HTTP_PROXY", "http_proxy", "https_proxy"]) expect(env[k]).toBe(env.HTTPS_PROXY);
+    return tag;
+  }
+
+  test("tag proxy userinfo and base URLs with repo@branch, a short sha when detached, and +agent for run", () => {
+    const repo = join(root, "tag-repo");
+    mkdirSync(join(repo, "sub"), { recursive: true });
+    git(repo, "init", "-q", "-b", "main");
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    expect(tagged(join(repo, "sub"))).toBe("tag-repo@main");
+    expect(buildEnv(join(repo, "sub"), 8888).HTTPS_PROXY).toBe("http://tag-repo%40main@127.0.0.1:8888");
+    expect(buildEnv(repo, 8888).OPENAI_BASE_URL).toBe("http://127.0.0.1:8888/_t/tag-repo%40main/openai/v1");
+    expect(tagged(repo, "/opt/bin/claude")).toBe("tag-repo@main+claude");
+
+    git(repo, "checkout", "-q", "-b", "feat/x#1,y");
+    expect(tagged(repo)).toBe("tag-repo@feat-x-1-y");
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x");
+    git(repo, "checkout", "-q", "--detach");
+    const sha = readFileSync(join(repo, ".git", "HEAD"), "utf-8").trim();
+    expect(tagged(repo)).toBe(`tag-repo@${sha.slice(0, 7)}`);
+
+    const wt = join(root, "tag wt!");
+    git(repo, "worktree", "add", "-q", "-b", "side", wt);
+    expect(tagged(wt, "codex")).toBe("tag-wt-@side+codex");
+  });
+
+  test("tags are capped at 96 chars and keep the agent suffix", () => {
+    const repo = join(root, "r".repeat(120));
+    mkdirSync(repo);
+    git(repo, "init", "-q", "-b", "main");
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    expect(tagged(repo).length).toBe(96);
+    const withAgent = tagged(repo, "claude");
+    expect(withAgent.length).toBe(96);
+    expect(withAgent).toEndWith("+claude");
+  });
+
+  test("a FIFO in place of .git or HEAD drops the tag instead of hanging", () => {
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    const repo = join(root, "fifo-repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    spawnSync("mkfifo", [join(repo, ".git", "HEAD")]);
+    const wt = join(root, "fifo-wt");
+    mkdirSync(wt);
+    spawnSync("mkfifo", [join(wt, ".git")]);
+    for (const dir of [repo, wt]) expect(buildEnv(dir, 8888).HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+  });
+
+  test("no tag outside a repo", () => {
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    const env = buildEnv(root, 8888);
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+    expect(env.OPENAI_BASE_URL).toBe("http://127.0.0.1:8888/openai/v1");
   });
 });
 
@@ -163,11 +284,32 @@ describe("formatEnv", () => {
       });
       expect(r.stdout).toBe(`${env.A}\n${env.B}\nA B\n1\n`);
     });
+
+    test(`${shell} restore puts back prior values, keeping unset apart from empty, even after a re-eval`, () => {
+      const bin = shell === "bash" ? ["bash", "--norc", "--noprofile", "-c"] : ["zsh", "-fc"];
+      const script = `export A="it's \\$x" B=; unset C
+eval "$OUT"; eval "$OUT"; printf '%s|' "$A" "$B" "$C"; echo
+eval "$_AGENTPASS_RESTORE"
+printf '%s|' "$A" "\${B-unset}" "\${C-unset}" "\${_AGENTPASS_RESTORE-gone}"; env | grep -c '^[AB]='
+set | grep -c '^__AGENTPASS_SAVED'`;
+      const r = spawnSync(bin[0]!, [...bin.slice(1), script], {
+        encoding: "utf-8",
+        env: { PATH: process.env.PATH, OUT: formatEnv({ A: "a", B: "b", C: "c" }, shell) },
+      });
+      expect(r.stdout).toBe(`a|b|c|\nit's $x||unset|gone|2\n0\n`);
+    });
   }
 
-  test("fish output escapes quotes and backslashes", () => {
+  test("fish output escapes quotes and backslashes and saves prior values", () => {
     expect(formatEnv({ A: "it's \\" }, "fish")).toBe(
-      "set -gx A 'it\\'s \\\\';\nset -g AGENTPASS_EXPORTED 'A';\n"
+      [
+        "if set -q _AGENTPASS_RESTORE; eval $_AGENTPASS_RESTORE; end;",
+        "set -q A; and set -g __AGENTPASS_SAVED_A $A;",
+        "set -gx A 'it\\'s \\\\';",
+        "set -g AGENTPASS_EXPORTED 'A';",
+        "set -g _AGENTPASS_RESTORE 'if set -q __AGENTPASS_SAVED_A; set -gx A $__AGENTPASS_SAVED_A; set -e __AGENTPASS_SAVED_A; else; set -e A; end; set -e AGENTPASS_EXPORTED; set -e _AGENTPASS_RESTORE;';",
+        "",
+      ].join("\n")
     );
   });
 });
@@ -182,11 +324,14 @@ describe("hook", () => {
     const bin = shell === "bash" ? ["bash", "--norc", "--noprofile", "-c"] : ["zsh", "-fc"];
     // Simulate a prompt: non-interactive shells never run precmd / PROMPT_COMMAND themselves.
     const tick = shell === "bash" ? 'eval "$PROMPT_COMMAND"' : 'for f in $precmd_functions; do $f; done';
-    const script = `eval "$HOOK"\nshow() { echo "$1:\${OPENAI_API_KEY-unset}:\${ANTHROPIC_API_KEY-unset}:\${HTTPS_PROXY-unset}"; }\n${body.replaceAll("TICK", tick)}`;
+    const script = `eval "$HOOK"
+show() { echo "$1:\${OPENAI_API_KEY-unset}:\${ANTHROPIC_API_KEY-unset}:\${HTTPS_PROXY-unset}"; }
+ap() { "${process.execPath}" "${CLI}" "$@"; }
+${body.replaceAll("TICK", tick)}`;
     const r = spawnSync(bin[0]!, [...bin.slice(1), script], {
       encoding: "utf-8",
       cwd: root,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, HOOK: hook, CALL_LOG: log },
+      env: { PATH: process.env.PATH, HOME: user, AGENTPASS_HOME: home, HOOK: hook, CALL_LOG: log },
     });
     const calls = existsSync(log) ? readFileSync(log, "utf-8").split("\n").filter(Boolean).length : 0;
     return { out: r.stdout, err: r.stderr, calls };
@@ -195,6 +340,7 @@ describe("hook", () => {
   for (const shell of ["bash", "zsh"] as const) {
     test(`${shell}: exports on entering a project and unsets on leaving`, () => {
       const p = "http://127.0.0.1:8888";
+      proxyUp();
       const r = runHook(
         shell,
         `show start
@@ -219,31 +365,200 @@ env | grep -c '^STRIPE_SECRET_KEY=' || true`
       expect(r.calls).toBe(2);
     });
 
-    test(`${shell}: reruns on manifest change and warns once for a bad manifest`, () => {
-      const bad = join(root, `bad-${shell}`);
+    test(`${shell}: restores the values a project overwrote, across project hops`, () => {
+      const p = "http://127.0.0.1:8888";
+      proxyUp();
+      const r = runHook(
+        shell,
+        `export HTTPS_PROXY=http://corp:3128 OPENAI_API_KEY=sk-mine ANTHROPIC_API_KEY=
+unset NODE_EXTRA_CA_CERTS
+cd "${proj}"; TICK; show proj
+cd "${other}"; TICK; show other
+cd "${proj}/sub"; TICK; show back
+cd "${root}"; TICK; show out
+echo "\${NODE_EXTRA_CA_CERTS-unset}:\${ANTHROPIC_API_KEY+set}"
+env | grep -E '^(HTTPS_PROXY|OPENAI_API_KEY|ANTHROPIC_API_KEY)=' | sort`
+      );
+      expect(r.err).toBe("");
+      expect(r.out).toBe(
+        [
+          `proj:{{secret:openai-work}}::${p}`,
+          `other:sk-mine:{{secret:anthropic}}:${p}`,
+          `back:{{secret:openai-work}}::${p}`,
+          "out:sk-mine::http://corp:3128",
+          "unset:set",
+          "ANTHROPIC_API_KEY=",
+          "HTTPS_PROXY=http://corp:3128",
+          "OPENAI_API_KEY=sk-mine",
+          "",
+        ].join("\n")
+      );
+    });
+
+    test(`${shell}: global defaults apply in every directory under HOME and follow config edits`, () => {
+      const p = "http://127.0.0.1:8888";
+      proxyUp();
+      mkdirSync(join(user, "plain2", "deep"), { recursive: true });
+      writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai-global" } }));
+      const r = runHook(
+        shell,
+        `cd "${user}"; TICK; show home
+cd "${user}/plain2/deep"; TICK; show deep
+printf '%s' '{"env":{"OPENAI_API_KEY":"openai-edited","ANTHROPIC_API_KEY":"anthropic"}}' > "${globalConfigFile()}"
+TICK; show edited
+cd "${proj}"; TICK; show proj
+cd "${root}"; TICK; show out`
+      );
+      expect(r.err).toBe("");
+      expect(r.out).toBe(
+        [
+          `home:{{secret:openai-global}}:unset:${p}`,
+          `deep:{{secret:openai-global}}:unset:${p}`,
+          `edited:{{secret:openai-edited}}:{{secret:anthropic}}:${p}`,
+          `proj:{{secret:openai-work}}:{{secret:anthropic}}:${p}`,
+          "out:unset:unset:unset",
+          "",
+        ].join("\n")
+      );
+    });
+
+    test(`${shell}: proxy vars follow the daemon, and a dead proxy warns once per session`, () => {
+      const r = runHook(
+        shell,
+        `cd "${proj}"; TICK; show down
+cd "${other}"; TICK; show down2
+printf '%s' '{"pid":${process.pid},"port":9999}' > "${daemonFile()}"; TICK; show up
+rm "${daemonFile()}"; TICK; show stopped
+echo "\${NODE_EXTRA_CA_CERTS-unset}:\${ANTHROPIC_BASE_URL-unset}"`
+      );
+      expect(r.out).toBe(
+        [
+          "down:{{secret:openai-work}}:unset:unset",
+          "down2:unset:{{secret:anthropic}}:unset",
+          "up:unset:{{secret:anthropic}}:http://127.0.0.1:9999",
+          "stopped:unset:{{secret:anthropic}}:unset",
+          "unset:unset",
+          "",
+        ].join("\n")
+      );
+      expect(r.err.match(/agentpass up/g)?.length).toBe(1);
+    });
+
+    test(`${shell}: the session tag follows a branch switch without a second env run`, () => {
+      proxyUp();
+      const repo = join(user, `tagged-${shell}`);
+      mkdirSync(repo);
+      git(repo, "init", "-q", "-b", "main");
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x");
+      const r = runHook(
+        shell,
+        `cd "${repo}"; TICK; TICK; echo "$HTTPS_PROXY"
+git checkout -q -b dev1; TICK; TICK; echo "$HTTPS_PROXY"`
+      );
+      expect(r.out).toBe(
+        `http://tagged-${shell}%40main@127.0.0.1:8888\nhttp://tagged-${shell}%40dev1@127.0.0.1:8888\n`
+      );
+      expect(r.calls).toBe(2);
+    });
+
+    test(`${shell}: an edited manifest waits for allow, and a bad one warns once`, () => {
+      const p = "http://127.0.0.1:8888";
+      proxyUp();
+      const bad = join(user, `bad-${shell}`);
       mkdirSync(bad, { recursive: true });
       writeFileSync(join(bad, ".agentpass.json"), "{oops");
+      allowManifest(bad);
       const r = runHook(
         shell,
         `cd "${proj}"; TICK; show a
-printf '%s' '{"env":{"ANTHROPIC_API_KEY":"anthropic"}}' > "${join(root, "edit.json")}"
+printf '%s' '{"env":{"ANTHROPIC_API_KEY":"anthropic-${shell}"}}' > "${join(root, "edit.json")}"
 cp "${join(proj, ".agentpass.json")}" "${join(root, "orig.json")}"
-cp "${join(root, "edit.json")}" "${join(proj, ".agentpass.json")}"; TICK; show b
+cp "${join(root, "edit.json")}" "${join(proj, ".agentpass.json")}"; TICK; TICK; show b
+ap allow >/dev/null; TICK; show c
 cp "${join(root, "orig.json")}" "${join(proj, ".agentpass.json")}"
 cd "${bad}"; TICK; TICK; TICK; show bad`
       );
       expect(r.out).toBe(
         [
-          "a:{{secret:openai-work}}:unset:http://127.0.0.1:8888",
-          "b:unset:{{secret:anthropic}}:http://127.0.0.1:8888",
+          `a:{{secret:openai-work}}:unset:${p}`,
+          `b:unset:unset:${p}`,
+          `c:unset:{{secret:anthropic-${shell}}}:${p}`,
           "bad:unset:unset:unset",
           "",
         ].join("\n")
       );
+      expect(r.err.match(/is not allowed yet/g)?.length).toBe(1);
+      expect(r.err).toContain("Review it, then run: agentpass allow");
       expect(r.err.match(/invalid JSON/g)?.length).toBe(1);
-      expect(r.calls).toBe(3);
+      expect(r.calls).toBe(4);
+    });
+
+    test(`${shell}: a repo cannot run code through GIT_CONFIG_GLOBAL or BASH_ENV, allowed or not`, () => {
+      const evil = join(user, `evil-${shell}`);
+      mkdirSync(evil);
+      git(evil, "init", "-q", "-b", "main");
+      writeFileSync(
+        join(evil, ".agentpass.json"),
+        JSON.stringify({ env: { GIT_CONFIG_GLOBAL: "g", BASH_ENV: "b" }, shell })
+      );
+      writeFileSync(join(evil, "{{secret:g}}"), '[core]\n\tfsmonitor = "touch pwned-git; false"\n');
+      writeFileSync(join(evil, "{{secret:b}}"), "touch pwned-bash\n");
+      git(evil, "add", "-A");
+      git(evil, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x");
+
+      const r = runHook(
+        shell,
+        `probe() { git status >/dev/null 2>&1; bash -c true; echo "$1:\${GIT_CONFIG_GLOBAL-unset}:\${BASH_ENV-unset}"; }
+cd "${evil}"; TICK; probe untrusted
+ap allow >/dev/null; TICK; probe allowed`
+      );
+      expect([existsSync(join(evil, "pwned-git")), existsSync(join(evil, "pwned-bash"))]).toEqual([false, false]);
+      expect(r.out).toBe("untrusted:unset:unset\nallowed:unset:unset\n");
+      expect(r.err).toContain("is not allowed yet");
+      expect(r.err).toContain("skipping GIT_CONFIG_GLOBAL: reserved");
+      expect(r.err).toContain("skipping BASH_ENV: reserved");
+    });
+
+    test(`${shell}: never applies a manifest above HOME or above the git toplevel`, () => {
+      const planted = join(root, ".agentpass.json");
+      const bytes = JSON.stringify({ env: { OPENAI_API_KEY: "planted" } });
+      writeFileSync(planted, bytes);
+      allow(planted, Buffer.from(bytes));
+      const top = join(user, ".agentpass.json");
+      writeFileSync(top, JSON.stringify({ env: { OPENAI_API_KEY: "home" } }));
+      allowManifest(user);
+      mkdirSync(join(user, "repo", ".git"), { recursive: true });
+      mkdirSync(join(user, "plain"), { recursive: true });
+      proxyUp();
+      try {
+        const r = runHook(
+          shell,
+          `cd "${root}"; TICK; show root
+cd "${user}/plain"; TICK; show plain
+cd "${user}/repo"; TICK; show repo`
+        );
+        const p = "http://127.0.0.1:8888";
+        expect(r.out).toBe(["root:unset:unset:unset", `plain:{{secret:home}}:unset:${p}`, `repo:unset:unset:${p}`, ""].join("\n"));
+      } finally {
+        rmSync(planted);
+        rmSync(top);
+      }
     });
   }
+
+  test("an untrusted manifest exports only global defaults and warns once for the directory", () => {
+    proxyUp();
+    const fresh = join(user, "fresh");
+    mkdirSync(join(fresh, "sub"), { recursive: true });
+    writeFileSync(join(fresh, ".agentpass.json"), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { ANTHROPIC_API_KEY: "anthropic" } }));
+    const r = runHook("zsh", `cd "${fresh}"; TICK; cd sub; TICK; TICK; show fresh`);
+    expect(r.out).toBe("fresh:unset:{{secret:anthropic}}:http://127.0.0.1:8888\n");
+    expect(r.err).toBe(
+      `agentpass: ${join(fresh, ".agentpass.json")} is not allowed yet, so nothing from it is exported.` +
+        " Review it, then run: agentpass allow\n"
+    );
+  });
 
   test("bash hook keeps an existing PROMPT_COMMAND and installs once", () => {
     const hook = hookScript("bash", ["true"]);
@@ -258,6 +573,6 @@ cd "${bad}"; TICK; TICK; TICK; show bad`
   test("fish hook registers on PWD changes", () => {
     const hook = hookScript("fish", ["agentpass", "it's"]);
     expect(hook).toContain("--on-variable PWD");
-    expect(hook).toContain("agentpass 'it\\'s' env --shell fish");
+    expect(hook).toContain("agentpass 'it\\'s' env --hook --shell fish");
   });
 });

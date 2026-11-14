@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "child_process";
 import http from "http";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join, resolve } from "path";
+import { basename, join, resolve } from "path";
 import { certificateAuthority } from "./ca";
 import { freePort, selfProxyEnv } from "./testing";
 import { Vault } from "./vault";
@@ -66,7 +66,7 @@ beforeAll(async () => {
 
   proj = join(root, "proj");
   mkdirSync(proj);
-  spawnSync("git", ["init", "-q"], { cwd: proj });
+  spawnSync("git", ["init", "-q", "-b", "main"], { cwd: proj });
 });
 
 afterAll(() => {
@@ -96,18 +96,43 @@ describe("cli", () => {
   });
 
   test("env prints json and shell formats, and fails cleanly on a bad manifest", () => {
-    const json = JSON.parse(cli(["env", "--shell", "json"]).out);
-    expect(json.OPENAI_API_KEY).toBe("{{secret:openai}}");
-    expect(json.HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+    const down = cli(["env", "--shell", "json"]);
+    expect(JSON.parse(down.out)).toEqual({ OPENAI_API_KEY: "{{secret:openai}}" });
+    expect(down.err).toContain("Start it with: agentpass up");
+    writeFileSync(join(home, "daemon.json"), JSON.stringify({ pid: process.pid, port: 8888 }));
+    try {
+      const json = JSON.parse(cli(["env", "--shell", "json"]).out);
+      expect(json.OPENAI_API_KEY).toBe("{{secret:openai}}");
+      expect(json.HTTPS_PROXY).toBe("http://proj%40main@127.0.0.1:8888");
+    } finally {
+      rmSync(join(home, "daemon.json"));
+    }
     expect(cli(["env", "--shell", "bash"]).out).toContain("export OPENAI_API_KEY='{{secret:openai}}';");
 
     const bad = join(root, "bad");
     mkdirSync(bad);
-    writeFileSync(join(bad, ".agentpass.json"), "{");
+    writeFileSync(join(bad, ".agentpass.json"), '{"env": {"OPENAI_API_KEY": sk_live_PLANTED}}');
+    const untrusted = cli(["env", "--dir", bad]);
+    expect(untrusted.code).toBe(2);
+    expect(untrusted.out).toBe("");
+    expect(untrusted.err).toContain("Review it, then run: agentpass allow");
+
+    expect(cli(["allow", bad]).out).toBe(`Allowed ${join(bad, ".agentpass.json")}\n`);
     const r = cli(["env", "--dir", bad]);
     expect(r.code).toBe(1);
     expect(r.out).toBe("");
     expect(r.err).toContain("invalid JSON");
+    expect(r.out + r.err).not.toContain("sk_live_PLANTED");
+  });
+
+  test("deny revokes a manifest and run refuses it with exit 2 before asking for the vault", async () => {
+    expect(cli(["deny"]).out).toBe(`Denied ${join(proj, ".agentpass.json")}\n`);
+    expect(cli(["env"]).code).toBe(2);
+    const r = await cliAsync(["run", "--", "sh", "-c", "echo ran"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toBe("");
+    expect(cli(["allow"]).code).toBe(0);
+    expect(cli(["env"]).code).toBe(0);
   });
 
   test("run uses a reachable proxy without the vault and passes the exit code", async () => {
@@ -117,7 +142,7 @@ describe("cli", () => {
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
       const r = await cliAsync(["run", "--", "sh", "-c", 'echo "$OPENAI_API_KEY $HTTPS_PROXY $KEEP"; exit 7']);
-      expect(r.out).toBe(`{{secret:openai}} http://127.0.0.1:${port} kept\n`);
+      expect(r.out).toBe(`{{secret:openai}} http://proj%40main%2Bsh@127.0.0.1:${port} kept\n`);
       expect(r.code).toBe(7);
     } finally {
       server.close();
@@ -171,7 +196,8 @@ describe("cli", () => {
         UPSTREAM: `http://127.0.0.1:${(upstream.address() as { port: number }).port}/ping`,
         ...selfProxyEnv(self),
       });
-      expect(probeLine(r.out)).toBe(`${self} 200 200`);
+      const tagged = `http://proj%40main%2B${basename(process.execPath)}@127.0.0.1:${port}`;
+      expect(probeLine(r.out)).toBe(`${tagged} 200 200`);
       expect(hits).toBe(1);
     } finally {
       upstream.close();
@@ -187,7 +213,7 @@ describe("cli", () => {
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
       const r = await cliAsync(["run", "--", "sh", "-c", 'echo "$HTTPS_PROXY"'], { AGENTPASS_PASSWORD: "test-password" });
-      expect(r.out).toContain(`http://127.0.0.1:${port}\n`);
+      expect(r.out).toContain(`http://proj%40main%2Bsh@127.0.0.1:${port}\n`);
       expect(r.code).toBe(0);
     } finally {
       rmSync(join(home, "daemon.json"));
