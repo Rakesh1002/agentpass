@@ -12,20 +12,20 @@ let root: string;
 let home: string;
 let proj: string;
 
-function cli(args: string[], cwd = proj) {
+function cli(args: string[], extra: Record<string, string> = {}, cwd = proj) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: "utf-8",
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+    env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept", ...extra },
   });
   return { out: r.stdout, err: r.stderr, code: r.status };
 }
 
-function cliAsync(args: string[]): Promise<{ out: string; code: number | null }> {
+function cliAsync(args: string[], extra: Record<string, string> = {}): Promise<{ out: string; code: number | null }> {
   return new Promise((done) => {
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd: proj,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTPASS_HOME: home, KEEP: "kept" },
+      env: { PATH: process.env.PATH, HOME: root, AGENTPASS_HOME: home, KEEP: "kept", ...extra },
     });
     let out = "";
     child.stdout.on("data", (c) => (out += c));
@@ -64,7 +64,7 @@ describe("cli", () => {
     expect(locked.out).toContain("OPENAI_API_KEY -> openai (project)");
     expect(locked.out).toContain("vault locked");
 
-    const open = cli(["project", "-p", "test-password"]);
+    const open = cli(["project"], { AGENTPASS_PASSWORD: "test-password" });
     expect(open.out).toContain("STRIPE_SECRET_KEY -> stripe-test (project) MISSING from vault");
     expect(open.out).not.toContain("OPENAI_API_KEY -> openai (project) MISSING");
     expect(open.out + open.err).not.toContain("sk-real-value");
@@ -112,7 +112,7 @@ describe("cli", () => {
     await new Promise<void>((r) => probe.close(() => r()));
     writeFileSync(join(home, "daemon.json"), JSON.stringify({ port }));
     try {
-      const r = await cliAsync(["run", "-p", "test-password", "--", "sh", "-c", 'echo "$HTTPS_PROXY"']);
+      const r = await cliAsync(["run", "--", "sh", "-c", 'echo "$HTTPS_PROXY"'], { AGENTPASS_PASSWORD: "test-password" });
       expect(r.out).toContain(`http://127.0.0.1:${port}\n`);
       expect(r.code).toBe(0);
     } finally {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
-import { vault } from "./vault";
+import { vault, vaultUnlockMode } from "./vault";
+import { keychain, keychainAccount, randomSecret } from "./keychain";
 import { proxy, ProxyServer } from "./proxy";
 import { claudeShim } from "./claude";
 import { listAudit } from "./audit";
@@ -11,14 +12,12 @@ import { effectivePins, validatePins, type Pin } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { vaultFile, routingConfigFile } from "./paths";
 import { linkVar, resolveProject, unlinkVar } from "./project";
 import { buildEnv, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
 
 const VAULT_FILE = vaultFile();
-
-let globalPassword: string | undefined;
 
 async function main() {
   const args = process.argv.slice(2);
@@ -31,7 +30,6 @@ async function main() {
   const { values } = parseArgs({
     args,
     options: {
-      password: { type: "string", short: "p" },
       help: { type: "boolean", short: "h", default: false },
     },
     allowPositionals: true,
@@ -43,14 +41,15 @@ async function main() {
     process.exit(0);
   }
 
-  globalPassword = typeof values.password === "string" ? values.password : undefined;
-
   const command = args[0];
 
   try {
     switch (command) {
       case "init":
         await handleInit(args.slice(1));
+        break;
+      case "unlock-mode":
+        await handleUnlockMode(args.slice(1));
         break;
       case "add":
         await handleAdd(args.slice(1));
@@ -129,7 +128,10 @@ AgentPass — credential broker for AI agents
 Usage: agentpass <command> [options]
 
 Commands:
-  init                  Initialize vault with master password
+  init [--passphrase]   Initialize the vault; it unlocks from the OS keychain
+                        unless --passphrase (or AGENTPASS_PASSWORD) is given
+  unlock-mode keychain|passphrase
+                        Re-encrypt the vault for the other unlock mode (backs up first)
   add <name>            Add a secret
       --host <h>[,<h>]    Hosts the proxy may send it to (required unless a provider name)
       --path <prefix>     Only for paths under this prefix
@@ -148,7 +150,7 @@ Commands:
   hook zsh|bash|fish    Print a shell hook: eval "$(agentpass hook zsh)"
   link <VAR> <secret>   Map an env var to a vault secret in .agentpass.json
   unlink <VAR>          Remove a mapping from .agentpass.json
-  project               Show the resolved mapping (-p to check the vault)
+  project               Show the resolved mapping (checks the vault if it unlocks without a prompt)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
   status                Show vault and proxy status
@@ -158,6 +160,8 @@ Commands:
   routing show          Display current routing config
   routing enable        Enable cost-aware routing
   routing disable       Disable cost-aware routing
+
+Passphrase-mode vaults read AGENTPASS_PASSWORD, or prompt on a TTY.
 
 Examples:
   agentpass scan
@@ -180,7 +184,7 @@ async function ensureVaultFile(): Promise<void> {
 
 async function promptHidden(question: string): Promise<string> {
   if (!process.stdin.isTTY) {
-    throw new Error("Interactive prompt requires a TTY. For non-interactive use, provide the required secrets via CLI options.");
+    throw new Error("Interactive prompt requires a TTY. Set AGENTPASS_PASSWORD for the master password; pass secret values with -v.");
   }
 
   process.stdout.write(question);
@@ -228,21 +232,41 @@ async function promptHidden(question: string): Promise<string> {
   });
 }
 
+async function vaultPassword(): Promise<string> {
+  if (vaultUnlockMode() === "keychain") {
+    const secret = keychain()?.get(keychainAccount());
+    if (!secret) throw new Error(`The OS keychain has no key for this vault (service sh.agentpass, account ${keychainAccount()})`);
+    return secret;
+  }
+  if (process.env.AGENTPASS_PASSWORD) return process.env.AGENTPASS_PASSWORD;
+  if (!process.stdin.isTTY) {
+    throw new Error("The vault is in passphrase mode and there is no TTY to prompt on. Set AGENTPASS_PASSWORD, or switch with: agentpass unlock-mode keychain");
+  }
+  return promptHidden("Master password: ");
+}
+
 async function unlock(): Promise<void> {
   if (vault.check()) return;
-  let password = globalPassword;
+  await vault.init(await vaultPassword());
+}
+
+async function newPassphrase(): Promise<string> {
+  let password = process.env.AGENTPASS_PASSWORD;
   if (!password) {
-    password = await promptHidden("Master password: ");
+    password = await promptHidden("Enter master password: ");
+    const confirm = await promptHidden("Confirm master password: ");
+    if (password !== confirm) throw new Error("Passwords do not match");
   }
-  await vault.init(password);
+  if (password.length < 8) throw new Error("Password must be at least 8 characters");
+  return password;
 }
 
 async function handleInit(args: string[]) {
   const { values } = parseArgs({
     args,
     options: {
-      password: { type: "string", short: "p" },
       force: { type: "boolean", short: "f", default: false },
+      passphrase: { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: false,
@@ -253,18 +277,55 @@ async function handleInit(args: string[]) {
     return;
   }
 
-  let password: string | undefined = typeof values.password === "string" ? values.password : undefined;
-  if (!password) {
-    password = await promptHidden("Enter master password: ");
-    const confirm = await promptHidden("Confirm master password: ");
-    if (password !== confirm) throw new Error("Passwords do not match");
+  const kc = values.passphrase || process.env.AGENTPASS_PASSWORD ? null : keychain();
+  if (!kc) {
+    await vault.init(await newPassphrase());
+    vault.setUnlockMode("passphrase");
+    console.log(`Vault initialized at ${VAULT_FILE} (passphrase mode)`);
+    vault.close();
+    return;
   }
 
-  if (password.length < 8) throw new Error("Password must be at least 8 characters");
-
-  await vault.init(password);
-  console.log("Vault initialized at ~/.agentpass/vault.db");
+  const isNew = !existsSync(VAULT_FILE);
+  const secret = randomSecret();
+  await vault.init(secret);
+  vault.setUnlockMode("keychain");
+  try {
+    kc.set(keychainAccount(), secret);
+  } catch (err) {
+    vault.close();
+    // the random key is gone, so a vault created for it could never be opened
+    if (isNew) for (const suffix of ["", "-wal", "-shm"]) rmSync(VAULT_FILE + suffix, { force: true });
+    throw new Error(`${err instanceof Error ? err.message : err}. Use agentpass init --passphrase to use a password instead.`);
+  }
+  console.log(`Vault initialized at ${VAULT_FILE} (keychain mode: it unlocks from your OS keychain, no password needed)`);
   vault.close();
+}
+
+async function handleUnlockMode(args: string[]) {
+  const target = args[0];
+  if (target !== "keychain" && target !== "passphrase") throw new Error("Usage: agentpass unlock-mode keychain|passphrase");
+  await ensureVaultFile();
+  if (vaultUnlockMode() === target) {
+    console.log(`Vault already uses ${target} mode.`);
+    return;
+  }
+
+  const kc = target === "keychain" ? keychain() : null;
+  if (target === "keychain" && !kc) throw new Error("No OS keychain available (macOS Keychain or Linux secret-tool)");
+  await unlock();
+  const password = kc ? randomSecret() : await newPassphrase();
+  // stored and read back before any value is re-encrypted under it
+  kc?.set(keychainAccount(), password);
+  const backup = await vault.rekey(password, target);
+  vault.close();
+
+  console.log(`Vault now uses ${target} mode. Backup of the previous vault: ${backup}`);
+  if (target === "passphrase") {
+    console.log(
+      `The old key stays in the OS keychain (service sh.agentpass, account ${keychainAccount()}) so the backup still opens. Delete both once the new passphrase works.`
+    );
+  }
 }
 
 async function handleAdd(args: string[]) {
@@ -515,20 +576,33 @@ async function handleProject() {
   }
 
   // Only check the vault when it opens without prompting.
-  const canOpen = globalPassword !== undefined && existsSync(VAULT_FILE);
+  const canOpen = existsSync(VAULT_FILE) && (vaultUnlockMode() === "keychain" || !!process.env.AGENTPASS_PASSWORD);
   if (canOpen) await unlock();
   for (const [name, { secret, source }] of entries) {
     const missing = canOpen && !(await vault.has(secret)) ? " MISSING from vault" : "";
     console.log(`  ${name} -> ${secret} (${source})${missing}`);
   }
   if (canOpen) vault.close();
-  else if (existsSync(VAULT_FILE)) console.log("vault locked (pass -p to check for missing secrets)");
+  else if (existsSync(VAULT_FILE)) console.log("vault locked (set AGENTPASS_PASSWORD to check for missing secrets)");
   else console.log("vault not initialized");
 }
 
+async function vaultStatus(): Promise<string> {
+  if (!existsSync(VAULT_FILE)) return "not initialized";
+  const mode = vaultUnlockMode();
+  if (mode === "passphrase" && !process.env.AGENTPASS_PASSWORD) return "passphrase mode, locked (needs the passphrase)";
+  try {
+    await unlock();
+    return `${mode} mode, unlockable`;
+  } catch (err) {
+    return `${mode} mode, locked (${err instanceof Error ? err.message : err})`;
+  } finally {
+    vault.close();
+  }
+}
+
 async function handleStatus() {
-  const vaultExists = existsSync(VAULT_FILE);
-  console.log(`Vault: ${vaultExists ? "initialized" : "not initialized"}`);
+  console.log(`Vault: ${await vaultStatus()}`);
   console.log(`Proxy: ${proxy.isRunning() ? `running on :${proxy.port()}` : "stopped"}`);
   console.log(`CA certificate: ${certificateAuthority.certPath()}`);
 
