@@ -5,7 +5,7 @@ export default function Footer() {
         <div className="flex flex-col items-center justify-between gap-6 sm:flex-row">
           <div className="flex items-center gap-2 text-sm text-muted">
             <span className="font-semibold text-fg">AgentPass</span>
-            <span>— Local-first. Open source. Built for AI agents.</span>
+            <span>— Local credential firewall for AI coding agents. Open source.</span>
           </div>
 
           <div className="flex items-center gap-6 text-sm text-muted">
@@ -26,7 +26,9 @@ export default function Footer() {
               X
             </a>
             <a
-              href="https://agentpass.sh"
+              href="https://github.com/Rakesh1002/agentpass#readme"
+              target="_blank"
+              rel="noopener noreferrer"
               className="transition-colors hover:text-fg"
             >
               Docs

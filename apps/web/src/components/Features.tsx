@@ -1,39 +1,51 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Layers, RefreshCw, Lock, Terminal, ArrowRight, Globe } from "lucide-react";
+import { KeyRound, ShieldCheck, GitBranch, Server, Search, Lock, Terminal, ArrowRight, Globe } from "lucide-react";
 
 const features = [
   {
-    icon: Layers,
-    title: "Multi-key fallback",
+    icon: KeyRound,
+    title: "Placeholders, not keys",
     description:
-      "Pool N keys per provider. On 429, AgentPass cools down the spent key, retries with the next one, and your agent keeps shipping.",
+      "Agents get STRIPE_SECRET_KEY={{secret:stripe}}. The real value never enters their environment, transcripts or commits.",
   },
   {
-    icon: RefreshCw,
-    title: "Transparent rotation",
+    icon: ShieldCheck,
+    title: "Pinned to the hosts you choose",
     description:
-      "On 401, AgentPass retries with the next key in the pool. Drop the new key into the vault and the next request finds it — no agent restart.",
+      "Each key is pinned to hosts, ports, methods and paths. Anywhere else, the request is refused with egress_blocked and written to the audit log.",
+  },
+  {
+    icon: GitBranch,
+    title: "One manifest for every worktree",
+    description:
+      ".agentpass.json maps env vars to vault names and is safe to commit. Every worktree gets the same keys; a manifest from a cloned repo waits for agentpass allow.",
+  },
+  {
+    icon: Server,
+    title: "Background proxy",
+    description:
+      "agentpass up runs the proxy now and at login, unlocking the vault from your OS keychain. No password prompts, no key in your shell.",
+  },
+  {
+    icon: Search,
+    title: "Find exposed keys",
+    description:
+      "agentpass scan finds plaintext keys in .env files, shell rc files and agent configs that your agents can already read.",
   },
   {
     icon: Lock,
-    title: "Agent never sees the key",
+    title: "Local and open source",
     description:
-      "The proxy injects auth at the network layer. The raw key sits in your encrypted local vault — not in agent context, not in error logs.",
-  },
-  {
-    icon: Terminal,
-    title: "Drop-in for your runtime",
-    description:
-      "agentpass run claude wires OPENAI_BASE_URL and ANTHROPIC_BASE_URL automatically. Works with Claude Code, Cursor, OpenClaw, Codex.",
+      "The encrypted vault and audit log live in ~/.agentpass on your machine. MIT licensed. Every request is tagged with its repo, branch and agent.",
   },
 ];
 
 export default function Features() {
   return (
     <section className="mx-auto max-w-6xl px-4 py-20 sm:px-6">
-      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
         {features.map((feature, i) => (
           <motion.div
             key={feature.title}
@@ -65,7 +77,7 @@ export default function Features() {
           How it works
         </h2>
         <p className="mx-auto mt-3 max-w-xl text-center text-sm text-muted">
-          Your agent points <code className="font-mono text-fg">OPENAI_BASE_URL</code> at the local proxy. AgentPass picks a live key, attaches the auth header, and forwards the request — falling over silently if the chosen key is throttled or rotated.
+          Your agent runs with <code className="font-mono text-fg">HTTPS_PROXY</code> pointed at the local proxy and holds only placeholders. For a host the key is pinned to, AgentPass swaps in the real value and forwards the request over HTTPS. Keep several keys for one provider and a 429 or 401 fails over to the next.
         </p>
 
         <div className="mx-auto mt-10 flex max-w-3xl flex-col items-center justify-between gap-6 sm:flex-row">
@@ -74,13 +86,13 @@ export default function Features() {
               <Terminal className="h-6 w-6 text-accent" />
             </div>
             <span className="text-sm font-medium text-fg">AI Agent</span>
-            <span className="text-xs text-muted">Claude Code / Cursor</span>
+            <span className="text-xs text-muted">Claude Code / Codex CLI</span>
           </div>
 
           <div className="flex flex-col items-center gap-1">
             <ArrowRight className="hidden h-5 w-5 text-muted sm:block" />
             <span className="text-xs text-muted sm:hidden">↓</span>
-            <span className="text-xs text-accent">localhost:8888</span>
+            <span className="text-xs text-accent">placeholders only</span>
           </div>
 
           <div className="flex flex-col items-center gap-2 text-center">
@@ -88,21 +100,21 @@ export default function Features() {
               <Lock className="h-6 w-6 text-accent" />
             </div>
             <span className="text-sm font-medium text-fg">AgentPass</span>
-            <span className="text-xs text-muted">Vault + Pool + Failover</span>
+            <span className="text-xs text-muted">Vault + Pins + Audit</span>
           </div>
 
           <div className="flex flex-col items-center gap-1">
             <ArrowRight className="hidden h-5 w-5 text-muted sm:block" />
             <span className="text-xs text-muted sm:hidden">↓</span>
-            <span className="text-xs text-accent">live key only</span>
+            <span className="text-xs text-accent">pinned hosts only</span>
           </div>
 
           <div className="flex flex-col items-center gap-2 text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-xl border border-border bg-card">
               <Globe className="h-6 w-6 text-muted" />
             </div>
-            <span className="text-sm font-medium text-fg">Provider API</span>
-            <span className="text-xs text-muted">OpenAI / Anthropic</span>
+            <span className="text-sm font-medium text-fg">Your APIs</span>
+            <span className="text-xs text-muted">Stripe / OpenAI / GitHub</span>
           </div>
         </div>
       </motion.div>

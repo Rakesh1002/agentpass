@@ -3,6 +3,25 @@
 import { motion } from "framer-motion";
 import { Shield } from "lucide-react";
 
+const demo: { cmd?: string; out?: string; tone?: string }[] = [
+  { cmd: "agentpass init" },
+  { out: "Vault initialized at ~/.agentpass/vault.db (keychain mode: it unlocks from your OS keychain, no password needed)" },
+  { cmd: "agentpass add stripe --host api.stripe.com" },
+  { out: "Secret value for stripe:", tone: "text-muted" },
+  { out: "Added secret: stripe" },
+  { cmd: "agentpass add openai" },
+  { out: "Added secret: openai" },
+  { cmd: "agentpass link STRIPE_SECRET_KEY stripe" },
+  { out: "Linked STRIPE_SECRET_KEY -> stripe in ~/code/my-app/.agentpass.json" },
+  { cmd: "agentpass allow" },
+  { out: "Allowed ~/code/my-app/.agentpass.json" },
+  { cmd: "agentpass run -- claude" },
+  { out: "# the agent only sees STRIPE_SECRET_KEY={{secret:stripe}}", tone: "text-muted" },
+  { out: "GET https://api.stripe.com/v1/balance -> 200", tone: "text-fg" },
+  { out: "GET https://api.openai.com/v1/models -> 403", tone: "text-fg" },
+  { out: '{"error":"egress_blocked","secret":"stripe","host":"api.openai.com"}', tone: "text-red-400" },
+];
+
 export default function Hero() {
   return (
     <section className="relative overflow-hidden pt-16 pb-20 sm:pt-24 sm:pb-28">
@@ -16,7 +35,7 @@ export default function Hero() {
           className="inline-flex items-center gap-2 rounded-full border border-accent/20 bg-accent/5 px-3 py-1 text-xs font-medium text-accent mb-8"
         >
           <Shield className="h-3 w-3" />
-          Open source · Local-first · For Claude Code, Cursor, OpenClaw, Codex
+          Open source · Runs on your machine · Alpha
         </motion.div>
 
         <motion.h1
@@ -25,9 +44,8 @@ export default function Hero() {
           transition={{ duration: 0.6, delay: 0.1 }}
           className="text-4xl font-bold tracking-tight text-fg sm:text-6xl"
         >
-          Stop your AI agents from breaking when{" "}
-          <span className="text-accent">a key rotates</span> or{" "}
-          <span className="text-accent">rate-limits</span>
+          A local <span className="text-accent">credential firewall</span> for
+          AI coding agents
         </motion.h1>
 
         <motion.p
@@ -36,11 +54,8 @@ export default function Hero() {
           transition={{ duration: 0.6, delay: 0.2 }}
           className="mx-auto mt-6 max-w-2xl text-lg text-muted"
         >
-          AgentPass pools your API keys, falls over to a backup on{" "}
-          <span className="font-mono text-fg">429</span>, retries transparently
-          on <span className="font-mono text-fg">401</span> — and the raw key
-          never leaves your machine. Drop-in for Claude Code, Cursor, OpenClaw,
-          and Codex.
+          Add a key once; every agent and worktree uses it through placeholders,
+          and the real value only goes to the hosts you pin it to.
         </motion.p>
 
         <motion.div
@@ -53,7 +68,7 @@ export default function Hero() {
             href="#waitlist"
             className="inline-flex items-center gap-2 rounded-lg bg-accent px-6 py-3 text-sm font-semibold text-bg transition-opacity hover:opacity-90"
           >
-            Join the waitlist
+            Get release notes
           </a>
           <a
             href="https://github.com/Rakesh1002/agentpass"
@@ -81,33 +96,19 @@ export default function Hero() {
               <div className="h-3 w-3 rounded-full bg-green-500/80" />
               <span className="ml-2 text-xs text-muted font-mono">agentpass</span>
             </div>
-            <div className="p-4 font-mono text-xs sm:text-sm text-muted text-left">
-              <div className="flex gap-2">
-                <span className="text-accent">$</span>
-                <span className="text-fg">agentpass init</span>
-              </div>
-              <div className="mt-1 text-accent">Vault initialized at ~/.agentpass/vault.db</div>
-
-              <div className="mt-3 flex gap-2">
-                <span className="text-accent">$</span>
-                <span className="text-fg">agentpass add openai</span>
-              </div>
-              <div className="mt-1 flex gap-2">
-                <span className="text-accent">$</span>
-                <span className="text-fg">agentpass add openai-2</span>
-              </div>
-              <div className="mt-1 text-accent">2 keys pooled for openai</div>
-
-              <div className="mt-3 flex gap-2">
-                <span className="text-accent">$</span>
-                <span className="text-fg">agentpass run claude</span>
-              </div>
-              <div className="mt-1 text-muted">
-                key …A hit 429, cooldown 60s, falling over → key …B
-              </div>
-              <div className="mt-1 text-fg">
-                ↳ agent didn&apos;t notice. it just kept working.
-              </div>
+            <div className="p-4 font-mono text-xs sm:text-sm text-muted text-left break-words">
+              {demo.map((line, i) =>
+                line.cmd ? (
+                  <div key={i} className={`flex gap-2 ${i > 0 ? "mt-3" : ""}`}>
+                    <span className="text-accent">$</span>
+                    <span className="text-fg">{line.cmd}</span>
+                  </div>
+                ) : (
+                  <div key={i} className={`mt-1 ${line.tone ?? "text-accent"}`}>
+                    {line.out}
+                  </div>
+                )
+              )}
             </div>
           </div>
         </motion.div>

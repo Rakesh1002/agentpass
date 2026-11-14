@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
 import "./globals.css";
 
-const TITLE = "AgentPass — Keep your AI agents alive when keys rotate or rate-limit";
+const TITLE = "AgentPass — A local credential firewall for AI coding agents";
 const DESCRIPTION =
-  "Local-first credential broker for Claude Code, Cursor, OpenClaw, and Codex. Multi-key fallback on 429, transparent retry on 401, encrypted vault, agents never see the raw key.";
+  "Add a key once; every agent and worktree uses it through placeholders, and the real value only goes to the hosts you pin it to. Open source, alpha.";
 
 export const metadata: Metadata = {
   title: TITLE,

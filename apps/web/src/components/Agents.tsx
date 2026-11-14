@@ -3,10 +3,8 @@
 import { motion } from "framer-motion";
 
 const agents = [
-  { name: "Claude Code", description: "Anthropic\'s CLI agent", color: "#D97757" },
-  { name: "Cursor", description: "AI-native IDE", color: "#60A5FA" },
-  { name: "OpenClaw", description: "Open-source agent runtime", color: "#A78BFA" },
-  { name: "Codex CLI", description: "OpenAI coding agent", color: "#10B981" },
+  { name: "Claude Code", description: "HTTPS_PROXY, ANTHROPIC_BASE_URL", color: "#D97757" },
+  { name: "Codex CLI", description: "HTTPS_PROXY, OPENAI_BASE_URL", color: "#10B981" },
 ];
 
 export default function Agents() {
@@ -22,6 +20,12 @@ export default function Agents() {
         <h2 className="text-sm font-semibold uppercase tracking-wider text-muted">
           Works with
         </h2>
+        <p className="mx-auto mt-4 max-w-xl text-sm text-muted">
+          Agents that honour{" "}
+          <code className="font-mono text-fg">HTTPS_PROXY</code> /{" "}
+          <code className="font-mono text-fg">*_BASE_URL</code>, such as Claude
+          Code and Codex CLI. No plugin or official integration needed.
+        </p>
         <div className="mt-8 flex flex-wrap items-center justify-center gap-6 sm:gap-10">
           {agents.map((agent) => (
             <div
@@ -36,7 +40,7 @@ export default function Agents() {
                 <div className="text-sm font-semibold text-fg">
                   {agent.name}
                 </div>
-                <div className="text-xs text-muted">{agent.description}</div>
+                <div className="font-mono text-xs text-muted">{agent.description}</div>
               </div>
             </div>
           ))}
