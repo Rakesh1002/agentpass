@@ -1,6 +1,7 @@
 import http from "http";
 import https from "https";
 import net from "net";
+import type { Duplex } from "stream";
 import { certificateAuthority } from "./ca";
 import { URL } from "url";
 import { vault } from "./vault";
@@ -572,7 +573,7 @@ export class ProxyServer {
 
   private async handleConnect(
     req: http.IncomingMessage,
-    clientSocket: NodeJS.ReadWriteStream,
+    clientSocket: Duplex,
     head: Buffer
   ): Promise<void> {
     const started = Date.now();
@@ -586,6 +587,11 @@ export class ProxyServer {
 
     try {
       if (head.length > 0) clientSocket.unshift(head);
+
+      if (!(await this.shouldIntercept(hostname))) {
+        this.tunnel(clientSocket, hostname, port, started);
+        return;
+      }
 
       const hostPair = certificateAuthority.getHostCertificate(hostname);
       const caPair = certificateAuthority.ensureCa();
@@ -740,6 +746,53 @@ export class ProxyServer {
         clientSocket.end();
       } catch { }
     }
+  }
+
+  private async shouldIntercept(hostname: string): Promise<boolean> {
+    try {
+      const hosts = await vault.pinnedHosts();
+      return hosts.has("*") || hosts.has(hostname.toLowerCase());
+    } catch {
+      // locked vault: nothing can be substituted, so there is no reason to break TLS
+      return false;
+    }
+  }
+
+  // Unpinned hosts get a raw TCP tunnel, so the local CA never touches their TLS.
+  private tunnel(clientSocket: Duplex, hostname: string, port: number, started: number): void {
+    const destination = `${hostname}:${port}`;
+    let connected = false;
+    const upstream = net.connect(port, hostname, () => {
+      connected = true;
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      appendAudit({
+        method: "CONNECT",
+        destination,
+        secretNames: [],
+        statusCode: 200,
+        durationMs: Date.now() - started,
+      });
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+
+    upstream.on("error", (err) => {
+      if (connected) {
+        clientSocket.destroy();
+        return;
+      }
+      appendAudit({
+        method: "CONNECT",
+        destination,
+        secretNames: [],
+        statusCode: 502,
+        durationMs: Date.now() - started,
+        error: err.message,
+      });
+      try { clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); } catch { }
+    });
+    clientSocket.on("error", () => upstream.destroy());
+    clientSocket.on("close", () => upstream.destroy());
   }
 
   stop(): Promise<void> {

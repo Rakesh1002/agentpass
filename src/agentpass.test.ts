@@ -185,6 +185,46 @@ describe("HTTPS proxy", () => {
     await proxy.stop();
     await target.close();
   });
+
+  test("tunnels unpinned CONNECT hosts without interception until a pin is added", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("openai", "sk-test");
+    const target = await startTarget(certificateAuthority.getHostCertificate("agentpass-target.test"));
+    const proxy = await startProxy();
+    const ca = readFileSync(caCertFile());
+
+    // a MITM would present a "localhost" leaf and fail verification against this servername
+    const tunneled = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca, {
+      servername: "agentpass-target.test",
+    });
+    expect(tunneled).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer {{secret:openai}}");
+
+    await sharedVault.setPins("openai", [{ host: "localhost" }]);
+    const intercepted = await requestThroughConnectTunnel(proxy.getPort(), target.port, ca);
+    expect(intercepted).toContain("200 OK");
+    expect(target.requests[1]?.authorization).toBe("Bearer sk-test");
+
+    await proxy.stop();
+    await target.close();
+  });
+
+  test("intercepts every CONNECT host when a wildcard pin exists", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*" }]);
+    const target = await startTarget(certificateAuthority.getHostCertificate("localhost"));
+    const proxy = await startProxy();
+
+    const response = await requestThroughConnectTunnel(proxy.getPort(), target.port, readFileSync(caCertFile()), {
+      auth: "Bearer {{secret:svc}}",
+    });
+
+    expect(response).toContain("200 OK");
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc");
+
+    await proxy.stop();
+    await target.close();
+  });
 });
 
 describe("egress lock", () => {
