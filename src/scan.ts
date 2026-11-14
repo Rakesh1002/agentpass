@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join, resolve } from "path";
+import { maskSecret } from "./mask";
 
 export type Severity = "tracked" | "agent-config" | "shell-rc" | "env-file";
 
@@ -275,8 +276,8 @@ export function scan(opts: { home: string; roots: string[] }): { findings: Findi
       findings.push(
         ...raws.map(({ token, path, ...rest }): Finding => ({
           ...rest,
-          ...(path ? { path: path.map((k) => (typeof k === "string" && secretish(k) ? mask(k) : k)) } : {}),
-          preview: mask(token),
+          ...(path ? { path: path.map((k) => (typeof k === "string" && secretish(k) ? maskSecret(k) : k)) } : {}),
+          preview: maskSecret(token),
           severity: tracked ? "tracked" : kind,
           tracked,
         }))
@@ -289,21 +290,12 @@ export function scan(opts: { home: string; roots: string[] }): { findings: Findi
   return { findings, skipped };
 }
 
-const PUBLIC_PREFIXES = ["sk-ant-", "sk-proj-", "sk-or-", "sk-", "ghp_", "gho_", "github_pat_", "sk_live_", "sk_test_", "rk_live_", "gsk_", "hf_", "xoxb-", "AIza", "glpat-", "npm_"];
-
-export function mask(value: string): string {
-  if (value.length < 16) return "…";
-  const budget = Math.min(6, Math.floor(value.length * 0.25));
-  const prefix = PUBLIC_PREFIXES.find((p) => value.startsWith(p)) ?? "";
-  return `${value.slice(0, Math.min(4, prefix.length, budget - 2))}…${value.slice(-2)}`;
-}
-
 function maskFile(file: string): string {
   return file
     .split("/")
     .map((seg) => {
       const hit = detect("", seg);
-      return hit ? seg.replace(hit.token, mask(hit.token)) : seg;
+      return hit ? seg.replace(hit.token, maskSecret(hit.token)) : seg;
     })
     .join("/");
 }

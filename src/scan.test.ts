@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
-import { detect, mask, scan, type Finding } from "./scan";
+import { maskSecret } from "./mask";
+import { detect, scan, type Finding } from "./scan";
 
 // Built by concatenation so the repo itself never contains a scanner-shaped literal.
 const BODY = "Q7mZ4kR9vT2wX8nB5cL3pH6jF1dS0gYa";
@@ -327,8 +328,8 @@ describe("scan hardening", () => {
 
     const findings = scan({ home, roots: [] }).findings;
     expect(findings.length).toBe(4);
-    expect(findings.find((f) => f.service === "Anthropic")?.path).toEqual(["tokens", mask(keySecret), "auth"]);
-    expect(findings.find((f) => f.file.endsWith(".toml"))?.path).toEqual(["mcp_servers", mask(tableSecret), "OPENAI_API_KEY"]);
+    expect(findings.find((f) => f.service === "Anthropic")?.path).toEqual(["tokens", maskSecret(keySecret), "auth"]);
+    expect(findings.find((f) => f.file.endsWith(".toml"))?.path).toEqual(["mcp_servers", maskSecret(tableSecret), "OPENAI_API_KEY"]);
     const secrets = [left, right, left2, keySecret, tableSecret, ...Object.values(T)];
     expect(leaks(JSON.stringify(findings), secrets)).toEqual([]);
     for (const args of [["--root", root], ["--json", "--root", root]]) {
@@ -403,17 +404,6 @@ describe("scan hardening", () => {
 });
 
 describe("scan robustness", () => {
-  test("masks short values fully and reveals at most a public prefix plus two chars", () => {
-    expect(mask("Q7mZ4kR9vT2wX8n")).toBe("…");
-    expect(mask("ghp" + "_Q7mZ4kR9vT2w")).toBe("gh…2w");
-    expect(mask(T.anthropic)).toBe("sk-a…Ya");
-    expect(mask(T.openaiProj)).toBe("sk-p…Ya");
-    expect(mask(T.hf)).toBe("hf_…Ya");
-    expect(mask(T.groq)).toBe("gsk_…Ya");
-    expect(mask(T.generic)).toBe("…wE");
-    expect(mask(T.aws)).toBe("…NB");
-  });
-
   test("a deeply nested hostile JSON file is skipped without aborting the scan", () => {
     put(join(home, ".zshrc"), `export OPENAI_API_KEY=${T.openaiProj}\n`);
     put(join(root, "app/.mcp.json"), "[".repeat(200_000) + "]".repeat(200_000));

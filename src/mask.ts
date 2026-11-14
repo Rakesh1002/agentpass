@@ -1,5 +1,8 @@
 // Prefixes that identify a key's issuer and carry no secret material.
-const PUBLIC_PREFIXES = ["sk-ant-", "sk-proj-", "sk-", "sk_live_", "sk_test_", "rk_live_", "ghp_", "github_pat_", "xoxb-", "glpat-"];
+const PUBLIC_PREFIXES = [
+  "sk-ant-", "sk-proj-", "sk-or-", "sk-", "sk_live_", "sk_test_", "rk_live_",
+  "ghp_", "gho_", "github_pat_", "gsk_", "hf_", "xoxb-", "AIza", "glpat-", "npm_",
+];
 
 export function maskSecret(value: string): string {
   if (value.length < 16) return "…";
