@@ -40,6 +40,10 @@ export function daemonFile(): string {
   return resolve(agentPassDir(), "daemon.json");
 }
 
+export function daemonLogFile(): string {
+  return resolve(agentPassDir(), "daemon.log");
+}
+
 export function caBundleFile(): string {
   return resolve(agentPassDir(), "ca-bundle.pem");
 }

@@ -13,7 +13,9 @@ import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { vaultFile, routingConfigFile } from "./paths";
+import { agentPassDir, daemonLogFile, vaultFile, routingConfigFile } from "./paths";
+import { daemonState, installService, removeDaemonInfo, removeService, serviceFile, writeDaemonInfo } from "./daemon";
+import { version } from "../package.json";
 import { linkVar, resolveProject, unlinkVar } from "./project";
 import { buildEnv, formatEnv, hookScript, proxyPort, proxyReachable } from "./shellenv";
 
@@ -72,6 +74,15 @@ async function main() {
         break;
       case "run":
         await handleRun(args.slice(1));
+        break;
+      case "daemon":
+        await handleDaemon(args.slice(1));
+        break;
+      case "up":
+        await handleUp();
+        break;
+      case "down":
+        handleDown();
         break;
       case "env":
         handleEnv(args.slice(1));
@@ -144,6 +155,9 @@ Commands:
   delete <name>         Delete a secret
   proxy start           Start HTTP/HTTPS proxy (port 8888)
   proxy stop            Stop proxy
+  up                    Start the proxy in the background now and at login (keychain mode)
+  down                  Stop the background proxy and remove it from login
+  daemon [--port N]     Run the proxy in the foreground (what the service runs)
   run -- <cmd> [args]   Run command with this project's placeholder env and proxy
   env [--shell zsh|bash|fish|json] [--dir DIR]
                         Print the placeholder env for a directory (no vault needed)
@@ -153,7 +167,7 @@ Commands:
   project               Show the resolved mapping (checks the vault if it unlocks without a prompt)
   audit                 Show recent proxy audit events
   ca path               Print local CA certificate path
-  status                Show vault and proxy status
+  status                Show vault mode, lock state, daemon, port and CA path
   import-claude         Import existing Anthropic key from Claude Code config
   scan [--root <dir>]   Find plaintext secrets your AI agents can read (--json)
   routing init          Generate default routing config
@@ -325,6 +339,10 @@ async function handleUnlockMode(args: string[]) {
     console.log(
       `The old key stays in the OS keychain (service sh.agentpass, account ${keychainAccount()}) so the backup still opens. Delete both once the new passphrase works.`
     );
+  }
+  const daemon = await daemonState();
+  if (daemon.healthy) {
+    console.log(`The background proxy (pid ${daemon.info?.pid}) still holds the old key; restart it: agentpass down && agentpass up`);
   }
 }
 
@@ -526,6 +544,57 @@ async function handleRun(args: string[]) {
   child.on("exit", (code: number | null) => cleanup(code ?? 0));
 }
 
+async function handleDaemon(args: string[]) {
+  const { values } = parseArgs({ args, options: { port: { type: "string" } }, allowPositionals: true, strict: false });
+  const raw = values.port ?? "8888";
+  const port = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!(port >= 0 && port < 65536)) throw new Error("Usage: agentpass daemon [--port <port>]");
+  await ensureVaultFile();
+
+  const existing = await daemonState();
+  if (existing.healthy && existing.info) {
+    throw new Error(`The AgentPass daemon is already running (pid ${existing.info.pid}, port ${existing.info.port})`);
+  }
+  await unlock();
+  const server = new ProxyServer({ port });
+  await server.start();
+  writeDaemonInfo({ pid: process.pid, port: server.port(), startedAt: new Date().toISOString(), version });
+
+  // Exit without draining: open tunnels would otherwise hold the process past the service manager's timeout.
+  const shutdown = () => {
+    removeDaemonInfo(process.pid);
+    vault.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+async function handleUp() {
+  await ensureVaultFile();
+  if (vaultUnlockMode() !== "keychain") {
+    throw new Error("The background proxy unlocks from the OS keychain, but this vault uses a passphrase. Switch first: agentpass unlock-mode keychain");
+  }
+  // fail here rather than in a service restart loop
+  await unlock();
+  vault.close();
+
+  const env: Record<string, string> = process.env.AGENTPASS_HOME ? { AGENTPASS_HOME: agentPassDir() } : {};
+  const result = installService({ command: [...selfCommand(), "daemon"], env, log: daemonLogFile() });
+  if (result === "already running") console.log("The AgentPass background proxy is already running.");
+  else console.log(`Started the AgentPass background proxy (${serviceFile()}). Logs: ${daemonLogFile()}`);
+}
+
+function handleDown() {
+  if (removeService()) console.log("Stopped the AgentPass background proxy and removed it from login.");
+  else console.log("The AgentPass background proxy was not installed.");
+}
+
+// Absolute invocation so hooks and services work without agentpass on PATH.
+function selfCommand(): string[] {
+  return Bun.main.endsWith(".ts") ? [process.execPath, Bun.main] : [process.execPath];
+}
+
 function handleEnv(args: string[]) {
   const { values } = parseArgs({
     args,
@@ -549,9 +618,7 @@ function handleHook(args: string[]) {
   if (shell !== "zsh" && shell !== "bash" && shell !== "fish") {
     throw new Error("Usage: agentpass hook zsh|bash|fish");
   }
-  // Absolute invocation so the hook works without agentpass on PATH.
-  const self = Bun.main.endsWith(".ts") ? [process.execPath, Bun.main] : [process.execPath];
-  process.stdout.write(hookScript(shell, self));
+  process.stdout.write(hookScript(shell, selfCommand()));
 }
 
 function handleLink(args: string[]) {
@@ -601,9 +668,17 @@ async function vaultStatus(): Promise<string> {
   }
 }
 
+function describeDaemon({ info, alive, healthy }: Awaited<ReturnType<typeof daemonState>>): string {
+  if (!info) return "not running";
+  if (healthy) return `running (pid ${info.pid}, port ${info.port}, since ${info.startedAt})`;
+  if (alive) return `not responding (pid ${info.pid}, port ${info.port})`;
+  return `not running (stale daemon.json for pid ${info.pid})`;
+}
+
 async function handleStatus() {
   console.log(`Vault: ${await vaultStatus()}`);
-  console.log(`Proxy: ${proxy.isRunning() ? `running on :${proxy.port()}` : "stopped"}`);
+  console.log(`Daemon: ${describeDaemon(await daemonState())}`);
+  console.log(`Proxy port: ${proxyPort()}`);
   console.log(`CA certificate: ${certificateAuthority.certPath()}`);
 
   const configPath = claudeShim.findConfig();

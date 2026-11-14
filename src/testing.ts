@@ -62,7 +62,7 @@ export function sandbox(): Sandbox {
     fakeDir,
     env,
     cli(args, extra = {}) {
-      const r = spawnSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf-8", env: { ...env, ...extra } });
+      const r = spawnSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf-8", env: { ...env, ...extra }, timeout: 20000 });
       return { out: r.stdout, err: r.stderr, code: r.status };
     },
   };
