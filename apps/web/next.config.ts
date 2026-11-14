@@ -17,16 +17,15 @@ const nextConfig: NextConfig = {
   },
   async redirects() {
     // OpenNext leaves an empty :path* unsubstituted, so the bare root gets its own rule.
-    return ["www.agentpass.sh", "pass.agentdrive.sh"].flatMap((host) => {
+    const hosts = ["www.agentpass.sh", "pass.agentdrive.sh"].flatMap((host) => {
       const has = [{ type: "host" as const, value: host }];
       return [
         { source: "/", has, destination: "https://agentpass.sh/", permanent: true },
         { source: "/:path+", has, destination: "https://agentpass.sh/:path+", permanent: true },
       ];
     });
-  },
-  async rewrites() {
-    return [{ source: "/install", destination: "/install.sh" }];
+    // OpenNext can't rewrite to a static asset; curl -L follows this instead.
+    return [...hosts, { source: "/install", destination: "/install.sh", permanent: false }];
   },
 };
 
