@@ -267,6 +267,10 @@ describe("CA bundle", () => {
   });
 });
 
+// zsh is absent on stock Linux images; CI installs it, contributors without it skip the zsh cases.
+const hasZsh = spawnSync("zsh", ["-fc", "true"]).status === 0;
+const SHELLS = hasZsh ? (["bash", "zsh"] as const) : (["bash"] as const);
+
 describe("formatEnv", () => {
   const env = { A: "it's $HOME `x` \\ \"q\"", B: "{{secret:b}}" };
 
@@ -274,7 +278,7 @@ describe("formatEnv", () => {
     expect(JSON.parse(formatEnv(env, "json"))).toEqual(env);
   });
 
-  for (const shell of ["bash", "zsh"] as const) {
+  for (const shell of SHELLS) {
     test(`${shell} quoting round-trips and records exported names`, () => {
       const bin = shell === "bash" ? ["bash", "--norc", "--noprofile", "-c"] : ["zsh", "-fc"];
       const script = `eval "$OUT"; printf '%s\\n' "$A" "$B" "$AGENTPASS_EXPORTED"; env | grep -c '^A='`;
@@ -337,7 +341,7 @@ ${body.replaceAll("TICK", tick)}`;
     return { out: r.stdout, err: r.stderr, calls };
   }
 
-  for (const shell of ["bash", "zsh"] as const) {
+  for (const shell of SHELLS) {
     test(`${shell}: exports on entering a project and unsets on leaving`, () => {
       const p = "http://127.0.0.1:8888";
       proxyUp();
@@ -546,7 +550,7 @@ cd "${user}/repo"; TICK; show repo`
     });
   }
 
-  test("an untrusted manifest exports only global defaults and warns once for the directory", () => {
+  test.skipIf(!hasZsh)("an untrusted manifest exports only global defaults and warns once for the directory", () => {
     proxyUp();
     const fresh = join(user, "fresh");
     mkdirSync(join(fresh, "sub"), { recursive: true });
