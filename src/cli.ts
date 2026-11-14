@@ -11,6 +11,7 @@ import { loadRoutingConfig, writeDefaultConfig } from "./router";
 import { effectivePins, validatePins, type Pin } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 import { spawn } from "child_process";
+import { maskSecret } from "./mask";
 import type { ChildProcess } from "child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { agentPassDir, daemonLogFile, vaultFile, routingConfigFile } from "./paths";
@@ -469,11 +470,7 @@ async function handleGet(args: string[]) {
   const value = await vault.get(name);
   if (value === null) throw new Error(`Secret "${name}" not found`);
 
-  const masked =
-    value.length <= 12
-      ? "*".repeat(value.length)
-      : value.slice(0, 7) + "..." + value.slice(-4);
-  console.log(`${name}: ${masked}`);
+  console.log(`${name}: ${maskSecret(value)}`);
   vault.close();
 }
 
