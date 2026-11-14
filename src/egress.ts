@@ -65,6 +65,11 @@ export function effectivePins(name: string, stored: Pin[] | null): Pin[] {
   return provider ? [{ host: provider.upstream.host }] : [];
 }
 
+export function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
+}
+
 function pathAllowed(prefix: string, rawPath: string): boolean {
   const path = rawPath.split("?")[0] || "/";
   // dot segments, backslashes or absolute-form targets could resolve outside the prefix upstream

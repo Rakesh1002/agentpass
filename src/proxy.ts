@@ -7,7 +7,7 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict, type Pin } from "./egress";
+import { egressVerdict, isLoopbackHost, type Pin } from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -146,6 +146,22 @@ export class ProxyServer {
     const isHttps = url.protocol === "https:";
     const client = isHttps ? https : http;
     const destination = `${url.hostname}:${url.port || (isHttps ? 443 : 80)}`;
+
+    const names = placeholderNames(req.headers);
+    // a secret in cleartext is readable by anyone on the path, whatever its pins say
+    if (!isHttps && names.length > 0 && !isLoopbackHost(url.hostname)) {
+      appendAudit({
+        method: req.method || "GET",
+        destination,
+        secretNames: names,
+        statusCode: 403,
+        durationMs: Date.now() - started,
+        error: "insecure_scheme",
+      });
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "insecure_scheme", secret: names[0], host: url.hostname }));
+      return;
+    }
 
     const egress = await this.enforceEgress(req, res, url.hostname, url.pathname, destination, started);
     if (!egress) return;

@@ -310,6 +310,39 @@ describe("egress lock", () => {
     await target.close();
   });
 
+  test("never substitutes into cleartext HTTP toward a non-loopback host", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("stripe", "sk_live_never_cleartext", "api_key", [{ host: "api.stripe.test" }]);
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), 0, {
+      auth: "Bearer {{secret:stripe}}",
+      origin: "http://api.stripe.test",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toEqual({ error: "insecure_scheme", secret: "stripe", host: "api.stripe.test" });
+    expect(listAudit(1)[0]).toMatchObject({ statusCode: 403, error: "insecure_scheme", secretNames: ["stripe"] });
+    expect(JSON.stringify(listAudit(50))).not.toContain("sk_live_never_cleartext");
+
+    await proxy.stop();
+  });
+
+  test("allows substitution over cleartext HTTP to a loopback host", async () => {
+    await sharedVault.init("correct-password");
+    await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "127.0.0.1" }]);
+    const target = await startTarget();
+    const proxy = await startProxy();
+
+    const response = await requestThroughDirectProxy(proxy.getPort(), target.port, { auth: "Bearer {{secret:svc}}" });
+
+    expect(response.status).toBe(200);
+    expect(target.requests[0]?.authorization).toBe("Bearer sk-svc");
+
+    await proxy.stop();
+    await target.close();
+  });
+
   test("blocks placeholders inside CONNECT tunnels when pins do not match", async () => {
     await sharedVault.init("correct-password");
     await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "localhost", methods: ["POST"] }]);
@@ -363,6 +396,7 @@ interface ProxiedRequest {
   auth?: string;
   host?: string;
   servername?: string;
+  origin?: string;
 }
 
 // Built by hand from the v1 schema so the test does not depend on the current Vault code.
@@ -423,7 +457,12 @@ function vaultSchema(): { columns: string[]; version: string | undefined } {
 async function requestThroughDirectProxy(
   proxyPort: number,
   targetPort: number,
-  { method = "GET", path = "/models", auth = "Bearer {{secret:openai}}" }: ProxiedRequest = {}
+  {
+    method = "GET",
+    path = "/models",
+    auth = "Bearer {{secret:openai}}",
+    origin = `http://127.0.0.1:${targetPort}`,
+  }: ProxiedRequest = {}
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -431,7 +470,7 @@ async function requestThroughDirectProxy(
         host: "127.0.0.1",
         port: proxyPort,
         method,
-        path: `http://127.0.0.1:${targetPort}${path}`,
+        path: `${origin}${path}`,
         headers: {
           authorization: auth,
           connection: "close",

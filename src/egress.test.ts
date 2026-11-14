@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectivePins, egressVerdict, parseStoredPins, validatePins } from "./egress";
+import { effectivePins, egressVerdict, isLoopbackHost, parseStoredPins, validatePins } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 
 describe("egress pins", () => {
@@ -74,6 +74,15 @@ describe("egress pins", () => {
     expect(parseStoredPins("not json")).toEqual([]);
     expect(parseStoredPins(JSON.stringify([{ host: "https://x" }]))).toEqual([]);
     expect(egressVerdict("openai", parseStoredPins("not json"), "api.openai.com", "GET", "/")).toBe("deny");
+  });
+
+  test("recognizes only loopback hosts as safe for cleartext", () => {
+    for (const host of ["127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"]) {
+      expect(isLoopbackHost(host)).toBe(true);
+    }
+    for (const host of ["128.0.0.1", "10.0.0.1", "api.stripe.com", "localhost.evil.example", "127.0.0.1.evil.example", "::2"]) {
+      expect(isLoopbackHost(host)).toBe(false);
+    }
   });
 
   test("exports well-known service hosts", () => {
