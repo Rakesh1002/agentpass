@@ -218,6 +218,17 @@ describe("session tags", () => {
     expect(withAgent).toEndWith("+claude");
   });
 
+  test("a FIFO in place of .git or HEAD drops the tag instead of hanging", () => {
+    writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
+    const repo = join(root, "fifo-repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    spawnSync("mkfifo", [join(repo, ".git", "HEAD")]);
+    const wt = join(root, "fifo-wt");
+    mkdirSync(wt);
+    spawnSync("mkfifo", [join(wt, ".git")]);
+    for (const dir of [repo, wt]) expect(buildEnv(dir, 8888).HTTPS_PROXY).toBe("http://127.0.0.1:8888");
+  });
+
   test("no tag outside a repo", () => {
     writeFileSync(globalConfigFile(), JSON.stringify({ env: { OPENAI_API_KEY: "openai" } }));
     const env = buildEnv(root, 8888);

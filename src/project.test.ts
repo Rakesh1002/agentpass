@@ -107,6 +107,11 @@ describe("manifest discovery", () => {
     chmodSync(m, 0o644);
     expect(resolveProject(root).trusted).toBe(true);
 
+    const fifo = join(root, "fifo");
+    mkdirSync(fifo);
+    spawnSync("mkfifo", [join(fifo, ".agentpass.json")]);
+    expect(resolveProject(fifo).warnings).toEqual([`ignoring ${join(fifo, ".agentpass.json")}: not a regular file`]);
+
     const uid = spyOn(process, "getuid").mockReturnValue(process.getuid!() + 1);
     try {
       expect(resolveProject(root).warnings).toEqual([`ignoring ${m}: not owned by you`]);

@@ -1,9 +1,9 @@
 import { spawnSync } from "child_process";
 import http from "http";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
+import { basename } from "path";
 import { certificateAuthority } from "./ca";
 import { caBundleFile, caCertFile, daemonFile, globalConfigFile } from "./paths";
-import { basename } from "path";
 import { BASE_URLS, MANIFEST_NAME, UntrustedError, gitHead, homeDir, resolveProject } from "./project";
 import { PROVIDERS } from "./providers";
 import { allowedFile } from "./trust";

@@ -112,6 +112,12 @@ export function gitRoot(dir: string): string | null {
   }
 }
 
+// A FIFO planted as .git or HEAD would otherwise block the hook forever.
+function readRegular(path: string): string {
+  if (!statSync(path).isFile()) throw new Error(`${path}: not a regular file`);
+  return readFileSync(path, "utf-8");
+}
+
 // Reads HEAD instead of spawning git: no subprocess per cd, and the repo's config gets no say.
 export function gitHead(dir: string): { repo: string; file: string; ref: string } | null {
   try {
@@ -120,9 +126,9 @@ export function gitHead(dir: string): { repo: string; file: string; ref: string 
     const dotgit = join(top, ".git");
     const gitdir = statSync(dotgit).isDirectory()
       ? dotgit
-      : resolve(top, readFileSync(dotgit, "utf-8").match(/^gitdir: (.*)$/m)?.[1]?.trim() ?? "");
+      : resolve(top, readRegular(dotgit).match(/^gitdir: (.*)$/m)?.[1]?.trim() ?? "");
     const file = join(gitdir, "HEAD");
-    const head = readFileSync(file, "utf-8").trim();
+    const head = readRegular(file).trim();
     const ref = head.startsWith("ref: ") ? head.slice(5).replace(/^refs\/heads\//, "") : head.slice(0, 7);
     return { repo: basename(top), file, ref };
   } catch {
