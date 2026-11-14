@@ -7,7 +7,7 @@ import { URL } from "url";
 import { vault } from "./vault";
 import { appendAudit } from "./audit";
 import { matchProvider, PROVIDERS, type Provider } from "./providers";
-import { egressVerdict, isLoopbackHost, pinHostMatches, type Pin, type Scheme } from "./egress";
+import { egressVerdict, isLoopbackHost, parseAuthority, pinHostMatches, unbracket, type Pin, type Scheme } from "./egress";
 import {
   loadRoutingConfig,
   makeRoutingDecision,
@@ -188,7 +188,7 @@ export class ProxyServer {
 
     const proxyReq = client.request(
       {
-        hostname: url.hostname,
+        hostname: unbracket(url.hostname),
         port,
         path: url.pathname + url.search,
         method: req.method,
@@ -643,13 +643,14 @@ export class ProxyServer {
     head: Buffer
   ): Promise<void> {
     const started = Date.now();
-    const [hostname, portText] = (req.url || "").split(":");
-    const port = Number(portText || "443");
-    if (!hostname || !Number.isFinite(port)) {
+    const authority = parseAuthority(req.url || "");
+    if (!authority) {
       clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
       clientSocket.end();
       return;
     }
+    const { host: hostname } = authority;
+    const port = authority.port ?? 443;
 
     try {
       if (head.length > 0) clientSocket.unshift(head);
@@ -659,7 +660,7 @@ export class ProxyServer {
         return;
       }
 
-      const hostPair = certificateAuthority.getHostCertificate(hostname);
+      const hostPair = certificateAuthority.getHostCertificate(unbracket(hostname));
       const caPair = certificateAuthority.ensureCa();
       const certChain = `${hostPair.cert}\n${caPair.cert}`;
 
@@ -689,7 +690,7 @@ export class ProxyServer {
 
           const upstreamReq = https.request(
             {
-              hostname,
+              hostname: unbracket(hostname),
               port,
               path: req.url || "/",
               method: req.method,
@@ -817,7 +818,7 @@ export class ProxyServer {
   private async shouldIntercept(hostname: string, port: number): Promise<boolean> {
     try {
       const hosts = await vault.pinnedHosts();
-      return [...hosts].some((pinHost) => pinHostMatches(pinHost, hostname.toLowerCase(), port, 443));
+      return [...hosts].some((pinHost) => pinHostMatches(pinHost, hostname, port, 443));
     } catch {
       // locked vault: nothing can be substituted, so there is no reason to break TLS
       return false;
@@ -828,7 +829,7 @@ export class ProxyServer {
   private tunnel(clientSocket: Duplex, hostname: string, port: number, started: number): void {
     const destination = `${hostname}:${port}`;
     let connected = false;
-    const upstream = net.connect(port, hostname, () => {
+    const upstream = net.connect(port, unbracket(hostname), () => {
       connected = true;
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       appendAudit({

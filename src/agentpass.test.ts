@@ -217,6 +217,38 @@ describe("HTTPS proxy", () => {
     await target.close();
   });
 
+  test("parses bracketed IPv6 authorities on CONNECT and the forward path", async () => {
+    await sharedVault.init("correct-password");
+    const tlsTarget = await startTarget(certificateAuthority.getHostCertificate("::1"), "::1");
+    const plainTarget = await startTarget(undefined, "::1");
+    await sharedVault.add("v6", "sk-v6", "api_key", [
+      { host: `[::1]:${tlsTarget.port}` },
+      { host: `[0:0:0:0:0:0:0:1]:${plainTarget.port}` },
+    ]);
+    const proxy = await startProxy();
+
+    const tunneled = await requestThroughConnectTunnel(proxy.getPort(), tlsTarget.port, readFileSync(caCertFile()), {
+      authority: `[::1]:${tlsTarget.port}`,
+      host: `[::1]:${tlsTarget.port}`,
+      auth: "Bearer {{secret:v6}}",
+      ip: "::1",
+    });
+    expect(tunneled).toContain("200 OK");
+    expect(tlsTarget.requests[0]?.authorization).toBe("Bearer sk-v6");
+    expect(tlsTarget.requests[0]?.host).toBe(`[::1]:${tlsTarget.port}`);
+
+    const forwarded = await requestThroughDirectProxy(proxy.getPort(), plainTarget.port, {
+      auth: "Bearer {{secret:v6}}",
+      origin: `http://[::1]:${plainTarget.port}`,
+    });
+    expect(forwarded.status).toBe(200);
+    expect(plainTarget.requests[0]?.authorization).toBe("Bearer sk-v6");
+
+    await proxy.stop();
+    await tlsTarget.close();
+    await plainTarget.close();
+  });
+
   test("intercepts every CONNECT host and port when a *:* pin exists", async () => {
     await sharedVault.init("correct-password");
     await sharedVault.add("svc", "sk-svc", "api_key", [{ host: "*:*" }]);
@@ -433,21 +465,24 @@ describe("egress lock", () => {
 interface Target {
   port: number;
   requests: http.IncomingHttpHeaders[];
+  urls: string[];
   close: () => Promise<void>;
 }
 
-async function startTarget(tlsCert?: { cert: string; key: string }): Promise<Target> {
+async function startTarget(tlsCert?: { cert: string; key: string }, host = "127.0.0.1"): Promise<Target> {
   const requests: http.IncomingHttpHeaders[] = [];
+  const urls: string[] = [];
   const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
     requests.push(req.headers);
+    urls.push(req.url || "");
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
   };
   const server = tlsCert ? https.createServer(tlsCert, handler) : http.createServer(handler);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Target server did not bind to a TCP port");
-  return { port: address.port, requests, close: () => new Promise((resolve) => server.close(() => resolve())) };
+  return { port: address.port, requests, urls, close: () => new Promise((resolve) => server.close(() => resolve())) };
 }
 
 async function startProxy(): Promise<ProxyServer> {
@@ -463,6 +498,8 @@ interface ProxiedRequest {
   host?: string;
   servername?: string;
   origin?: string;
+  authority?: string;
+  ip?: string;
 }
 
 // Built by hand from the v1 schema so the test does not depend on the current Vault code.
@@ -565,6 +602,8 @@ async function requestThroughConnectTunnel(
     auth = "Bearer {{secret:openai}}",
     host = `localhost:${targetPort}`,
     servername = "localhost",
+    authority = `localhost:${targetPort}`,
+    ip,
   }: ProxiedRequest = {}
 ): Promise<string> {
   const socket = net.connect(proxyPort, "127.0.0.1");
@@ -573,15 +612,14 @@ async function requestThroughConnectTunnel(
     socket.once("error", reject);
   });
 
-  socket.write(
-    `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\n\r\n`
-  );
+  socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
 
-  await readUntil(socket, "\r\n\r\n");
+  const established = await readUntil(socket, "\r\n\r\n");
+  if (!established.startsWith("HTTP/1.1 200")) return established;
 
   const tlsSocket = tls.connect({
     socket,
-    servername,
+    ...(ip ? { checkServerIdentity: (_: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(ip, cert) } : { servername }),
     ca,
     rejectUnauthorized: true,
   });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectivePins, egressVerdict, isLoopbackHost, parseStoredPins, validatePins } from "./egress";
+import { effectivePins, egressVerdict, isLoopbackHost, parseAuthority, parseStoredPins, validatePins } from "./egress";
 import { KNOWN_SERVICES } from "./providers";
 
 describe("egress pins", () => {
@@ -141,6 +141,16 @@ describe("egress pins", () => {
     expect(parseStoredPins("not json")).toEqual([]);
     expect(parseStoredPins(JSON.stringify([{ host: "https://x" }]))).toEqual([]);
     expect(egressVerdict("openai", parseStoredPins("not json"), "api.openai.com", "GET", "/")).toBe("deny");
+  });
+
+  test("parses request authorities strictly, IPv6 included", () => {
+    expect(parseAuthority("[::1]:18443")).toEqual({ host: "[::1]", port: 18443 });
+    expect(parseAuthority("[0:0::1]")).toEqual({ host: "[::1]", port: null });
+    expect(parseAuthority("API.example.com:443")).toEqual({ host: "api.example.com", port: 443 });
+    expect(parseAuthority("127.1:80")).toEqual({ host: "127.0.0.1", port: 80 });
+    for (const raw of ["::1:443", "[::1", "evil@localhost:443", "localhost:443/x", "*:443", "localhost:*", ""]) {
+      expect(parseAuthority(raw)).toBeNull();
+    }
   });
 
   test("recognizes only loopback hosts as safe for cleartext", () => {

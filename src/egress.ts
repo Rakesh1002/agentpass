@@ -97,8 +97,13 @@ export function effectivePins(name: string, stored: Pin[] | null): Pin[] {
   return provider ? [{ host: provider.upstream.host }] : [];
 }
 
+// sockets and DNS want an IPv6 literal without the URL brackets
+export function unbracket(host: string): string {
+  return host.replace(/^\[(.*)\]$/, "$1");
+}
+
 export function isLoopbackHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  const h = unbracket(host.toLowerCase());
   return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
 }
 
