@@ -2,13 +2,12 @@
 
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { Mail, CheckCircle, Loader2, Zap } from "lucide-react";
+import { Mail, CheckCircle, Loader2 } from "lucide-react";
 
 export default function Waitlist() {
   const [email, setEmail] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState("");
-  const [tip, setTip] = useState("");
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -16,7 +15,6 @@ export default function Waitlist() {
 
     setStatus("loading");
     setErrorMsg("");
-    setTip("");
 
     try {
       const res = await fetch("/api/waitlist", {
@@ -32,21 +30,9 @@ export default function Waitlist() {
       }
 
       setStatus("success");
-
-      try {
-        const auditRes = await fetch("/api/audit", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email }),
-        });
-        const auditData = await auditRes.json();
-        if (auditData.tip) setTip(auditData.tip);
-      } catch {
-        // Non-blocking
-      }
     } catch (err) {
       setStatus("error");
-      setErrorMsg(err instanceof Error ? err.message : "Failed to join waitlist");
+      setErrorMsg(err instanceof Error ? err.message : "Failed to subscribe");
     }
   }
 
@@ -64,11 +50,11 @@ export default function Waitlist() {
             <Mail className="h-5 w-5" />
           </div>
           <h2 className="text-2xl font-bold tracking-tight text-fg">
-            Get the alpha
+            Get release notes
           </h2>
           <p className="mt-2 text-muted">
-            10 founder spots, no spam. We&apos;ll ping you when the CLI ships
-            and send a security tip while you wait.
+            AgentPass is in alpha. Leave your email and we&apos;ll send a short
+            note when a new release ships. Nothing else.
           </p>
         </div>
 
@@ -80,14 +66,8 @@ export default function Waitlist() {
           >
             <div className="inline-flex items-center gap-2 rounded-lg bg-accent/10 px-4 py-3 text-accent">
               <CheckCircle className="h-5 w-5" />
-              <span className="font-medium">You are on the list — thanks!</span>
+              <span className="font-medium">Subscribed. Thanks!</span>
             </div>
-            {tip && (
-              <div className="mt-4 rounded-lg border border-accent/20 bg-accent/5 px-4 py-3 text-sm text-accent">
-                <Zap className="inline h-4 w-4 mr-1 -mt-0.5" />
-                {tip}
-              </div>
-            )}
           </motion.div>
         ) : (
           <form onSubmit={handleSubmit} className="mt-8">
@@ -108,7 +88,7 @@ export default function Waitlist() {
                 {status === "loading" ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
-                  "Join"
+                  "Subscribe"
                 )}
               </button>
             </div>
