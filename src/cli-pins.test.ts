@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
+import { Vault } from "./vault";
 
 const CLI = resolve(import.meta.dir, "cli.ts");
 let home: string;
@@ -15,8 +16,14 @@ afterEach(() => {
 });
 
 function run(...args: string[]): { code: number; out: string; err: string } {
+  return pipe("", ...args);
+}
+
+// stdin is a pipe, never a TTY, so `add` reads the value from it
+function pipe(input: string, ...args: string[]): { code: number; out: string; err: string } {
   const proc = Bun.spawnSync([process.execPath, CLI, ...args], {
     env: { ...process.env, HOME: home, AGENTPASS_HOME: home, AGENTPASS_PASSWORD: "test-password" },
+    stdin: new TextEncoder().encode(input),
   });
   return { code: proc.exitCode, out: proc.stdout.toString(), err: proc.stderr.toString() };
 }
@@ -24,13 +31,13 @@ function run(...args: string[]): { code: number; out: string; err: string } {
 describe("cli pins", () => {
   test("add stores pins from --host, --path and --method, and list shows them", () => {
     expect(run("init").code).toBe(0);
-    const added = run(
-      "add", "stripe", "-v", "sk_test_cli_secret",
-      "--host", "api.stripe.com,files.stripe.com", "--path", "/v1", "--method", "get,post"
+    const added = pipe(
+      "sk_test_cli_secret",
+      "add", "stripe", "--host", "api.stripe.com,files.stripe.com", "--path", "/v1", "--method", "get,post"
     );
     expect(added.code).toBe(0);
-    expect(run("add", "openai", "--value", "sk-openai").code).toBe(0);
-    const loose = run("add", "stripe-live", "-t", "api_key", "-v", "sk_live_x");
+    expect(pipe("sk-openai", "add", "openai").code).toBe(0);
+    const loose = pipe("sk_live_x", "add", "stripe-live", "-t", "api_key");
     expect(loose.out).toContain("--host api.stripe.com");
 
     const listed = run("list");
@@ -42,7 +49,7 @@ describe("cli pins", () => {
 
   test("pins shows, replaces and clears a secret's pins", () => {
     run("init");
-    run("add", "stripe", "-v", "sk_test", "--host", "api.stripe.com");
+    pipe("sk_test", "add", "stripe", "--host", "api.stripe.com");
     expect(run("pins", "stripe").out).toContain("stripe: api.stripe.com");
 
     expect(run("pins", "stripe", "--set", "api.stripe.com", "--method", "POST").code).toBe(0);
@@ -54,7 +61,7 @@ describe("cli pins", () => {
 
   test("rejects invalid pins and unknown secrets", () => {
     run("init");
-    run("add", "stripe", "-v", "sk_test", "--host", "api.stripe.com");
+    pipe("sk_test", "add", "stripe", "--host", "api.stripe.com");
 
     const badHost = run("pins", "stripe", "--set", "https://api.stripe.com");
     expect(badHost.code).toBe(1);
@@ -62,7 +69,45 @@ describe("cli pins", () => {
     expect(run("pins", "stripe").out).toContain("stripe: api.stripe.com");
 
     expect(run("pins", "missing").code).toBe(1);
-    expect(run("add", "svc", "-v", "sk", "--method", "GET").code).toBe(1);
+    expect(pipe("sk", "add", "svc", "--method", "GET").code).toBe(1);
+    expect(run("list").out).not.toContain("svc");
+  });
+});
+
+describe("cli add", () => {
+  test("reads the value from stdin, strips exactly one trailing newline and rejects an empty value", async () => {
+    run("init");
+    expect(pipe("sk-piped-value\n\n", "add", "svc", "--host", "api.example.com").code).toBe(0);
+    expect(pipe("sk-piped-crlf\r\n", "add", "crlf", "--host", "api.example.com").code).toBe(0);
+    expect(pipe("sk-piped-bare", "add", "bare", "--host", "api.example.com").code).toBe(0);
+    for (const empty of ["", "\n"]) {
+      const r = pipe(empty, "add", "empty", "--host", "api.example.com");
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("empty");
+    }
+
+    process.env.AGENTPASS_HOME = home;
+    try {
+      const v = new Vault();
+      await v.init("test-password");
+      expect(await v.get("svc")).toBe("sk-piped-value\n");
+      expect(await v.get("crlf")).toBe("sk-piped-crlf");
+      expect(await v.get("bare")).toBe("sk-piped-bare");
+      expect(await v.has("empty")).toBe(false);
+      v.close();
+    } finally {
+      delete process.env.AGENTPASS_HOME;
+    }
+  });
+
+  test("refuses a value on the command line and never echoes it", () => {
+    run("init");
+    for (const args of [["-v", "sk-argv-leak"], ["--value", "sk-argv-leak"], ["--value=sk-argv-leak"], ["-vsk-argv-leak"], ["sk-argv-leak"]]) {
+      const r = pipe("sk-stdin-value", "add", "svc", ...args);
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("Usage: agentpass add");
+      expect(r.out + r.err).not.toContain("argv-leak");
+    }
     expect(run("list").out).not.toContain("svc");
   });
 });

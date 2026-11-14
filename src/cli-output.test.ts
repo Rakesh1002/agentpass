@@ -36,8 +36,8 @@ function files(dir: string): string[] {
 test("no command prints, logs or writes a stored value or the vault key", async () => {
   writeFileSync(join(box.home, ".claude.json"), JSON.stringify({ apiKey: CLAUDE_KEY }));
   const outputs: string[] = [];
-  const run = (args: string[], extra: Record<string, string> = {}) => {
-    const r = box.cli(args, extra);
+  const run = (args: string[], extra: Record<string, string> = {}, input?: string) => {
+    const r = box.cli(args, extra, input);
     outputs.push(`$ agentpass ${args[0]}\n${r.out}${r.err}`);
     return r;
   };
@@ -45,8 +45,8 @@ test("no command prints, logs or writes a stored value or the vault key", async 
 
   expect(run(["init"]).code).toBe(0);
   const firstKey = keychainSecret();
-  expect(run(["add", "openai", "-v", PLANTED]).code).toBe(0);
-  expect(run(["add", "short", "-v", SHORT, "--host", "api.example.com"]).code).toBe(0);
+  expect(run(["add", "openai"], {}, PLANTED).code).toBe(0);
+  expect(run(["add", "short", "--host", "api.example.com"], {}, SHORT).code).toBe(0);
   expect(run(["import-claude"]).code).toBe(0);
   for (const name of ["openai", "short", "anthropic"]) expect(run(["get", name]).out).toContain(`${name}: `);
   run(["get", "missing"]);

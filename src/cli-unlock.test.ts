@@ -27,7 +27,7 @@ describe("cli unlock", () => {
     const secret = keychainSecret();
     expect(Buffer.from(secret, "base64")).toHaveLength(32);
 
-    const added = box.cli(["add", "openai", "-v", "sk-keychain-value"]);
+    const added = box.cli(["add", "openai"], {}, "sk-keychain-value");
     expect(added.code).toBe(0);
     const got = box.cli(["get", "openai"]);
     expect(got.code).toBe(0);
@@ -44,7 +44,7 @@ describe("cli unlock", () => {
     const init = box.cli(["init"], { AGENTPASS_PASSWORD: PW });
     expect(init.code).toBe(0);
     expect(init.out).toContain("passphrase mode");
-    expect(box.cli(["add", "openai", "-v", "sk-passphrase-value"], { AGENTPASS_PASSWORD: PW }).code).toBe(0);
+    expect(box.cli(["add", "openai"], { AGENTPASS_PASSWORD: PW }, "sk-passphrase-value").code).toBe(0);
     expect(box.cli(["list"], { AGENTPASS_PASSWORD: PW }).out).toContain("openai");
     expect(argvLog()).toBe("");
 
@@ -74,8 +74,8 @@ describe("cli unlock", () => {
 
   test("unlock-mode converts both ways, backing up first and keeping every value", async () => {
     expect(box.cli(["init"], { AGENTPASS_PASSWORD: PW }).code).toBe(0);
-    box.cli(["add", "openai", "-v", "sk-convert-openai"], { AGENTPASS_PASSWORD: PW });
-    box.cli(["add", "stripe", "-v", "sk_convert_stripe", "--host", "api.stripe.com"], { AGENTPASS_PASSWORD: PW });
+    box.cli(["add", "openai"], { AGENTPASS_PASSWORD: PW }, "sk-convert-openai");
+    box.cli(["add", "stripe", "--host", "api.stripe.com"], { AGENTPASS_PASSWORD: PW }, "sk_convert_stripe");
 
     const toKeychain = box.cli(["unlock-mode", "keychain"], { AGENTPASS_PASSWORD: PW });
     expect(toKeychain.code).toBe(0);

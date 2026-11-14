@@ -49,7 +49,7 @@ export interface Sandbox {
   agentpassHome: string;
   fakeDir: string;
   env: Record<string, string>;
-  cli(args: string[], extra?: Record<string, string>): { out: string; err: string; code: number | null };
+  cli(args: string[], extra?: Record<string, string>, input?: string): { out: string; err: string; code: number | null };
 }
 
 // Temp HOME and AGENTPASS_HOME, with fake keychain and service tools first on PATH.
@@ -75,8 +75,8 @@ export function sandbox(): Sandbox {
     agentpassHome,
     fakeDir,
     env,
-    cli(args, extra = {}) {
-      const r = spawnSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf-8", env: { ...env, ...extra }, timeout: 20000 });
+    cli(args, extra = {}, input) {
+      const r = spawnSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf-8", env: { ...env, ...extra }, input, timeout: 20000 });
       return { out: r.stdout, err: r.stderr, code: r.status };
     },
   };
